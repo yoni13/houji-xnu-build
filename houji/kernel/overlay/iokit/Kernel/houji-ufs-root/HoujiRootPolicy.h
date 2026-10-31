@@ -1,6 +1,6 @@
 #define HOUJI_ROOT_GIB 32
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-static const uint32_t kHoujiRootFirst=2362880U;
+static const uint32_t kHoujiRootFirst=2260480U;
 // Existing qualified images keep 12 GiB. A newly built, separately verified
 // volume may opt into 32 GiB; this never broadens the physical partition.
 #ifndef HOUJI_ROOT_GIB

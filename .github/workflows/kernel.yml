@@ -48,6 +48,10 @@ jobs:
           git -C xnu-upstream fetch -q --depth 1 https://github.com/apple-oss-distributions/xnu.git "$XNU_REV"
           git -C xnu-upstream checkout -q FETCH_HEAD
           python3 houji/tools/prepare-sources.py kernel --upstream xnu-upstream --output dxb/xnu
+          # Unmodified upstream files the published overlay references but does not carry
+          # (Apple hfs 31d5ec23 B-tree sources, IOHIDFamily usage tables, VerifiedRoot headers).
+          cp -Rn houji/kernel/upstream-fill/. dxb/xnu/
+          python3 retarget-layout.py dxb/xnu
           # dxb applies its generic patches with `git apply`; give the tree a repository.
           git -C dxb/xnu init -q && git -C dxb/xnu add -A >/dev/null && git -C dxb/xnu -c user.email=ci@local -c user.name=ci commit -qm houji
           openssl enc -d -aes-256-cbc -pbkdf2 -pass env:FW_KEY -in fwheaders.tar.gz.enc | tar -xzf - -C dxb/xnu/iokit/Kernel/houji-ufs-root/
