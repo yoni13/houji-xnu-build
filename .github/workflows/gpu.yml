@@ -17,7 +17,7 @@ jobs:
           XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
           sudo xcode-select -s "$XC"
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
-          brew install meson ninja bison flex pkg-config llvm spirv-tools shaderc
+          brew install meson ninja bison flex pkg-config llvm spirv-tools shaderc glslang
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.0 --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           "$HOME/.cargo/bin/rustup" target add aarch64-apple-ios --toolchain 1.98.0
