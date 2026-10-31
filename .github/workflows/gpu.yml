@@ -69,7 +69,7 @@ jobs:
           cpp_link_args = ['-target','arm64-apple-ios16.0','-isysroot','$SDK']
           objc_link_args = ['-target','arm64-apple-ios16.0','-isysroot','$SDK']
           EOF
-          export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+          export PATH="$GITHUB_WORKSPACE/.venv/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
           .venv/bin/meson setup turnip-build mesa --cross-file ios.cross --wrap-mode=nodownload \
             -Dgallium-drivers= -Dvulkan-drivers=freedreno -Dfreedreno-kmds=darwin \
             -Dtu-darwin-abi-dir="$GITHUB_WORKSPACE/gpu/metal" -Dplatforms=macos \
