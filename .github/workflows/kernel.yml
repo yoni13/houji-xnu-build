@@ -49,7 +49,8 @@ jobs:
           git -C xnu-upstream checkout -q FETCH_HEAD
           python3 houji/tools/prepare-sources.py kernel --upstream xnu-upstream --output dxb/xnu
           # Unmodified upstream files the published overlay references but does not carry
-          # (Apple hfs 31d5ec23 B-tree sources, IOHIDFamily usage tables, VerifiedRoot headers).
+          # (Apple hfs 31d5ec23 B-tree sources, IOHIDFamily usage tables, VerifiedRoot headers,
+          # and the untracked MASTER.arm64.sweet created by ios-vermeer-lab d68e05df 0006-0008).
           cp -Rn houji/kernel/upstream-fill/. dxb/xnu/
           python3 retarget-layout.py dxb/xnu
           # dxb applies its generic patches with `git apply`; give the tree a repository.
@@ -68,7 +69,11 @@ jobs:
           p = Path('build.sh'); s = p.read_text()
           old = '        build_xnu\n        echo "  🎉 XNU Build Done!"'
           assert old in s
-          p.write_text(s.replace(old, '        echo "dependencies ready"'))
+          s = s.replace(old, '        echo "dependencies ready"')
+          # SWEET is plain arm64 (no PAC); libfirehose_kernel must carry an arm64 slice.
+          arch = 'ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"'
+          assert s.count(arch) == 1
+          p.write_text(s.replace(arch, 'ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"'))
           EOF
           bash build.sh 2>&1 | tee ../deps-build.log
           ls fakeroot/usr/local/bin fakeroot/usr/local/lib/kernel
