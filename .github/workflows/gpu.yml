@@ -92,7 +92,8 @@ jobs:
           LLVM_AS=$(brew --prefix llvm)/bin/llvm-as
           "$LLVM_AS" -o runtime_examples.air runtime/crates/metal2vulkan-validation/fixtures/public/examples/runtime_examples.ll
           "$LLVM_AS" -o function_constant.air runtime/crates/metal2vulkan-validation/fixtures/public/kernel_function_constant_gate_fold.ll
-          cat > bridge.Cargo.toml <<EOF
+          mkdir -p bridge-build
+          cat > bridge-build/Cargo.toml <<EOF
           [package]
           name = "native-metal-bridge"
           version = "0.1.0"
@@ -115,8 +116,8 @@ jobs:
           export NMB_FIXTURE_AIR="$GITHUB_WORKSPACE/runtime_examples.air"
           export NMB_FC_AIR="$GITHUB_WORKSPACE/function_constant.air"
           export IPHONEOS_DEPLOYMENT_TARGET=16.0
-          "$HOME/.cargo/bin/cargo" +1.98.0 generate-lockfile --manifest-path bridge.Cargo.toml
-          "$HOME/.cargo/bin/cargo" +1.98.0 build --locked --release --manifest-path bridge.Cargo.toml \
+          "$HOME/.cargo/bin/cargo" +1.98.0 generate-lockfile --manifest-path bridge-build/Cargo.toml
+          "$HOME/.cargo/bin/cargo" +1.98.0 build --locked --release --manifest-path bridge-build/Cargo.toml \
             --target aarch64-apple-ios --target-dir bridge-target
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           xcrun clang -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -std=c11 -c gpu/metal/AdrenoPM4.c -o AdrenoPM4.o
