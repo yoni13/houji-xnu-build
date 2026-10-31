@@ -108,9 +108,9 @@ static void houjiLiveDeadline(void*,wait_result_t){
 }
 static void houjiLiveWorker(void*,wait_result_t){
  thread_set_thread_name(current_thread(),"houji-gpu-owner");auto&l=gHoujiLive;uint64_t started=houjiSubmitNow(nullptr),busy_since=0,last_saved=UINT64_MAX,last_report=0,last_desktop_save=0,first_draw=0,first_fence=0,base_swaps=0,base_presents=0;unsigned checks=0,probe_state=0;
- if(l.mode==3)houji_framebuffer_counts(&base_swaps,&base_presents);
+ if(l.mode>=3)houji_framebuffer_counts(&base_swaps,&base_presents);
  for(;;){
-  IOSleep(l.mode==3?500:l.mode==2?250:100);++checks;
+  IOSleep(l.mode>=3?500:l.mode==2?250:100);++checks;
   if(l.mode==2 && !(checks&3)){
    uint64_t progress=native_adreno_provider_progress_token();
    if(progress!=last_saved){
@@ -124,7 +124,7 @@ static void houjiLiveWorker(void*,wait_result_t){
    if(!busy_since)busy_since=houjiSubmitNow(nullptr);
    if(houjiSubmitNow(nullptr)-busy_since>10000000)panic("HOUJI LIVE: provider call held gate over10s; all resources pinned, last progress saved, no-FS PSCI");
   }else {busy_since=0;if(polled){l.code=13;break;}}
-  if(l.mode==3){
+  if(l.mode>=3){
    if(gHoujiDvfs.failed){l.code=16;break;}
    uint64_t now=houjiSubmitNow(nullptr);
    if(now-last_report>=5000000){
@@ -134,9 +134,9 @@ static void houjiLiveWorker(void*,wait_result_t){
     if(!observed && stats[0] && !first_draw){first_draw=now;first_fence=stats[4];}
     if(!observed && stats[2]){l.code=15;break;}
     if(now-last_desktop_save>=20000000){houji_touch_driver_report();houji_managed_physical_map_debug_report();houjiProviderPerfReport();native_adreno_provider_snapshot();if(houjiNativeGpuFsAllowed())houji_ufs_checkpoint("desktop actual-submit/fence/display sampling; no GPU gate held",0);last_desktop_save=now;}
-    if(first_draw && now-first_draw>=120000000 && !observed && stats[0]>=64 && stats[4]>=first_fence+32 && presents-base_presents>=30){IOLog("HOUJI DESKTOP: GPU and display activity sampling complete; physical UI confirmation still required\n");break;}
+    if(l.mode==3 && first_draw && now-first_draw>=120000000 && !observed && stats[0]>=64 && stats[4]>=first_fence+32 && presents-base_presents>=30){IOLog("HOUJI DESKTOP: GPU and display activity sampling complete; physical UI confirmation still required\n");break;}
    }
-   if(now-started>=360000000)break;
+   if(l.mode==3 && now-started>=360000000)break;
   }else if(l.mode==2){
    probe_state=native_adreno_provider_probe_result();
    /* The per-boot started flag proves this process cleared the previous log.
@@ -153,7 +153,7 @@ static void houjiLiveWorker(void*,wait_result_t){
  /* Commit terminal GPU/call state before any diagnostic vnode lookup can block. */
  houjiFullReport();houjiCpSaveFinal();
  if(l.mode==2){houjiProbeLogDump();houjiCpSaveFinal();}
- if(l.mode==3){houjiWallpaperLogDump();houjiCpSaveFinal();houjiKeyboardLogDump();houjiCpSaveFinal();}
+ if(l.mode>=3){houjiWallpaperLogDump();houjiCpSaveFinal();houjiKeyboardLogDump();houjiCpSaveFinal();}
  panic("HOUJI LIVE: runtime ended mode=%u code=%u; retained PSCI recovery",l.mode,l.code);
 }
 static bool houjiLiveStart(void){
@@ -165,7 +165,7 @@ static bool houjiLiveStart(void){
  thread_t t;
  if(kernel_thread_start(houjiLiveWorker,nullptr,&t)!=KERN_SUCCESS)return false;
  thread_deallocate(t);gHoujiLive.worker=1;
- if(gHoujiLive.mode>=2){thread_t guard;if(kernel_thread_start(houjiLiveDeadline,nullptr,&guard)!=KERN_SUCCESS)panic("HOUJI LIVE: independent guard creation failed; all resources pinned, no-FS PSCI");thread_deallocate(guard);}
+ if(gHoujiLive.mode==2 || gHoujiLive.mode==3){thread_t guard;if(kernel_thread_start(houjiLiveDeadline,nullptr,&guard)!=KERN_SUCCESS)panic("HOUJI LIVE: independent guard creation failed; all resources pinned, no-FS PSCI");thread_deallocate(guard);}
  return true;
 }
 #endif
