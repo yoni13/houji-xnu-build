@@ -1,0 +1,151 @@
+name: houji Metal and Turnip
+on: workflow_dispatch
+permissions:
+  contents: read
+env:
+  MESA_REV: 85fda3b36405bcaea8bffc64aa4f2651dc90770d
+  RUNTIME_REV: 0dfdbcd59d235e37ba13b87a5ab30835b5bb9e35
+jobs:
+  gpu:
+    runs-on: macos-15
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode and install tools
+        run: |
+          set -euxo pipefail
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          sudo xcode-select -s "$XC"
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          brew install meson ninja bison flex pkg-config llvm spirv-tools shaderc rustup-init
+          rustup-init -y --default-toolchain 1.98.0 --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" target add aarch64-apple-ios --toolchain 1.98.0
+          xcodebuild -version
+          python3 -m venv .venv
+          .venv/bin/pip install mako pyyaml packaging
+      - name: Prepare active sources
+        run: |
+          set -euxo pipefail
+          git init -q mesa
+          git -C mesa fetch -q --depth 1 https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa "$MESA_REV"
+          git -C mesa checkout -q FETCH_HEAD
+          git -C mesa apply --check "$GITHUB_WORKSPACE/gpu/graphics/turnip/patches/local.patch"
+          git -C mesa apply "$GITHUB_WORKSPACE/gpu/graphics/turnip/patches/local.patch"
+          cp -a gpu/graphics/turnip/overlay/. mesa/
+          git init -q runtime
+          git -C runtime fetch -q --depth 1 https://github.com/steelbrain/metal2vulkan.git "$RUNTIME_REV"
+          git -C runtime checkout -q FETCH_HEAD
+          cp -a gpu/graphics/runtime/overlay/. runtime/
+          cmp gpu/graphics/include/NativeAdrenoABI.h gpu/metal/NativeAdrenoABI.h
+      - name: Build Turnip Darwin backend
+        run: |
+          set -euxo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CC=$(xcrun --sdk iphoneos --find clang)
+          CXX=$(xcrun --sdk iphoneos --find clang++)
+          AR=$(xcrun --sdk iphoneos --find ar)
+          STRIP=$(xcrun --sdk iphoneos --find strip)
+          cat > ios.cross <<EOF
+          [binaries]
+          c = '$CC'
+          cpp = '$CXX'
+          objc = '$CC'
+          ar = '$AR'
+          strip = '$STRIP'
+          pkg-config = '/usr/bin/false'
+          [host_machine]
+          system = 'darwin'
+          cpu_family = 'aarch64'
+          cpu = 'arm64'
+          endian = 'little'
+          [properties]
+          needs_exe_wrapper = true
+          [built-in options]
+          c_args = ['-target','arm64-apple-ios16.0','-isysroot','$SDK','-fstack-protector-strong']
+          cpp_args = ['-target','arm64-apple-ios16.0','-isysroot','$SDK','-fstack-protector-strong']
+          objc_args = ['-target','arm64-apple-ios16.0','-isysroot','$SDK','-fstack-protector-strong']
+          c_link_args = ['-target','arm64-apple-ios16.0','-isysroot','$SDK']
+          cpp_link_args = ['-target','arm64-apple-ios16.0','-isysroot','$SDK']
+          objc_link_args = ['-target','arm64-apple-ios16.0','-isysroot','$SDK']
+          EOF
+          export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+          .venv/bin/meson setup turnip-build mesa --cross-file ios.cross --wrap-mode=nodownload \
+            -Dgallium-drivers= -Dvulkan-drivers=freedreno -Dfreedreno-kmds=darwin \
+            -Dtu-darwin-abi-dir="$GITHUB_WORKSPACE/gpu/metal" -Dplatforms=macos \
+            -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dopengl=false \
+            -Dgles1=disabled -Dgles2=disabled -Dllvm=disabled -Dshared-glapi=disabled \
+            -Dxmlconfig=disabled -Dshader-cache=disabled -Dtools= -Dbuild-tests=false \
+            -Dvideo-codecs= -Dvulkan-layers= -Dlibunwind=disabled -Dlmsensors=disabled \
+            -Dvalgrind=disabled -Dexpat=disabled -Dzstd=disabled -Dbuildtype=release \
+            -Db_ndebug=true -Dtu-builtin-source-id=houji-r222-active -Dtu-builtin-pack-header=
+          ninja -C turnip-build -j"$(sysctl -n hw.ncpu)" src/freedreno/vulkan/libvulkan_freedreno.dylib
+          mkdir -p artifact/NativeAdrenoMetal.bundle
+          cp turnip-build/src/freedreno/vulkan/libvulkan_freedreno.dylib artifact/NativeAdrenoMetal.bundle/
+          install_name_tool -id /usr/lib/libvulkan_freedreno.dylib artifact/NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib
+          strip -x artifact/NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib
+          codesign --force --sign - --pagesize 4096 --identifier org.blu-sharky.turnip artifact/NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib
+          nm -gU artifact/NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib | grep _vk_icdGetInstanceProcAddr
+      - name: Build active Metal bridge and bundle
+        run: |
+          set -euxo pipefail
+          LLVM_AS=$(brew --prefix llvm)/bin/llvm-as
+          "$LLVM_AS" -o runtime_examples.air runtime/crates/metal2vulkan-validation/fixtures/public/examples/runtime_examples.ll
+          "$LLVM_AS" -o function_constant.air runtime/crates/metal2vulkan-validation/fixtures/public/kernel_function_constant_gate_fold.ll
+          cat > bridge.Cargo.toml <<EOF
+          [package]
+          name = "native-metal-bridge"
+          version = "0.1.0"
+          edition = "2024"
+          rust-version = "1.98"
+          [workspace]
+          [lib]
+          crate-type = ["staticlib"]
+          path = "$GITHUB_WORKSPACE/gpu/metal/bridge/NativeMetalBridge.rs"
+          [dependencies]
+          metal2vulkan = { path = "$GITHUB_WORKSPACE/runtime/crates/metal2vulkan", features = ["ash"] }
+          metal2vulkan-runtime = { path = "$GITHUB_WORKSPACE/runtime/crates/metal2vulkan-runtime" }
+          libc = "0.2"
+          sha2 = { version = "0.10", features = ["asm"] }
+          [profile.release]
+          panic = "unwind"
+          debug = 1
+          EOF
+          export NMB_RUNTIME_ID=houji-r222-active-$(git -C runtime rev-parse --short=12 HEAD)
+          export NMB_FIXTURE_AIR="$GITHUB_WORKSPACE/runtime_examples.air"
+          export NMB_FC_AIR="$GITHUB_WORKSPACE/function_constant.air"
+          export IPHONEOS_DEPLOYMENT_TARGET=16.0
+          "$HOME/.cargo/bin/cargo" +1.98.0 generate-lockfile --manifest-path bridge.Cargo.toml
+          "$HOME/.cargo/bin/cargo" +1.98.0 build --locked --release --manifest-path bridge.Cargo.toml \
+            --target aarch64-apple-ios --target-dir bridge-target
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun clang -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -std=c11 -c gpu/metal/AdrenoPM4.c -o AdrenoPM4.o
+          xcrun clang++ -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -g -fstack-protector-strong \
+            -std=c++17 -fobjc-arc -Wno-deprecated-declarations -bundle \
+            -I gpu/metal -I gpu -I "$SDK/usr/include" \
+            -x objective-c++ gpu/metal/NativeAdrenoMetalPlugin.mm gpu/metal/NativeBridgeMetalFrontend.mm \
+            -x none AdrenoPM4.o bridge-target/aarch64-apple-ios/release/libnative_metal_bridge.a \
+            -Wl,-dead_strip -lobjc -framework Foundation -framework Metal -framework IOSurface \
+            -o artifact/NativeAdrenoMetal.bundle/NativeAdrenoMetal
+          strip -x artifact/NativeAdrenoMetal.bundle/NativeAdrenoMetal
+          python3 - <<'EOF'
+          import plistlib
+          p={'CFBundleIdentifier':'org.blu-sharky.NativeAdrenoMetal','CFBundleExecutable':'NativeAdrenoMetal',
+             'CFBundlePackageType':'BNDL','CFBundleVersion':'1','CFBundleShortVersionString':'1',
+             'NSPrincipalClass':'NativeAdrenoMetalDevice','MinimumOSVersion':'16.0'}
+          open('artifact/NativeAdrenoMetal.bundle/Info.plist','wb').write(plistlib.dumps(p))
+          EOF
+          codesign --force --sign - --pagesize 4096 --identifier org.blu-sharky.NativeAdrenoMetal artifact/NativeAdrenoMetal.bundle
+          codesign --verify --strict artifact/NativeAdrenoMetal.bundle
+          printf 'backboardd\n' > artifact/NativeAdrenoMetal.clients
+          : > artifact/NativeAdrenoMetal.publish
+          shasum -a 256 artifact/NativeAdrenoMetal.bundle/NativeAdrenoMetal artifact/NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib > artifact/SHA256SUMS
+          file artifact/NativeAdrenoMetal.bundle/*
+          otool -L artifact/NativeAdrenoMetal.bundle/NativeAdrenoMetal
+          otool -L artifact/NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: houji-metal-turnip
+          path: artifact/
+          retention-days: 7

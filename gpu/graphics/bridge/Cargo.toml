@@ -1,0 +1,17 @@
+[package]
+name = "native-metal-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+[workspace]
+[lib]
+crate-type = ["staticlib"]
+path = "../metal/AdrenoMetal/bridge/NativeMetalBridge.rs"
+[dependencies]
+metal2vulkan = { path = "../../.deps/metal2vulkan/crates/metal2vulkan", features = ["ash"] }
+metal2vulkan-runtime = { path = "../../.deps/metal2vulkan/crates/metal2vulkan-runtime" }
+libc = "0.2"
+sha2 = { version = "0.10", features = ["asm"] }
+[profile.release]
+panic = "unwind"
+debug = 1

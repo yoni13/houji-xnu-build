@@ -1,0 +1,644 @@
+diff --git a/meson.build b/meson.build
+index 3aed8ca..6a2a30c 100644
+--- a/meson.build
++++ b/meson.build
+@@ -985,6 +985,7 @@ if with_clc
+ endif
+ 
+ with_gfx_compute = [
++  with_tools.contains('freedreno'),
+   with_any_opengl,
+   with_any_vk,
+   with_clc,
+diff --git a/meson.options b/meson.options
+index 678bc67..8b92a2b 100644
+--- a/meson.options
++++ b/meson.options
+@@ -222,11 +222,18 @@ option(
+   'freedreno-kmds',
+   type : 'array',
+   value : ['msm'],
+-  choices : ['msm', 'kgsl', 'virtio', 'wsl'],
++  choices : ['msm', 'kgsl', 'virtio', 'wsl', 'darwin'],
+   description : 'List of kernel-mode drivers to enable for freedreno ' +
+                 'gallium and vulkan driver',
+ )
+ 
++option(
++  'tu-darwin-abi-dir',
++  type : 'string',
++  value : '',
++  description : 'Directory holding NativeAdrenoABI.h for the Turnip darwin kernel backend (freedreno-kmds=darwin)',
++)
++
+ option(
+   'amdgpu-virtio',
+   type : 'boolean',
+@@ -899,3 +906,14 @@ option(
+   value : false,
+   description : 'Build panfrost Rust components.'
+ )
++
++option('offline-adreno-probe', type : 'string', value : '',
++       description : 'C source for an explicitly requested offline compiler fixture')
++
++option('offline-air-nir-dir', type : 'string', value : '',
++       description : 'Optional external AIR frontend source directory for offline tests')
++option('offline-air-nir-llvm-config', type : 'string', value : '',
++       description : 'Explicit LLVM config executable for the offline AIR frontend')
++
++option('tu-builtin-source-id', type : 'string', value : '', description : 'Exact builtin compiler source and profile identity')
++option('tu-builtin-pack-header', type : 'string', value : '', description : 'Explicit generated builtin pack header; empty retains compiler path')
+diff --git a/src/freedreno/ir3/ir3_disk_cache.c b/src/freedreno/ir3/ir3_disk_cache.c
+index 3b732d3..8946939 100644
+--- a/src/freedreno/ir3/ir3_disk_cache.c
++++ b/src/freedreno/ir3/ir3_disk_cache.c
+@@ -37,7 +37,8 @@ ir3_disk_cache_init(struct ir3_compiler *compiler)
+    const struct build_id_note *note =
+       build_id_find_nhdr_for_addr(ir3_disk_cache_init);
+    unsigned build_id_len = build_id_length(note);
+-   assert(note && build_id_len == BUILD_ID_EXPECTED_HASH_LENGTH); /* sha1 */
++   /* Mach-O identifies a build with its 16-byte LC_UUID; ELF uses SHA-1. */
++   assert(note && build_id_len == (DETECT_OS_APPLE ? 16 : BUILD_ID_EXPECTED_HASH_LENGTH));
+ 
+    const uint8_t *id_sha1 = build_id_data(note);
+    assert(id_sha1);
+diff --git a/src/freedreno/ir3/ir3_shader.c b/src/freedreno/ir3/ir3_shader.c
+index 6b8419b..cfe684a 100644
+--- a/src/freedreno/ir3/ir3_shader.c
++++ b/src/freedreno/ir3/ir3_shader.c
+@@ -352,17 +352,27 @@ create_roundtrip_variant(struct ir3_shader *shader, struct ir3_shader_variant *v
+    char *disasm_data = NULL;
+    size_t disasm_size = 0;
+    FILE *disasm_stream = open_memstream(&disasm_data, &disasm_size);
++   if (!disasm_stream)
++      goto fail;
+    ir3_shader_disasm(v, v->bin, disasm_stream);
+-   fflush(disasm_stream);
++   if (fclose(disasm_stream)) {
++      free(disasm_data);
++      goto fail;
++   }
+ 
+    struct ir3_kernel_info info;
+    memset(&info, 0, sizeof(info));
+    info.numwg = INVALID_REG;
+ 
+-   fseek(disasm_stream, 0, SEEK_SET);
+-   rt_v->ir = ir3_parse(rt_v, &info, disasm_stream);
++   /* open_memstream is a write stream; read the completed bytes separately. */
++   FILE *input = fmemopen(disasm_data, disasm_size, "r");
++   if (!input) {
++      free(disasm_data);
++      goto fail;
++   }
++   rt_v->ir = ir3_parse(rt_v, &info, input);
+ 
+-   fclose(disasm_stream);
++   fclose(input);
+    free(disasm_data);
+ 
+    if (!rt_v->ir) {
+diff --git a/src/freedreno/ir3/meson.build b/src/freedreno/ir3/meson.build
+index c6258e5..ab6a9c0 100644
+--- a/src/freedreno/ir3/meson.build
++++ b/src/freedreno/ir3/meson.build
+@@ -173,3 +173,31 @@ test('ir3_delay_test',
+   ),
+   suite: ['freedreno'],
+ )
++
++if get_option('offline-adreno-probe') != ''
++  executable(
++    'adreno_compiler_probe',
++    get_option('offline-adreno-probe'),
++    link_with : libfreedreno_ir3,
++    dependencies : [idep_libir3decode, idep_mesautil, idep_nir],
++    include_directories : [inc_freedreno, inc_include, inc_src],
++    build_by_default : false,
++  )
++endif
++
++if get_option('offline-air-nir-dir') != ''
++  air_llvm_config = find_program(get_option('offline-air-nir-llvm-config'), required : true)
++  air_cpp_args = run_command(air_llvm_config, '--cxxflags', check : true).stdout().strip().split()
++  air_link_args = run_command(air_llvm_config, '--ldflags', '--libs', 'core', 'bitreader', 'bitwriter', 'analysis', '--system-libs', check : true).stdout().strip().split()
++  air_dir = get_option('offline-air-nir-dir')
++  executable(
++    'air_nir',
++    [air_dir / 'Frontend.cpp', air_dir / 'MesaBackend.c', air_dir / 'Library.c'],
++    cpp_args : air_cpp_args,
++    link_args : air_link_args,
++    link_with : libfreedreno_ir3,
++    dependencies : [idep_libir3decode, idep_mesautil, idep_nir],
++    include_directories : [inc_freedreno, inc_include, inc_src],
++    build_by_default : false,
++  )
++endif
+diff --git a/src/freedreno/vulkan/meson.build b/src/freedreno/vulkan/meson.build
+index d6c8a05..b544a9f 100644
+--- a/src/freedreno/vulkan/meson.build
++++ b/src/freedreno/vulkan/meson.build
+@@ -100,6 +100,7 @@ libtu_includes = [
+ ]
+ 
+ tu_link_with = []
++tu_link_args = []
+ tu_deps = []
+ tu_flags = [sse2_args]
+ 
+@@ -115,6 +116,10 @@ if with_platform_wayland
+   tu_wsi = true
+ endif
+ 
++if with_platform_macos
++  tu_wsi = true
++endif
++
+ if system_has_kms_drm and not with_platform_android
+   tu_wsi = true
+ endif
+@@ -132,6 +137,19 @@ if freedreno_kmds.contains('kgsl')
+   libtu_files += files('tu_knl_kgsl.cc')
+ endif
+ 
++if freedreno_kmds.contains('darwin')
++  tu_flags += '-DTU_HAS_DARWIN'
++  libtu_files += files('tu_knl_darwin.cc', 'tu_builtin_cache.cc')
++  tu_flags += '-DTU_BUILTIN_SOURCE_ID="' + get_option('tu-builtin-source-id') + '"'
++  if get_option('tu-builtin-pack-header') != ''
++    tu_flags += '-DTU_BUILTIN_PACK_HEADER="' + get_option('tu-builtin-pack-header') + '"'
++  endif
++  libtu_includes += include_directories(get_option('tu-darwin-abi-dir'), is_system : false)
++  tu_deps += dependency('appleframeworks', modules : ['IOKit', 'CoreGraphics', 'Foundation', 'QuartzCore'])
++  # The wsi layer's device entrypoint table references weak symbols that nothing defines; ld64 needs them allowed.
++  tu_link_args += ['-Wl,-undefined,dynamic_lookup']
++endif
++
+ if freedreno_kmds.contains('msm')
+   tu_flags += '-DTU_HAS_MSM'
+   libtu_files += files('tu_knl_drm_msm.cc', 'tu_knl_drm.cc')
+@@ -225,7 +243,7 @@ libvulkan_freedreno = shared_library(
+   c_args : [no_override_init_args, tu_flags, soong_compat_c_args],
+   cpp_args : [tu_cpp_args, tu_flags, soong_compat_cpp_args],
+   gnu_symbol_visibility : 'hidden',
+-  link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id],
++  link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id, tu_link_args],
+   link_depends : vulkan_icd_link_depends,
+   install : true,
+ )
+diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
+index 47a2fc6..1d33085 100644
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -981,33 +981,39 @@ static void
+ compile_shader(struct tu_device *dev, struct nir_shader *nir,
+                unsigned consts, unsigned *offset, enum global_shader idx)
+ {
+-   nir->options = ir3_get_compiler_options(dev->compiler);
++   /* A provisioned variant bypasses NIR/compiler work while retaining the
++    * original global-BO upload, addresses and command emission below. */
++   struct ir3_shader_variant *so = dev->builtin_variants[idx];
++   struct ir3_shader *sh = NULL;
++   if (so) {
++      ralloc_free(nir);
++   } else {
++      nir->options = ir3_get_compiler_options(dev->compiler);
+ 
+-   nir_assign_io_var_locations(nir, nir_var_shader_in);
+-   nir_assign_io_var_locations(nir, nir_var_shader_out);
++      nir_assign_io_var_locations(nir, nir_var_shader_in);
++      nir_assign_io_var_locations(nir, nir_var_shader_out);
+ 
+-   struct ir3_const_allocations const_allocs = {};
+-   if (consts > 0)
+-      ir3_const_alloc(&const_allocs, IR3_CONST_ALLOC_UBO_RANGES, align(consts, 8), 1);
++      struct ir3_const_allocations const_allocs = {};
++      if (consts > 0)
++         ir3_const_alloc(&const_allocs, IR3_CONST_ALLOC_UBO_RANGES, align(consts, 8), 1);
+ 
+-   const struct ir3_shader_options options = {
+-      .api_wavesize = IR3_SINGLE_OR_DOUBLE,
+-      .real_wavesize = IR3_SINGLE_OR_DOUBLE,
+-      .const_allocs = const_allocs,
+-      .fragdata_dynamic_remap =
+-         idx >= GLOBAL_SH_VS_CLEAR && idx <= GLOBAL_SH_FS_CLEAR_MAX,
+-   };
++      const struct ir3_shader_options options = {
++         .api_wavesize = IR3_SINGLE_OR_DOUBLE,
++         .real_wavesize = IR3_SINGLE_OR_DOUBLE,
++         .const_allocs = const_allocs,
++         .fragdata_dynamic_remap =
++            idx >= GLOBAL_SH_VS_CLEAR && idx <= GLOBAL_SH_FS_CLEAR_MAX,
++      };
+ 
+-   ir3_finalize_nir(dev->compiler, &options.nir_options, nir);
++      ir3_finalize_nir(dev->compiler, &options.nir_options, nir);
+ 
+-   ir3_nir_lower_io(nir);
++      ir3_nir_lower_io(nir);
+ 
+-   struct ir3_shader *sh =
+-      ir3_shader_from_nir(dev->compiler, nir, &options);
++      sh = ir3_shader_from_nir(dev->compiler, nir, &options);
+ 
+-   struct ir3_shader_key key = {};
+-   struct ir3_shader_variant *so =
+-      ir3_shader_get_variant(sh, &key, false, false, NULL, NULL);
++      struct ir3_shader_key key = {};
++      so = ir3_shader_get_variant(sh, &key, false, false, NULL, NULL);
++   }
+ 
+    struct tu6_global *global = dev->global_bo_map;
+ 
+@@ -1045,6 +1051,8 @@ tu_destroy_clear_blit_shaders(struct tu_device *dev)
+       if (dev->global_shaders[i])
+          ir3_shader_destroy(dev->global_shaders[i]);
+    }
++   ralloc_free(dev->builtin_cache_owner);
++   dev->builtin_cache_owner = NULL;
+ }
+ 
+ enum r3d_type {
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 82efb07..527a4d4 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -34,6 +34,7 @@
+ #include "fdl/freedreno_layout.h"
+ #include "tu_acceleration_structure.h"
+ #include "tu_clear_blit.h"
++#include "tu_builtin_cache.h"
+ #include "tu_cmd_buffer.h"
+ #include "tu_cs.h"
+ #include "tu_descriptor_set.h"
+@@ -327,6 +328,7 @@ get_device_extensions(const struct tu_physical_device *device,
+       .EXT_extended_dynamic_state2 = true,
+       .EXT_extended_dynamic_state3 = true,
+       .EXT_external_memory_dma_buf = true,
++      .EXT_external_memory_host = device->has_host_import,
+       .EXT_filter_cubic = device->info->props.has_tex_filter_cubic,
+       .EXT_fragment_density_map = true,
+       .EXT_fragment_density_map_offset = true,
+@@ -1163,6 +1165,8 @@ tu_get_properties(struct tu_physical_device *pdevice,
+          : pdevice->info->props.max_storage_buffer_range_bytes;
+    props->maxPushConstantsSize = MAX_PUSH_CONSTANTS_SIZE;
+    props->maxMemoryAllocationCount = UINT32_MAX;
++   /* VK_EXT_external_memory_host: the kernel pins whole 4 KiB pages. */
++   props->minImportedHostPointerAlignment = 4096;
+    props->maxSamplerAllocationCount = 64 * 1024;
+    props->bufferImageGranularity = 64;          /* A cache line */
+    props->sparseAddressSpaceSize = pdevice->va_size;
+@@ -3046,6 +3050,11 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+ 
+    global = (struct tu6_global *)device->global_bo->map;
+    device->global_bo_map = global;
++#ifdef TU_HAS_DARWIN
++   result = tu_builtin_pack_load(device);
++   if (result != VK_SUCCESS)
++      goto fail_null_accel_struct;
++#endif
+    tu_init_clear_blit_shaders(device);
+ 
+    if (device->vk.enabled_features.accelerationStructure &&
+@@ -3161,6 +3170,9 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+                                  "pthread condattr init");
+       goto fail_timeline_cond;
+    }
++#ifndef __APPLE__
++   /* Darwin has no pthread_condattr_setclock: its condition variables always use the realtime clock, and the darwin
++    * backend converts monotonic deadlines itself. */
+    if (pthread_condattr_setclock(&condattr, CLOCK_MONOTONIC) != 0) {
+       pthread_condattr_destroy(&condattr);
+       result = vk_startup_errorf(physical_device->instance,
+@@ -3168,6 +3180,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+                                  "pthread condattr clock setup");
+       goto fail_timeline_cond;
+    }
++#endif
+    if (pthread_cond_init(&device->timeline_cond, &condattr) != 0) {
+       pthread_condattr_destroy(&condattr);
+       result = vk_startup_errorf(physical_device->instance,
+@@ -3485,6 +3498,17 @@ vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName)
+    return tu_GetInstanceProcAddr(instance, pName);
+ }
+ 
++#ifdef __APPLE__
++/* iPadOS has no Khronos loader: a consumer that opens a loader by path (the metal2vulkan runtime behind the native Metal device) opens this
++ * library and looks up the loader's name. Turnip is the only driver there, so the loader's entry is the driver's own. */
++PUBLIC
++VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
++vkGetInstanceProcAddr(VkInstance instance, const char *pName)
++{
++   return tu_GetInstanceProcAddr(instance, pName);
++}
++#endif
++
+ static VkResult
+ tu_add_to_heap(struct tu_device *dev, struct tu_bo *bo)
+ {
+@@ -3684,7 +3708,18 @@ tu_AllocateMemory(VkDevice _device,
+    const VkImportMemoryFdInfoKHR *fd_info =
+       vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
+ 
+-   if (fd_info && fd_info->handleType) {
++   const VkImportMemoryHostPointerInfoEXT *host_info =
++      vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
++
++   if (host_info && host_info->handleType) {
++      if (host_info->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
++          ((uintptr_t) host_info->pHostPointer | pAllocateInfo->allocationSize) & 4095) {
++         result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
++      } else {
++         result = tu_bo_init_host(device, &mem->bo, host_info->pHostPointer,
++                                  pAllocateInfo->allocationSize);
++      }
++   } else if (fd_info && fd_info->handleType) {
+       assert(fd_info->handleType ==
+                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
+              fd_info->handleType ==
+@@ -3808,6 +3843,22 @@ tu_AllocateMemory(VkDevice _device,
+    return VK_SUCCESS;
+ }
+ 
++VKAPI_ATTR VkResult VKAPI_CALL
++tu_GetMemoryHostPointerPropertiesEXT(VkDevice _device,
++                                     VkExternalMemoryHandleTypeFlagBits handleType,
++                                     const void *pHostPointer,
++                                     VkMemoryHostPointerPropertiesEXT *pMemoryHostPointerProperties)
++{
++   VK_FROM_HANDLE(tu_device, device, _device);
++   if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
++       !device->physical_device->has_host_import || ((uintptr_t) pHostPointer & 4095))
++      return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++   /* Imported pages keep the owner's CPU mapping; they are offered as the plain (host-coherent) type. On Darwin the importer cleans
++    * and invalidates its own CPU caches around GPU use (NativeAdrenoAbiBoImport), as an IOSurface's owner does. */
++   pMemoryHostPointerProperties->memoryTypeBits = 1u;
++   return VK_SUCCESS;
++}
++
+ VkResult
+ tu_allocate_lazy_memory(struct tu_device *dev,
+                         struct tu_device_memory *mem)
+diff --git a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
+index d32a7d8..356ab86 100644
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -136,6 +136,8 @@ struct tu_physical_device
+    uint64_t va_size;
+ 
+    bool has_cached_coherent_memory;
++   /* The kernel pins host pages as BOs (VK_EXT_external_memory_host). */
++   bool has_host_import;
+    bool has_cached_non_coherent_memory;
+    /* Index for device local, host-coherent, host-cached memory.
+     * Only set to positive index when overwriting device-local, uncached memory
+@@ -300,6 +302,7 @@ struct tu_device
+ {
+    struct vk_device vk;
+    struct tu_instance *instance;
++   void *darwin_retire; /* Darwin KMD's bounded deferred BO retirement state. */
+ 
+    struct tu_queue *queues[TU_MAX_QUEUE_FAMILIES];
+    int queue_count[TU_MAX_QUEUE_FAMILIES];
+@@ -309,6 +312,8 @@ struct tu_device
+    int fd;
+ 
+    struct ir3_compiler *compiler;
++   void *builtin_cache_owner;
++   struct ir3_shader_variant *builtin_variants[GLOBAL_SH_COUNT + 2];
+ 
+    /* Backup in-memory cache to be used if the app doesn't provide one */
+    struct vk_pipeline_cache *mem_cache;
+diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
+index fa2ca90..8b0aef1 100644
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -1169,8 +1169,14 @@ tu_get_image_memory_requirements(struct tu_device *dev, struct tu_image *image,
+       case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
+          VkMemoryDedicatedRequirements *req =
+             (VkMemoryDedicatedRequirements *) ext;
++         /* Host pointer imports carry no per-image metadata, so an image
++          * over one may be bound at any offset of a shared import.
++          */
++         const VkExternalMemoryHandleTypeFlags host_types =
++            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT |
++            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT;
+          req->requiresDedicatedAllocation =
+-            image->vk.external_handle_types != 0;
++            (image->vk.external_handle_types & ~host_types) != 0;
+          req->prefersDedicatedAllocation = req->requiresDedicatedAllocation;
+          break;
+       }
+diff --git a/src/freedreno/vulkan/tu_knl.cc b/src/freedreno/vulkan/tu_knl.cc
+index ab27798..9c545c6 100644
+--- a/src/freedreno/vulkan/tu_knl.cc
++++ b/src/freedreno/vulkan/tu_knl.cc
+@@ -85,6 +85,19 @@ tu_bo_init_new_explicit_iova(struct tu_device *dev,
+    return VK_SUCCESS;
+ }
+ 
++VkResult
++tu_bo_init_host(struct tu_device *dev, struct tu_bo **bo, void *pointer, uint64_t size)
++{
++   if (!dev->instance->knl->bo_init_host)
++      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++   VkResult result = dev->instance->knl->bo_init_host(dev, bo, pointer, size);
++   if (result != VK_SUCCESS)
++      return result;
++   if (!(*bo)->unique_id)
++      (*bo)->unique_id = (*bo)->gem_handle;
++   return VK_SUCCESS;
++}
++
+ VkResult
+ tu_bo_init_dmabuf(struct tu_device *dev,
+                   struct tu_bo **bo,
+@@ -362,6 +375,14 @@ tu_enumerate_devices(struct vk_instance *vk_instance)
+       mesa_logi("Found compatible device '%s'.", path);
+ 
+    return result;
++#elif defined(TU_HAS_DARWIN)
++   struct tu_instance *instance =
++      container_of(vk_instance, struct tu_instance, vk);
++
++   VkResult result = tu_knl_darwin_load(instance);
++   if (result == VK_SUCCESS && TU_DEBUG(STARTUP))
++      mesa_logi("Found the NativeAdreno kernel client.");
++   return result;
+ #else
+    return VK_ERROR_INCOMPATIBLE_DRIVER;
+ #endif
+diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
+index 4c2bf6a..a8ccd76 100644
+--- a/src/freedreno/vulkan/tu_knl.h
++++ b/src/freedreno/vulkan/tu_knl.h
+@@ -58,6 +58,13 @@ struct tu_bo {
+    int shared_fd;
+ #endif
+ 
++#ifdef TU_HAS_DARWIN
++   /* The NativeAdreno kernel client's buffer handle (64 bit, gem_handle is its low half) and the token that selects its
++    * CPU mapping (IOConnectMapMemory64 memory type). */
++   uint64_t darwin_handle;
++   uint32_t darwin_token;
++#endif
++
+    bool implicit_sync : 1;
+    bool never_unmap : 1;
+    bool cached_non_coherent : 1;
+@@ -140,6 +147,9 @@ struct tu_knl {
+                        const char *name);
+    VkResult (*bo_init_dmabuf)(struct tu_device *dev, struct tu_bo **out_bo,
+                               uint64_t size, enum tu_bo_alloc_flags flags, int prime_fd);
++   /* Optional (VK_EXT_external_memory_host): a BO over the caller's own pages at pointer. */
++   VkResult (*bo_init_host)(struct tu_device *dev, struct tu_bo **out_bo,
++                            void *pointer, uint64_t size);
+    int (*bo_export_dmabuf)(struct tu_device *dev, struct tu_bo *bo);
+    VkResult (*bo_alloc_lazy)(struct tu_device *dev, struct tu_bo *bo);
+    VkResult (*bo_map)(struct tu_device *dev, struct tu_bo *bo, void *placed_addr);
+@@ -221,6 +231,9 @@ tu_bo_init_dmabuf(struct tu_device *dev,
+ int
+ tu_bo_export_dmabuf(struct tu_device *dev, struct tu_bo *bo);
+ 
++VkResult
++tu_bo_init_host(struct tu_device *dev, struct tu_bo **bo, void *pointer, uint64_t size);
++
+ void
+ tu_bo_finish(struct tu_device *dev, struct tu_bo *bo);
+ 
+@@ -262,6 +275,7 @@ void tu_sparse_vma_finish(struct tu_device *device,
+                           struct tu_sparse_vma *vma);
+ 
+ VkResult tu_knl_kgsl_load(struct tu_instance *instance, int fd);
++VkResult tu_knl_darwin_load(struct tu_instance *instance);
+ 
+ struct _drmVersion;
+ VkResult tu_knl_drm_msm_load(struct tu_instance *instance,
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index dba43f9..8b010ed 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -1958,7 +1958,10 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
+ 
+    if (!executable_info) {
+       cache_hit = true;
+-      bool application_cache_hit = false;
++      /* Every required shader (and retained NIR, when requested) must come
++       * from the application's cache. Starting false makes this AND reduction
++       * report a miss even when compile-forbidden creation succeeds. */
++      bool application_cache_hit = true;
+ 
+       unsigned char shader_blake3[BLAKE3_KEY_LEN + 1];
+       memcpy(shader_blake3, pipeline_blake3, sizeof(pipeline_blake3));
+@@ -1997,7 +2000,8 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
+          cache_hit &= !!nir_shaders;
+       }
+ 
+-      if (application_cache_hit && builder->cache != builder->device->mem_cache) {
++      if (cache_hit && application_cache_hit &&
++          builder->cache != builder->device->mem_cache) {
+          pipeline_feedback.flags |=
+             VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT;
+       }
+@@ -2854,13 +2858,16 @@ template <chip CHIP>
+ static unsigned
+ tu6_scissor_size(struct tu_device *dev, const struct vk_viewport_state *vp)
+ {
+-   return 1 + vp->scissor_count * 2;
++   /* A pipeline without viewport state (rasterizer discard) has no scissors: a type-4 packet of zero registers is invalid. */
++   return vp->scissor_count ? 1 + vp->scissor_count * 2 : 0;
+ }
+ 
+ template <chip CHIP>
+ void
+ tu6_emit_scissor(struct tu_cs *cs, const struct vk_viewport_state *vp)
+ {
++   if (!vp->scissor_count)
++      return;
+    tu_cs_emit_pkt4(cs, GRAS_SC_SCREEN_SCISSOR_TL(CHIP, 0).reg, vp->scissor_count * 2);
+ 
+    for (uint32_t i = 0; i < vp->scissor_count; i++) {
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 8c228e9..d99d55c 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -3858,10 +3858,21 @@ tu_empty_fs_create(struct tu_device *dev, struct tu_shader **shader,
+    for (unsigned i = 0; i < MAX_SETS; i++)
+       (*shader)->dynamic_descriptor_sizes[i] = -1;
+ 
+-   struct ir3_shader *ir3_shader =
+-      ir3_shader_from_nir(dev->compiler, fs_b.shader, &options);
+-   (*shader)->variant = ir3_shader_create_variant(ir3_shader, &key, false);
+-   ir3_shader_destroy(ir3_shader);
++   struct ir3_shader_variant *cached =
++      dev->builtin_variants[GLOBAL_SH_COUNT + fragment_density_map];
++   if (cached) {
++      /* The shader object owns its variant independently of the global
++       * builtin context: normal shader destruction remains unchanged. */
++      ralloc_steal(NULL, cached);
++      (*shader)->variant = cached;
++      dev->builtin_variants[GLOBAL_SH_COUNT + fragment_density_map] = NULL;
++      ralloc_free(fs_b.shader);
++   } else {
++      struct ir3_shader *ir3_shader =
++         ir3_shader_from_nir(dev->compiler, fs_b.shader, &options);
++      (*shader)->variant = ir3_shader_create_variant(ir3_shader, &key, false);
++      ir3_shader_destroy(ir3_shader);
++   }
+ 
+    return tu_upload_shader(dev, *shader);
+ }
+diff --git a/src/util/cache_ops_aarch64.c b/src/util/cache_ops_aarch64.c
+index d56ab8a..2ab772b 100644
+--- a/src/util/cache_ops_aarch64.c
++++ b/src/util/cache_ops_aarch64.c
+@@ -29,9 +29,16 @@
+ static uint32_t
+ get_ctr_el0(void)
+ {
++#if defined(__APPLE__)
++   /* Darwin does not let EL0 read CTR_EL0 (the instruction raises SIGILL, which would take down whichever system process hosts the
++    * driver). The Adreno 740 hosts are Cortex cores with 64-byte data cache lines: CWG = DminLine = 4 (16 words). A line size that is
++    * too small only costs extra cache maintenance operations; one that is too large would skip lines. */
++   return (4u << 24) | (4u << 16);
++#else
+    uint32_t ctr_el0;
+    __asm("mrs\t%x0, ctr_el0" : "=r"(ctr_el0));
+    return ctr_el0;
++#endif
+ }
+ 
+ static uint32_t
+diff --git a/src/vulkan/wsi/wsi_common_metal_layer.m b/src/vulkan/wsi/wsi_common_metal_layer.m
+index 67c3e7f..9fbb042 100644
+--- a/src/vulkan/wsi/wsi_common_metal_layer.m
++++ b/src/vulkan/wsi/wsi_common_metal_layer.m
+@@ -4,6 +4,7 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <TargetConditionals.h>
+ #include "wsi_common_metal_layer.h"
+ 
+ #import <QuartzCore/CAMetalLayer.h>
+@@ -137,7 +138,9 @@
+ wsi_metal_layer_set_immediate(const CAMetalLayer *metal_layer,
+                               bool enable_immediate)
+ {
++#if TARGET_OS_OSX
+    metal_layer.displaySyncEnabled = !enable_immediate;
++#endif /* iOS layers are always display synchronised */
+ }
+ 
+ VkResult
+@@ -169,7 +172,9 @@
+       metal_layer.maximumDrawableCount = image_count;
+       metal_layer.drawableSize = (CGSize){.width = width, .height = height};
+       metal_layer.opaque = enable_opaque;
++#if TARGET_OS_OSX
+       metal_layer.displaySyncEnabled = !enable_immediate;
++#endif
+       metal_layer.pixelFormat = metal_format;
+ 
+       metal_layer.colorspace = cg_color_space;
