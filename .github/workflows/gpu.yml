@@ -23,7 +23,7 @@ jobs:
           "$HOME/.cargo/bin/rustup" target add aarch64-apple-ios --toolchain 1.98.0
           xcodebuild -version
           python3 -m venv .venv
-          .venv/bin/pip install mako pyyaml packaging
+          .venv/bin/pip install meson ninja mako pyyaml packaging
       - name: Prepare active sources
         run: |
           set -euxo pipefail
