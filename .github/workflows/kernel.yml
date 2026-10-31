@@ -1,0 +1,97 @@
+name: houji kernel
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: macOS runner image
+        type: choice
+        default: macos-15
+        options: [macos-14, macos-15, macos-26]
+      xcode:
+        description: Xcode version (empty = runner default)
+        type: string
+        default: ''
+permissions:
+  contents: read
+env:
+  XNU_REV: 1b191cb58250d0705d8a51287127505aa4bc0789
+  DXB_REV: 663906528d1cd5ea8fde7de6f16de73db9511549
+  MACOS_VERSION: '13.5'
+  KERNEL_CONFIG: DEVELOPMENT
+  ARCH_CONFIG: ARM64
+  MACHINE_CONFIG: SWEET
+jobs:
+  kernel:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Select Xcode and tools
+        run: |
+          brew install jq gum cmake ninja bash || true
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          if [ -n "${{ inputs.xcode }}" ]; then sudo xcode-select -s "/Applications/Xcode_${{ inputs.xcode }}.app"; fi
+          echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
+          xcodebuild -version
+          ls -d /Applications/Xcode*.app
+      - name: Prepare pinned XNU with houji patches and overlay
+        run: |
+          set -euo pipefail
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 https://github.com/blacktop/darwin-xnu-build "$DXB_REV"
+          git -C dxb checkout -q FETCH_HEAD
+          git init -q xnu-upstream
+          git -C xnu-upstream fetch -q --depth 1 https://github.com/apple-oss-distributions/xnu.git "$XNU_REV"
+          git -C xnu-upstream checkout -q FETCH_HEAD
+          python3 houji/tools/prepare-sources.py kernel --upstream xnu-upstream --output dxb/xnu
+          # dxb applies its generic patches with `git apply`; give the tree a repository.
+          git -C dxb/xnu init -q && git -C dxb/xnu add -A >/dev/null && git -C dxb/xnu -c user.email=ci@local -c user.name=ci commit -qm houji
+          openssl enc -d -aes-256-cbc -pbkdf2 -pass env:FW_KEY -in fwheaders.tar.gz.enc | tar -xzf - -C dxb/xnu/iokit/Kernel/houji-ufs-root/
+          ls -la dxb/xnu/iokit/Kernel/houji-ufs-root/Houji*Firmware*.h
+          grep -n kHoujiRootFirst dxb/xnu/iokit/Kernel/houji-ufs-root/HoujiRootPolicy.h
+        env:
+          FW_KEY: ${{ secrets.FW_KEY }}
+      - name: Build Apple build dependencies (dxb, without its XNU step)
+        working-directory: dxb
+        run: |
+          set -o pipefail
+          python3 - <<'EOF'
+          from pathlib import Path
+          p = Path('build.sh'); s = p.read_text()
+          old = '        build_xnu\n        echo "  🎉 XNU Build Done!"'
+          assert old in s
+          p.write_text(s.replace(old, '        echo "dependencies ready"'))
+          EOF
+          bash build.sh 2>&1 | tee ../deps-build.log
+          ls fakeroot/usr/local/bin fakeroot/usr/local/lib/kernel
+          ls -d /Library/Developer/KDKs/*
+      - name: Build houji kernel
+        run: |
+          set -o pipefail
+          export HOUJI_XNU="$PWD/dxb/xnu"
+          export HOUJI_KDK="$(ls -d /Library/Developer/KDKs/KDK_13.5_*.kdk | head -1)"
+          export HOUJI_FAKEROOT="$PWD/dxb/fakeroot"
+          export HOUJI_BUILD_ROOT="$PWD/out/kernel"
+          export HOUJI_JOBS="$(sysctl -n hw.ncpu)"
+          # The kernel build writes into DSTROOT=$HOUJI_BUILD_ROOT/fakeroot, but headers and
+          # libfirehose_kernel come from FAKEROOT_DIR, which is the dxb fakeroot.
+          bash houji/tools/build-kernel.sh 2>&1 | tee kernel-build.log
+      - name: Collect kernel
+        if: always()
+        run: |
+          mkdir -p artifact
+          find out/kernel -name 'kernel.development.sweet*' -maxdepth 6 -print
+          k=$(find out/kernel/xnu.obj -name 'kernel.development.sweet' -type f | head -1 || true)
+          [ -n "$k" ] && cp "$k" artifact/ && shasum -a 256 artifact/* > artifact/SHA256SUMS || true
+          cp deps-build.log kernel-build.log artifact/ 2>/dev/null || true
+          tail -c 200000 kernel-build.log > artifact/kernel-build-tail.log 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: houji-kernel
+          path: artifact/
+          retention-days: 7

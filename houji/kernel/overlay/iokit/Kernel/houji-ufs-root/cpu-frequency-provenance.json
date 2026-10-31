@@ -1,0 +1,26 @@
+{
+  "reference": {
+    "url": "https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/shennong-u-oss/drivers/cpufreq/qcom-cpufreq-hw.c",
+    "sha256": "2584e93d8604033df12a2b3d90c4b017659ff934bf5dff512e3ad8da16bdd646",
+    "license": "GPL-2.0; reference only, not incorporated into XNU"
+  },
+  "source_device_tree_sha256": "04dad3a2a40758525e93109ef17954183500a86c7bdf77973b89e39f97723807",
+  "domain": 0,
+  "physical_base": "0x17d91000",
+  "mapped_bytes": 4096,
+  "read_offsets": [
+    "0x0",
+    "0x20",
+    "0xb0",
+    "0x320",
+    "0x100 + validated_index*4",
+    "0x3c8"
+  ],
+  "cycles": "vendor reg_cycle_cntr 0x3c4 plus accumulative_counter CPU0 offset 4",
+  "sample_milliseconds": 100,
+  "writes_to_clock_voltage_registers": false,
+  "interpretation": "CPU0 busy average over architected-timer interval; requested LUT index recorded separately; not a DVFS driver",
+  "hardware_tested": false,
+  "r35_hardware_result": "8 GiB and UFS passed; CNTVCT sample rejected as backwards; no frequency conclusion",
+  "reference_counter": "XNU clock_get_uptime; no direct speculative CNTVCT polling"
+}

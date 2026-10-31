@@ -1,0 +1,41 @@
+# Xiaomi 14 / houji. Darwin 22 / iOS 16 native UFS port; eight CPU cores.
+[board]
+name = "houji"
+soc = "SM8650"
+description = "Xiaomi 14 23127PN0CC"
+kit = "houji"
+
+# Always pass the owner's local IPSW with --ipsw or UNIXNU_IPSW.
+# No fallback to the reference board's iPadOS image.
+[ipsw]
+product = "iPhone10,3"
+version = "16.7.16"
+build = "20H392"
+device_class = "d22ap"
+chip_id = 0x8015
+board_id = 0x06
+fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustCache"]
+
+# Member pins from the locally supplied 20H392 archive; see docs/development.md.
+[ipsw.sha256]
+"kernelcache.release.iphone10b" = "2d6a13d040aaf87cec09bb6906d43e9bd8cea951e43d1aa1cd62707dfdc5aaec"
+"DeviceTree.d22ap.im4p" = "480e8b0888949b4128b7aa2cd254497581c69e1bafa596a760b2fa955a8a6368"
+"087-86698-044.dmg.trustcache" = "63e01c03b31e1532a5581a24865490673f0b5c297b0199fe0095637c6100ef4b"
+"087-86593-047.dmg.trustcache" = "9cc478fe3525e2683b5b9ea1eea0851eaebebdab21d206556233400e59d2e361"
+
+[firmware]
+config = "houji"
+dsc = "Platforms/Xiaomi/houjiPkg/houji.dsc"
+fd = "Build/houjiPkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
+
+[firmware.defines]
+DEVICE_MODEL = "0"
+ENABLE_SECUREBOOT = "0"
+FD_BASE = "0xA7100000"
+FD_SIZE = "0x300000"
+FD_BLOCKS = "0x300"
+
+[bootimg.image]
+header_version = 4
+os_version = "16.0.0"
+os_patch_level = "2026-08"

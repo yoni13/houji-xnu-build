@@ -1,0 +1,24 @@
+{
+  "reference_revision": "18f51ec652501c62e19dd4f1035dc51daa2a3361",
+  "native_ufs_revision": "af785c1777161a62931425c2faaa536ce0bebd5b",
+  "reference_files": {
+    "RootCommands.h": "ee2dd30ba52e2ab0116c3e8b0913351979917c2368621960105fe919f878c859",
+    "LICENSE": "d3cdce3b19df47f2e4dcafdfd54909eb9bc64ac722645ceb1feae58695c97b09",
+    "RootDiagnostics.h": "0ad96da909e87d161b17694e32768a9d84500da96f975dcc6913535c413fde29",
+    "RootQueue.h": "001d06dcc4c3c7073704cffa3105a28d11e3e97985e7fcb49b8cc107216248bf",
+    "TransferPoll.h": "742df51cdce6d06df6bf93294176f01305c9d1359c8ffdfb99daff7b76a1ece3",
+    "GccUfs.h": "1ef7030533184ecb7efebb8ad3a6fa8e155a8b5b9eea19a6a2af758027d483c3",
+    "RootLayout.h": "3e25127486a5102cd477fcfabd62366a3b3f02bb12a0b8db2294330a4b233484",
+    "SmmuTakeover.h": "54868bf0745ee6093627e73ba8cec9ac3c574446955c359463507d0f122f90a8",
+    "GiuliaUfsRead.cpp": "ca5c15f81fc5049000bca1d32427eb960c1cf6c9864f537b1bcb4a3135730f67",
+    "upstream.json": "8b5e87b0459c8d886349e87bf9aa08b3dc84d4a7958cc0a7bd4154148cc14dd8",
+    "GiuliaSmmuTakeover.h": "8caff7d3ee58b012f22815bdaa271299235ed8b89e7d94e0a02caff769054bf1",
+    "RootTransportLayout.h": "77699362f09e103ceda0d5f216d0be7749cdc1e88c6143ddd15ceb11dfd42e91"
+  },
+  "policy": "r24 GPT-only default; optional r25 fixed-file 16-sector log write after live FAT/GPT/initial-run validation; no root-media publication",
+  "hardware_tested": true,
+  "verified_scopes": {
+    "r24": "native GPT READ PASS",
+    "r25": "native fixed-file snapshot persists across automatic PSCI return; independent ADB and direct-media CRC verified"
+  }
+}
