@@ -123,7 +123,7 @@ jobs:
           xcrun clang -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -std=c11 -c gpu/metal/AdrenoPM4.c -o AdrenoPM4.o
           xcrun clang++ -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -g -fstack-protector-strong \
             -std=c++17 -fobjc-arc -Wno-deprecated-declarations -bundle \
-            -I gpu/metal -I gpu -I "$SDK/usr/include" \
+            -I gpu/metal -I gpu -I mesa/include -I "$SDK/usr/include" \
             -x objective-c++ gpu/metal/NativeAdrenoMetalPlugin.mm gpu/metal/NativeBridgeMetalFrontend.mm \
             -x none AdrenoPM4.o bridge-target/aarch64-apple-ios/release/libnative_metal_bridge.a \
             -Wl,-dead_strip -lobjc -framework Foundation -framework Metal -framework IOSurface \
