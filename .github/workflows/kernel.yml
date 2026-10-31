@@ -93,9 +93,10 @@ jobs:
         if: always()
         run: |
           mkdir -p artifact
-          find out/kernel -name 'kernel.development.sweet*' -maxdepth 6 -print
-          k=$(find out/kernel/xnu.obj -name 'kernel.development.sweet' -type f | head -1 || true)
-          [ -n "$k" ] && cp "$k" artifact/ && shasum -a 256 artifact/* > artifact/SHA256SUMS || true
+          find out/kernel -name 'kernel.development.sweet*' -not -path '*.dSYM/*' -print
+          k=out/kernel/fakeroot/System/Library/Kernels/kernel.development.sweet
+          [ -f "$k" ] || k=out/kernel/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet
+          if [ -f "$k" ]; then cp "$k" artifact/kernel.development.sweet; file artifact/kernel.development.sweet; shasum -a 256 artifact/kernel.development.sweet > artifact/SHA256SUMS; fi
           cp deps-build.log kernel-build.log artifact/ 2>/dev/null || true
           tail -c 200000 kernel-build.log > artifact/kernel-build-tail.log 2>/dev/null || true
       - uses: actions/upload-artifact@v4
