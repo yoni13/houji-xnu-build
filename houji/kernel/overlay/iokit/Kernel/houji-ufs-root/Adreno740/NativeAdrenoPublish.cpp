@@ -463,7 +463,7 @@ extern "C" void houji_gate_hitch_snapshot(uint64_t out[6]);
 extern "C" void houji_surface_lazy_report(void);
 extern "C" {extern volatile uint64_t native_adreno_wptr_stats[4];}
 extern "C" {extern volatile uint64_t native_adreno_dvfs_skips[2];}
-extern "C" {extern volatile uint64_t native_adreno_submit_parts[8][2];}
+extern "C" {extern volatile uint64_t native_adreno_submit_parts[12][2];}
 extern "C" {extern volatile uint64_t native_adreno_pipeline_stats[5];extern volatile uint64_t native_adreno_tlb_stats[2];}
 /* Methods that may skip waiting for the GPU (see native_adreno_board_light_gate): no page table, SMMU or GPU register access,
  * except the submission itself, which the gate admits only under unchanged, already synchronized tables. */
@@ -973,8 +973,8 @@ extern "C" void native_adreno_perf_report(void){
    native_adreno_tlb_stats[0],native_adreno_tlb_stats[1],g.submit?g.submit->outstanding():0ul);
  }
  {
-  const char *names[8]={"retire","acquire-imported","hold","sample","ring","tlb","depth-wait","light-gate"};
-  for(unsigned i=0;i<8;i++)IOLog("HOUJI SUBMIT PART: %s n=%llu us=%llu; live\n",names[i],native_adreno_submit_parts[i][0],native_adreno_submit_parts[i][1]);
+  const char *names[12]={"retire","acquire-imported","hold","sample","ring","tlb","depth-wait","light-gate","ring-rptr","ring-emit","ring-publish","ring-wptr"};
+  for(unsigned i=0;i<12;i++)IOLog("HOUJI SUBMIT PART: %s n=%llu us=%llu; live\n",names[i],native_adreno_submit_parts[i][0],native_adreno_submit_parts[i][1]);
  }
  houji_surface_lazy_report();
  IOLog("HOUJI DVFS LOCK: skipped-ticks=%llu retries=%llu; live\n",native_adreno_dvfs_skips[0],native_adreno_dvfs_skips[1]);

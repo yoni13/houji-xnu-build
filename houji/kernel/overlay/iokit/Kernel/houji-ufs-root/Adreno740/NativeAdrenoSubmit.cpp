@@ -18,10 +18,10 @@ static void submitDiagRecord(unsigned slot,uint64_t began) {
 }
 /* Finer parts, [part][0]=count [1]=us: 0 retireCompleted, 1 acquireImported (job release), 2 holdJob, 3 sample/peek words,
  * 4 ring write, 5 TLB step; 6 depth wait and 7 light gate are recorded by the board. */
-extern "C" {volatile uint64_t native_adreno_submit_parts[8][2];}
+extern "C" {volatile uint64_t native_adreno_submit_parts[12][2];}
 extern "C" void native_adreno_submit_part(unsigned part,uint64_t began)
 {
-    if(!began || part>=8)return;
+    if(!began || part>=12)return;
     const uint64_t end=submitDiagNow();if(end<began)return;
     __atomic_fetch_add(&native_adreno_submit_parts[part][0],1ull,__ATOMIC_RELAXED);
     __atomic_fetch_add(&native_adreno_submit_parts[part][1],end-began,__ATOMIC_RELAXED);
