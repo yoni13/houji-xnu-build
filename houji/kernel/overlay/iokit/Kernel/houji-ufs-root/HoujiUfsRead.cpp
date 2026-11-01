@@ -687,9 +687,6 @@ extern "C" void houji_ufs_root_attach(void) {
 namespace {
 inline uint64_t partLe64(const uint8_t *p){uint64_t v=0;for(int i=7;i>=0;i--)v=(v<<8)|p[i];return v;}
 inline uint32_t partLe32(const uint8_t *p){return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);}
-struct HoujiPartGrant {uint32_t lun; uint64_t first, blocks;};
-HoujiPartGrant gHoujiPartGrants[4];
-unsigned gHoujiPartGrantCount;
 }
 extern "C" int native_ufs_part_find(const char *name, uint32_t *lun, uint64_t *first, uint64_t *blocks)
 {
@@ -699,11 +696,11 @@ extern "C" int native_ufs_part_find(const char *name, uint32_t *lun, uint64_t *f
   if (!__atomic_load_n(&lock, __ATOMIC_ACQUIRE)) {IOLock *made = IOLockAlloc(), *none = nullptr; if (!made) return 0; if (!__atomic_compare_exchange_n(&lock, &none, made, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) IOLockFree(made);}
   IOLockLock(lock);
   int found = 0;
-  for (uint32_t l = 0; l < 6 && !found; l++) {
+  for (uint32_t l = 1; l < 6 && !found; l++) {
     if (hostRead4k((uint8_t)l, 1, 1, block) != kIOReturnSuccess || memcmp(block, "EFI PART", 8)) continue;
     const uint64_t entriesLba = partLe64(block + 72);
     const uint32_t count = partLe32(block + 80), size = partLe32(block + 84);
-    if (size != 128 || count > 256 || entriesLba < 2) continue;
+    if (size != 128 || count > 256 || entriesLba != 2) continue;
     for (uint32_t i = 0; i < count && !found; i++) {
       if (i % 32 == 0 && hostRead4k((uint8_t)l, entriesLba + i / 32, 1, block) != kIOReturnSuccess) break;
       const uint8_t *e = block + (i % 32) * 128;
