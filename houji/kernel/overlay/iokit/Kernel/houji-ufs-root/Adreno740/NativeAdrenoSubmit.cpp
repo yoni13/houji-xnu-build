@@ -38,7 +38,7 @@ struct SubmitDiagScope {unsigned slot;uint64_t began;
  * and IB_SIZE in dwords (bits 0..19), exactly as the pinned adreno_pm4.xml
  * domain states and Linux msm_gem_submit.c converts the userspace byte size. */
 enum : uint32_t {SubmitIndirectBuffer=0x3f,SubmitIbWords=3,SubmitMaxJobs=8,
-    SubmitMaxBuffers=16,SubmitMaxIbBytes=0xfffffu*4u,
+    SubmitMaxBuffers=32,SubmitMaxIbBytes=0xfffffu*4u,
     SubmitAuditBytes=256u*1024u};   /* IB bytes the write-combine audit compares per submission */
 extern "C" {volatile uint32_t native_adreno_coherence[8];}
 /* The submission (1-based count) at which the write-combine audit found a dirty IB line or failed; 0 = never. */
@@ -113,8 +113,9 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     if(!buffers || !count || count>SubmitMaxBuffers)return kIOReturnBadArgument;
     /* Every buffer is validated against the live VM before any reference. */
-    uint64_t handles[SubmitMaxBuffers];size_t handle_count=0;
-    uint32_t words[SubmitMaxBuffers*(1+SubmitIbWords)];size_t word_count=0;
+    /* Scratch off the kernel stack: every caller holds the provider's issuer lock (or is the single boot thread). */
+    static uint64_t handles[SubmitMaxBuffers];size_t handle_count=0;
+    static uint32_t words[SubmitMaxBuffers*(1+SubmitIbWords)];size_t word_count=0;
     for(size_t i=0;i<count;++i) {
         const NativeAdrenoSubmitBuffer &buffer=buffers[i];
         if(!buffer.handle || !buffer.bytes || (buffer.bytes&3) || buffer.bytes>SubmitMaxIbBytes)

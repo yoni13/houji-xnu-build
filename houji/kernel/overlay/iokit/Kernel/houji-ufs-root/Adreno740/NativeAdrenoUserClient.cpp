@@ -335,7 +335,7 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
         const IOReturn waited=submit_->observeFence((uint32_t)request->wait_fence,clock,wait_us);
         if(waited)return waited;
     }
-    NativeAdrenoSubmitBuffer buffers[NativeAdrenoAbiMaxBuffers];
+    static NativeAdrenoSubmitBuffer buffers[NativeAdrenoAbiMaxBuffers];   /* serialized by the issuer lock; off the kernel stack */
     for(uint32_t i=0;i<request->buffer_count;++i) {
         const NativeAdrenoAbiSubmitBuffer &wire=request->buffers[i];
         if(!wire.bytes || (wire.bytes&3))return kIOReturnBadArgument;
@@ -508,7 +508,7 @@ IOReturn NativeAdrenoUserClient::dispatch(uint32_t method,const void *input,
         break;
     }
     case NativeAdrenoMethodSubmit: {
-        NativeAdrenoAbiSubmit request{};
+        static NativeAdrenoAbiSubmit request;request={};   /* serialized by the issuer lock; off the kernel stack */
         memcpy(&request,input,sizeof(request));
         NativeAdrenoAbiSubmitReply reply{};
         status=submit(&request,&reply,clock);
