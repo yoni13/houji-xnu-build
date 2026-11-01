@@ -753,5 +753,6 @@ extern "C" void houji_power_report(void) {
     IOLog("HOUJI BATTERY: stage=%d pct=%d mV=%d mA=%d temp=%d flags=%x cycles-done=%d answers=%d to/err=%x notes=%d usb=%d full=%d design=%d "
           "cycles=%d drop=%x refused=%d\n", b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
     IOLog("HOUJI CHARGER: usb-online=%d usb-type=%d adapter=%d real-type=%d limit-mA=%d max-mA=%d usb-mV=%d usb-mA=%d status=%d type=%d "
-          "thermal=%d chg-mA=%d watts=%d bits=%x\n", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], c[12], c[13]);
+          "thermal=%d chg-mA=%d watts=%d bits=%x limit-sets=%x limit-result=%d\n", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11],
+          c[12], c[13], c[14], c[15]);
 }
