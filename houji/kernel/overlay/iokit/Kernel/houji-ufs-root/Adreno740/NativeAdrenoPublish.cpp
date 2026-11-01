@@ -914,6 +914,14 @@ extern "C" void native_adreno_perf_report(void){
   uint64_t v[4];for(unsigned i=0;i<4;++i)v[i]=__atomic_load_n(&nativeAdrenoDispatchPerf[method][i],__ATOMIC_RELAXED);
   if(v[0])IOLog("HOUJI ABI METHOD: id=%u calls=%llu total-us=%llu max-us=%llu no-drain=%llu; live\n",method,v[0],v[1],v[2],v[3]);
  }
+ {
+  const char *phases[]={"all","wc-reassert","publish","audit"};
+  for(unsigned phase=0;phase<4;++phase){
+   uint64_t v[3];for(unsigned i=0;i<3;++i)v[i]=__atomic_load_n(&native_adreno_submit_cost[phase*3+i],__ATOMIC_RELAXED);
+   IOLog("HOUJI SUBMIT COST: phase=%s calls=%llu total-us=%llu max-us=%llu; live\n",phases[phase],v[0],v[1],v[2]);
+  }
+  IOLog("HOUJI COHERENT SKIPS: %u/%u/%u/%u wc-trusted-audit=%u/%u/%u/%u reset=%u distrusted=%u; live\n",native_adreno_coherent_skips[0],native_adreno_coherent_skips[1],native_adreno_coherent_skips[2],native_adreno_coherent_skips[3],native_adreno_wc_audit[0],native_adreno_wc_audit[1],native_adreno_wc_audit[2],native_adreno_wc_audit[3],native_adreno_wc_audit[5],native_adreno_wc_distrusted);
+ }
  IOLog("HOUJI WAIT OUTER: waits=%llu total-us=%llu pauses=%llu max-us=%llu; live\n",native_adreno_wait_outer[0],native_adreno_wait_outer[1],native_adreno_wait_outer[2],native_adreno_wait_outer[3]);
  for(unsigned row=0;row<48;row++)if(native_adreno_metal_rows[row][0])IOLog("HOUJI METAL ROW %u: %.95s\n",row,native_adreno_metal_rows[row]);
 }
