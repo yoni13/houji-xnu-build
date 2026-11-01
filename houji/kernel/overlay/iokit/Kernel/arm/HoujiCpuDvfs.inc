@@ -70,7 +70,7 @@ static void worker(void*,wait_result_t){
  uint64_t last=mach_absolute_time(),idle[8]={},report=last,boost=0,frameTicks=0,frameUntil=0;
  uint64_t submits=houji_gpu_submit_activity(),sumUs=0,boostUs=0,frameUs=0,maxTickUs=0;
  uint64_t coreUs[8]={},requestUs[4]={};
- HoujiThermal::Reading heat{};bool sensing=HoujiThermal::init();unsigned heatLevel=sensing?0:2,heatTick=0,levelMax=0;
+ HoujiThermal::Reading heat{};bool sensing=HoujiThermal::init();unsigned heatLevel=sensing?0:2,heatTick=0,levelMax=0,spikesIgnored=0;
  int cpuMax=-1000,gpuMax=-1000,hotMax=-1000;
  if(!sensing)IOLog("HOUJI THERMAL: sensors unavailable; fixed level 2 CPU cap\n");
  unsigned recent=0,quiet[4]={},stateMin[4]={UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX},stateMax[4]={},throttled[4]={},changes[4]={};
@@ -94,7 +94,14 @@ static void worker(void*,wait_result_t){
   uint64_t touch=houji_dvfs_touch_time();bool boosted=touch && now>=touch && now-touch<boost;
   if(boosted)boostUs+=us;if(framing)frameUs+=us;
   if(sensing && ++heatTick>=6){heatTick=0;
-   if(HoujiThermal::read(heat)){unsigned next=HoujiThermal::level(heatLevel,heat.hottest);
+   if(HoujiThermal::read(heat)){
+    /* A single 240 ms sample on one sensor reached 87-93 C with ~61 C on the next (app launch bursts), dropping CPU and GPU
+     * to minimum for about a second. Rises follow the lower of two consecutive readings; >=95 C still acts at once. */
+    static int previous=-1000;
+    const int confirmed=heat.hottest>=950?heat.hottest:(heat.hottest<previous?heat.hottest:previous);
+    if(heatLevel+1<HoujiThermal::levels && heat.hottest>=HoujiThermal::trigger[heatLevel+1] && confirmed<HoujiThermal::trigger[heatLevel+1])++spikesIgnored;
+    previous=heat.hottest;
+    unsigned next=HoujiThermal::level(heatLevel,confirmed>-1000?confirmed:heat.hottest);
     if(next!=heatLevel)IOLog("HOUJI THERMAL LEVEL: %u->%u hottest=%d.%dC sensor=%u/%u cpu=%d.%dC gpu=%d.%dC\n",heatLevel,next,heat.hottest/10,heat.hottest%10,heat.hottestId>>4,heat.hottestId&15,heat.cpu/10,heat.cpu%10,heat.gpu/10,heat.gpu%10);
     heatLevel=next;__atomic_store_n(&houji_thermal_level,heatLevel,__ATOMIC_RELAXED);
     if(heat.cpu>cpuMax)cpuMax=heat.cpu;if(heat.gpu>gpuMax)gpuMax=heat.gpu;if(heat.hottest>hotMax)hotMax=heat.hottest;
@@ -125,7 +132,7 @@ static void worker(void*,wait_result_t){
     for(unsigned id=0;id<domains;id++){auto&w=d[id];h.request[id]=(uint32_t)(requestUs[id]/sumUs);h.stateMin[id]=stateMin[id];h.stateMax[id]=stateMax[id];h.throttled[id]=throttled[id];h.changes[id]=w.changes-changes[id];}
     __atomic_store_n(&historyCount,count+1,__ATOMIC_RELEASE);
    }
-   IOLog("HOUJI THERMAL: hottest=%d.%dC sensor=%u/%u cpu=%d.%dC gpu=%d.%dC ddr=%d.%dC level=%u window-max=%d.%dC valid=%u invalid=%u\n",heat.hottest/10,heat.hottest%10,heat.hottestId>>4,heat.hottestId&15,heat.cpu/10,heat.cpu%10,heat.gpu/10,heat.gpu%10,heat.ddr/10,heat.ddr%10,heatLevel,hotMax/10,hotMax%10,heat.valid,heat.invalid);
+   IOLog("HOUJI THERMAL: hottest=%d.%dC sensor=%u/%u cpu=%d.%dC gpu=%d.%dC ddr=%d.%dC level=%u window-max=%d.%dC valid=%u invalid=%u spikes-ignored=%u\n",heat.hottest/10,heat.hottest%10,heat.hottestId>>4,heat.hottestId&15,heat.cpu/10,heat.cpu%10,heat.gpu/10,heat.gpu%10,heat.ddr/10,heat.ddr%10,heatLevel,hotMax/10,hotMax%10,heat.valid,heat.invalid,spikesIgnored);
    cpuMax=gpuMax=hotMax=-1000;levelMax=heatLevel;
    sumUs=boostUs=frameUs=maxTickUs=0;for(auto&c:coreUs)c=0;
    for(unsigned id=0;id<domains;id++){requestUs[id]=0;stateMin[id]=UINT32_MAX;stateMax[id]=throttled[id]=0;changes[id]=d[id].changes;}
