@@ -462,6 +462,7 @@ extern "C" IOReturn native_adreno_board_light_gate(int submit);
 extern "C" void houji_gate_hitch_snapshot(uint64_t out[6]);
 extern "C" void houji_surface_lazy_report(void);
 extern "C" {extern volatile uint64_t native_adreno_wptr_stats[4];}
+extern "C" {extern volatile uint64_t native_adreno_dvfs_skips[2];}
 extern "C" {extern volatile uint64_t native_adreno_submit_parts[8][2];}
 extern "C" {extern volatile uint64_t native_adreno_pipeline_stats[5];extern volatile uint64_t native_adreno_tlb_stats[2];}
 /* Methods that may skip waiting for the GPU (see native_adreno_board_light_gate): no page table, SMMU or GPU register access,
