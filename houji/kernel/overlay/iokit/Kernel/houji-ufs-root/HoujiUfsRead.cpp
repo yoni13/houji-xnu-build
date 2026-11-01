@@ -128,6 +128,27 @@ static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, u
   report[2] = sctlr;
 }
 
+/* Same proven bypass route as UFS, for another stream whose controller is
+ * already halted (debug USB). Never panics; returns null or the refusal. */
+extern "C" const char *houji_smmu_route_stream(uint16_t stream, uint64_t dma, uint64_t bytes, uint32_t report[3])
+{
+  static OSSharedPtr<IOMemoryMap> keep;
+  report[0] = report[1] = report[2] = 0;
+  uintptr_t smmu = keep ? static_cast<uintptr_t>(keep->getVirtualAddress()) : mapPhys(0x15000000ULL, 0xd0000, keep);
+  if (!smmu) return "SMMU map failed";
+  auto rd = [smmu](unsigned offset) { return read32(smmu, offset); };
+  UfsSmmuPlan plan = planUfsSmmu(stream, dma, bytes, rd);
+  if (plan.error) { report[0] = plan.slot; report[1] = plan.smr; report[2] = plan.s2cr; return plan.error; }
+  const char *failure = configureUfsSmmu(plan, stream, rd, [smmu](unsigned offset, uint32_t value) {
+    write32(smmu, offset, value);
+    __asm__ volatile ("dsb sy" ::: "memory");
+  });
+  report[0] = plan.slot | (plan.bank << 16);
+  report[1] = read32(smmu, 0x1000 + 4 * plan.bank);
+  report[2] = read32(smmu, (plan.pages + plan.bank) * 4096);
+  return failure;
+}
+
 static bool houjiNativeGpuFsAllowed(void);
 namespace {
 #include "RootTransportLayout.h"

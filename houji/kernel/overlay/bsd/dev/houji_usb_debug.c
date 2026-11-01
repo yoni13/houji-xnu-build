@@ -26,6 +26,7 @@ extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
 extern unsigned houji_debug_copy(uint64_t *, char *, unsigned);
 extern uint64_t houji_debug_total(void);
 extern uint64_t houji_debug_dropped(void);
+extern const char *houji_smmu_route_stream(uint16_t, uint64_t, uint64_t, uint32_t *);
 void houji_usb_debug_start(void);
 void houji_usb_report(void);
 /* Early USB lines leave the rolling log long before a checkpoint; keep them. */
@@ -458,12 +459,13 @@ static void usb_thread(void *arg __unused,wait_result_t result __unused)
 }
 /* Require the exact known nonsecure SMMU layout and a unique identity route.
  * Never create mappings or weaken isolation just to make debug USB work. */
-static bool identity(void)
+/* 0 refuse, 1 routed already, 2 unmatched and faulting: needs our own route. */
+static int identity(void)
 {
     vm_offset_t s=u.smmu;
     unote("HOUJI USB: SMMU id0=%08x id1=%08x id2=%08x scr0=%08x\n",
         read_reg(s,0x20),read_reg(s,0x24),read_reg(s,0x28),read_reg(s,0));
-    if (!huc_layout(read_reg(s,0x20),read_reg(s,0x24),read_reg(s,0x28))) return false;
+    if (!huc_layout(read_reg(s,0x20),read_reg(s,0x24),read_reg(s,0x28))) return 0;
     unsigned matches=0;uint32_t route=0;
     for (unsigned i=0;i<107;i++) if (vusb_stream_match(read_reg(s,0x800+4*i))) {
         matches++;route=read_reg(s,0xc00+4*i);
@@ -473,16 +475,16 @@ static bool identity(void)
          * bypasses it to the VM's stage 2. With USFCFG=1 it would fault. */
         uint32_t scr0=read_reg(s,0);
         unote("HOUJI USB: SID40 unmatched; sCR0 USFCFG=%u CLIENTPD=%u\n",(scr0>>10)&1,scr0&1);
-        return !((scr0>>10)&1);
+        return ((scr0>>10)&1)?2:1;
     }
-    if (matches!=1) { unote("HOUJI USB: SID40 matches %u\n",matches);return false; }
+    if (matches!=1) { unote("HOUJI USB: SID40 matches %u\n",matches);return 0; }
     unsigned cb=route&255;uint32_t cbar=0,sctlr=1;
     if (((route>>16)&3)==0) {
-        if (cb>=71) return false;
+        if (cb>=71) return 0;
         cbar=read_reg(s,0x1000+4*cb);sctlr=read_reg(s,0x80000+0x1000*cb);
     }
     unote("HOUJI USB: SID40 route=%08x cbar=%08x sctlr=%08x\n",route,cbar,sctlr);
-    return huc_route(route,cbar,sctlr,((route>>16)&3)==0?read_reg(s,0x1800+4*cb):0)!=0;
+    return huc_route(route,cbar,sctlr,((route>>16)&3)==0?read_reg(s,0x1800+4*cb):0)?1:0;
 }
 void houji_usb_debug_start(void)
 {
@@ -526,7 +528,8 @@ void houji_usb_debug_start(void)
     unote("HOUJI USB: id=%08x hwparams0=%08x awidth=%u gctl=%08x dctl=%08x dsts=%08x\n",
         id,hw,width,rd(GCTL),rd(DCTL),rd(DSTS));
     if ((id>>16)!=0x5533 && (id>>16)!=0x3331) return;
-    if (((rd(GCTL)>>12)&3)!=2 || !identity()) {
+    int route=((rd(GCTL)>>12)&3)==2?identity():0;
+    if (!route) {
         unote("HOUJI USB: device mode/identity guard refused; controller untouched\n");return;
     }
     if (width<36 || width>64) { unote("HOUJI USB: DMA address width guard refused\n");return; }
@@ -542,6 +545,14 @@ void houji_usb_debug_start(void)
     for (unsigned off=0;off<DMA_SIZE;off+=PAGE_SIZE) {
         ppnum_t page=pmap_find_phys(kernel_pmap,(addr64_t)(u.dma+off));
         if (!page || ptoa_64(page)!=u.pa+off) return;
+    }
+    if (route==2) {
+        if (!(rd(DSTS)&HALTED) || (rd(DCTL)&RUN)) { unote("HOUJI USB: controller not halted; SMMU route refused\n");return; }
+        uint32_t r[3];
+        const char *why=houji_smmu_route_stream(0x40,u.pa,DMA_SIZE,r);
+        unote("HOUJI USB: SID40 bypass route %s slot=%u bank=%u cbar=%08x sctlr=%08x\n",
+            why?why:"ok",r[0]&0xffff,r[0]>>16,r[1],r[2]);
+        if (why) return;
     }
     vm_offset_t qs=ml_io_map(0xa6f8800,0x100);
     if (!qs) return;
