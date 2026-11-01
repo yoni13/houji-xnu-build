@@ -5,6 +5,17 @@
  */
 #include "HoujiGpuGovernorPolicy.h"
 extern "C" uint64_t houji_dvfs_touch_time(void);
+extern "C" {extern volatile uint32_t houji_thermal_level;}
+/* GPU OPP cap by TSENS level: 680, 578, 500, 500, 366, 231 MHz. houji_gpu_maxlevel (default 8 = 680 MHz, at most 12) bounds it;
+ * 5 restores the old fixed 500 MHz cap. Levels above 500 MHz were unqualified on this phone before thermal sensing existed. */
+static unsigned houjiGpuCap(void){
+ static unsigned maximum=0;
+ if(!maximum){unsigned v=8;PE_parse_boot_argn("houji_gpu_maxlevel",&v,sizeof(v));maximum=v<1?1:v>HCO_COUNT?HCO_COUNT:v;}
+ static const unsigned byLevel[]={8,6,5,5,3,1};
+ unsigned level=__atomic_load_n(&houji_thermal_level,__ATOMIC_RELAXED);
+ unsigned cap=byLevel[level<6?level:5];
+ return cap<maximum?cap:maximum;
+}
 static struct {
  unsigned enabled,ready,bad,level=HCO_BOOT_LEVEL,low,changes,failed,busyPermille;
  uint64_t last,lastBusy,lastTouch,idleAt,wakeUntil,lastSubmits,windowNs,busyNs,at[HCO_COUNT+1],invalid;
@@ -37,7 +48,7 @@ extern "C" void houji_gpu_dvfs_tick(void){
   uint32_t enable=0,select=0;
   if(!houjiDvfsRead(0x3d7e100,&enable) || !houjiDvfsRead(0x3d7e104,&select) || enable!=1 || (select&255)!=32){v.bad=1;IOLog("HOUJI GPU DVFS: existing XO counter selection invalid; no vote changes\n");return;}
   v.last=now;v.lastBusy=busy;v.idleAt=now;v.historyAt=now;v.ready=1;
-  IOLog("HOUJI GPU OPP: 12 advertised factory levels 231..903 MHz; diagnostic cap=500 MHz, boot=500 MHz; SKU bin5/AB; firmware HFI votes, no PLL writes; thermal feedback unqualified\n");return;
+  IOLog("HOUJI GPU OPP: 12 advertised factory levels 231..903 MHz; thermal cap now %u MHz (TSENS level %u), boot=500 MHz; SKU bin5/AB; firmware HFI votes, no PLL writes\n",hco_opp(houjiGpuCap())->khz/1000,houji_thermal_level);return;
  }
  uint64_t us=now-v.last;if(us<16000)return;
  if(us>v.maxTickUs)v.maxTickUs=us;
@@ -52,7 +63,7 @@ extern "C" void houji_gpu_dvfs_tick(void){
  if(active)v.idleAt=now;
  uint64_t touch=houji_dvfs_touch_time(),touchNs=0;
  if(touch){uint64_t abs=mach_absolute_time();if(abs>=touch)absolutetime_to_nanoseconds(abs-touch,&touchNs);}
- unsigned want=houjiGpuChoose(&v.policy,v.level,HCO_BOOT_LEVEL,v.busyPermille,active,
+ unsigned want=houjiGpuChoose(&v.policy,v.level,houjiGpuCap(),v.busyPermille,active,
   touch && touchNs<1000000000ULL,now<v.wakeUntil,(unsigned)gHoujiApi.submit.outstanding());
  if(!hco_opp(want)){v.bad=1;IOLog("HOUJI GPU DVFS: invalid policy output; no vote changes\n");return;}
  if(want!=v.level){
@@ -77,7 +88,7 @@ static void houjiDvfsReport(){auto&v=gHoujiDvfs;
 extern "C" unsigned houji_gpu_dvfs_snapshot(char*out,unsigned capacity){
  if(!out || !capacity)return 0;unsigned used=0;out[0]=0;auto&v=gHoujiDvfs;
  auto append=[&](const char*f,auto...a){if(used>=capacity-1)return;int n=snprintf(out+used,capacity-used,f,a...);if(n>0)used+=(unsigned)n<capacity-used?(unsigned)n:capacity-used-1;};
- append("HOUJI OPP SNAPSHOT: ready=%u bad=%u level=%u cap-MHz=500 changes=%u failed=%u busy=%u reason=%u\n",v.ready,v.bad,v.level,v.changes,v.failed,v.busyPermille,v.policy.reason);
+ append("HOUJI OPP SNAPSHOT: ready=%u bad=%u level=%u cap-MHz=%u changes=%u failed=%u busy=%u reason=%u\n",v.ready,v.bad,v.level,hco_opp(houjiGpuCap())->khz/1000,v.changes,v.failed,v.busyPermille,v.policy.reason);
  for(unsigned i=1;i<=HCO_COUNT;i++)append("HOUJI OPP RESIDENCY: MHz=%u request-us=%llu\n",hco_opp(i)->khz/1000,__atomic_load_n(&v.at[i],__ATOMIC_RELAXED)/1000);
  return used;
 }
