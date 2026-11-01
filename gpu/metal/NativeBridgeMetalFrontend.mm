@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <dlfcn.h>
+#include <sys/sysctl.h>
 #include <execinfo.h>
 #include <mach/mach.h>
 #include <cmath>
@@ -1629,7 +1630,20 @@ static void installAnswers(Class cls) {
 extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
- gDevice=nmb_device_open(loader,cache);
+ // Runtime-only scheduling choices from the kernel boot argument houji_m2v=<tokens> (see nmb_device_open_policy), so they can be
+ // tuned without rewriting the root volume. Absent or unreadable: the runtime's defaults.
+ char policy[64]={};
+ {
+  char args[1024]={};size_t length=sizeof args-1;
+  if(sysctlbyname("kern.bootargs",args,&length,nullptr,0)==0){
+   args[length<sizeof args?length:sizeof args-1]=0;
+   if(const char *at=strstr(args,"houji_m2v=")){
+    at+=10;size_t n=0;
+    while(at[n] && at[n]!=0x20 && n<sizeof policy-1){policy[n]=at[n];n++;}
+   }
+  }
+ }
+ gDevice=nmb_device_open_policy(loader,cache,policy);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  if(!strcmp(getprogname(),"backboardd")){
   bool ok=nmb_device_native_astc_copy_check(gDevice);
@@ -1796,7 +1810,19 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("HOST submit-span n=%llu total=%llums max=%llums mean=%lluus unavailable=%llu",(unsigned long long)gTimeSubmitSpan.count.load(),ms(gTimeSubmitSpan.total.load()),ms(gTimeSubmitSpan.slowest.load()),(unsigned long long)(gTimeSubmitSpan.count.load()?gTimeSubmitSpan.total.load()/gTimeSubmitSpan.count.load():0),(unsigned long long)gSubmitTimesUnavailable.load());
  row("API draw n=%llu wall=%llums max=%lluus end=%llums",(unsigned long long)gTimeDraw.count.load(),ms(gTimeDraw.total.load()),(unsigned long long)gTimeDraw.slowest.load(),ms(gTimeEncoderEnd.total.load()));
  row("API pass=%llums commit=%llums | wait-native=%llums handlers=%llums",ms(gTimePass.total.load()),ms(gTimeCommitCall.total.load()),ms(gTimeWaitNative.total.load()),ms(gTimeWaitHandlers.total.load()));
- row("HOST transfer counts unavailable: mutating runtime getter excluded");
+ {
+  // The runtime's own scheduling counters (nmb_device_sched_counts) and the policy the device was opened with.
+  uint64_t c[26]={};char pol[32]={};
+  if(gDevice && nmb_device_sched_counts(gDevice,c)){
+   nmb_device_policy_text(pol,sizeof pol);
+   auto u=[](uint64_t v){return (unsigned long long)v;};
+   row("M %s q%llu cb%llu sub%llums grp%llu/%llu end-held%llu kept%llu",pol,u(c[0]),u(c[1]),u(c[2]/1000000),u(c[3]),u(c[4]),u(c[5]),u(c[6]));
+   row("M held host%llu earlier%llu chk%llu ev%llu look%llu | sl%llu wC%llu wG%llu ps%llu gw%llu",u(c[7]),u(c[8]),u(c[9]),u(c[10]),u(c[11]),
+    u(c[12]),u(c[13]),u(c[14]),u(c[15]),u(c[16]));
+   row("M at-submit%llu gate%llu/%llu tl%llu fw%llu pend0:%llu 1:%llu 2-3:%llu 4+:%llu",u(c[17]),u(c[18]),u(c[19]),u(c[20]),u(c[21]),
+    u(c[22]),u(c[23]),u(c[24]),u(c[25]));
+  }
+ }
  row("J scheduled wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitScheduled.count.load(),ms(gTimeWaitScheduled.total.load()),ms(gTimeWaitScheduled.slowest.load()));
  row("J completed wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitCompleted.count.load(),ms(gTimeWaitCompleted.total.load()),ms(gTimeWaitCompleted.slowest.load()));
  row("J resource wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeResourceWait.count.load(),ms(gTimeResourceWait.total.load()),ms(gTimeResourceWait.slowest.load()));

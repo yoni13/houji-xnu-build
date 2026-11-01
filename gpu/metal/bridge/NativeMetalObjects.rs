@@ -155,6 +155,39 @@ impl NmbDevice {
 /// `loader` and `cache` are C strings.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_char) -> *mut NmbDevice {
+    // SAFETY: forwarded contract; no policy text.
+    unsafe { nmb_device_open_policy(loader, cache, std::ptr::null()) }
+}
+
+/// The runtime-only scheduling choices this device was opened with, as `c<E|G> o<E|N> l<W|A>`, for the plugin's telemetry.
+static POLICY_TEXT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Applies a compact policy text (from the `houji_m2v` boot argument): comma-separated tokens `cE`/`cG` completion Exact/Grouped,
+/// `oE`/`oN` batch order Exact/Ends, `lW`/`lA` render lowering Worker/AtCall. Unknown tokens are ignored. Only choices the runtime
+/// documents as its own (no emitted code changes) are offered.
+fn apply_policy(policy: &mut metal2vulkan::device::DevicePolicy, text: &str) {
+    use metal2vulkan::device::{BatchOrderPolicy, CompletionPolicy, RenderLoweringPolicy};
+    for token in text.split(|c| c == ',' || c == ' ') {
+        match token {
+            "cE" => policy.completion = CompletionPolicy::Exact,
+            "cG" => policy.completion = CompletionPolicy::Grouped,
+            "oE" => policy.batch_order = BatchOrderPolicy::Exact,
+            "oN" => policy.batch_order = BatchOrderPolicy::Ends,
+            "lW" => policy.render_lowering = RenderLoweringPolicy::Worker,
+            "lA" => policy.render_lowering = RenderLoweringPolicy::AtCall,
+            _ => {}
+        }
+    }
+    let c = if policy.completion == CompletionPolicy::Exact { 'E' } else { 'G' };
+    let o = if policy.batch_order == BatchOrderPolicy::Exact { 'E' } else { 'N' };
+    let l = if policy.render_lowering == RenderLoweringPolicy::Worker { 'W' } else { 'A' };
+    *POLICY_TEXT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = format!("c{c} o{o} l{l}");
+}
+
+/// # Safety
+/// `loader` and `cache` are C strings; `policy` is a C string or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_device_open_policy(loader: *const c_char, cache: *const c_char, policy: *const c_char) -> *mut NmbDevice {
     guard(std::ptr::null_mut(), || {
         if loader.is_null() || cache.is_null() {
             return Err("loader and cache are required".into());
@@ -162,6 +195,9 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // SAFETY: the caller's contract.
         let (loader, cache) = unsafe { (CStr::from_ptr(loader), CStr::from_ptr(cache)) };
         let mut options = DeviceOptions::default();
+        // SAFETY: the caller's contract.
+        let text = if policy.is_null() { String::new() } else { unsafe { CStr::from_ptr(policy) }.to_string_lossy().into_owned() };
+        apply_policy(&mut options.policy, &text);
         options.loader = Some(PathBuf::from(loader.to_string_lossy().into_owned()));
         options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
         options.messages = Some(MessageSink::new(observe_message));
@@ -229,6 +265,48 @@ pub extern "C" fn nmb_device_work_stats(device: *const NmbDevice, out: *mut u64)
         out[9] = cache.writes;
         Ok(true)
     })
+}
+
+/// The runtime's scheduling counters into the caller's 26 words, in this order: queue submissions, command buffers submitted, batch
+/// submit nanoseconds, grouped submissions, batches grouped, group ends held, groups kept pending, heads held for host steps, for
+/// earlier commits, for checks, for event values, batches held past a look, scheduler sleeps, wakes by commit, wakes by completion,
+/// scheduler passes, scheduler GPU waits, scheduled where submitted, gate waits, gate waits slept, timeline waits, fence waits,
+/// batches with none, one, two or three, four or more pending.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_sched_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        let w = get(device)?.0.work_counts();
+        let values = [
+            w.queue_submissions, w.command_buffers_submitted, w.batch_submit_nanos, w.grouped_submissions, w.batches_grouped,
+            w.group_ends_held, w.groups_kept_pending, w.heads_held_for_host_steps, w.heads_held_for_earlier_commits,
+            w.heads_held_for_checks, w.heads_held_for_event_values, w.batches_held_past_a_look, w.scheduler_sleeps,
+            w.scheduler_wakes_commit, w.scheduler_wakes_completion, w.scheduler_passes, w.scheduler_gpu_waits,
+            w.scheduled_where_submitted, w.gate_waits, w.gate_waits_slept, w.timeline_waits, w.fence_waits,
+            w.batches_with_none_pending, w.batches_with_one_pending, w.batches_with_two_or_three_pending,
+            w.batches_with_four_or_more_pending,
+        ];
+        // SAFETY: the header's 26 words.
+        unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), out, values.len()) };
+        Ok(true)
+    })
+}
+
+/// The scheduling policy text the device was opened with (see `apply_policy`), NUL-terminated into `out`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_policy_text(out: *mut c_char, size: usize) {
+    if out.is_null() || size == 0 {
+        return;
+    }
+    let text = POLICY_TEXT.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let n = text.len().min(size - 1);
+    // SAFETY: `out` holds `size` bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr() as *const c_char, out, n);
+        *out.add(n) = 0;
+    }
 }
 
 /// Read the runtime's six process-local QoS counters. No worker synchronization or I/O.

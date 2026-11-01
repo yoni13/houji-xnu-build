@@ -39,6 +39,9 @@ size_t nmb_device_name(const NmbDevice *, char *out, size_t size);
 uint64_t nmb_device_max_buffer_length(const NmbDevice *);
 // Pipeline makings (count, total us, longest us, waited us, failed), sink messages (info, warning+), shader cache hits/misses/writes.
 bool nmb_device_work_stats(const NmbDevice *, uint64_t out[10]);
+NmbDevice *nmb_device_open_policy(const char *loader, const char *cache, const char *policy);
+bool nmb_device_sched_counts(const NmbDevice *, uint64_t out[26]);
+void nmb_device_policy_text(char *out, size_t size);
 /* QoS initiated/interactive requests, set/read errors, observed initiated/interactive. */
 void nmb_thread_qos_stats(uint64_t out[6]);
 /* Artifact lookups and driver pipeline records are separate cache layers. */
