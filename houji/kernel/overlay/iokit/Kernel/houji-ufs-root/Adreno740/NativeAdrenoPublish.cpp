@@ -515,7 +515,19 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         const uint64_t timeout_us=poll.timeout_ns/1000,began=g.clock.now_us(g.clock.cookie);
         poll.timeout_ns=0;
         uint64_t waited=0;
+        const uint32_t want=(uint32_t)poll.fence;
         for(;;) {
+            /* Poll the GPU-written fence without the issuer lock while the job runs: locked polls queued behind submissions
+             * (about 2 ms each) and stretched every wait. The lock is taken once the fence passed, to retire the job, or once
+             * the time is up, so the core reports the timeout or error exactly as before. */
+            if(want && g.ring && connection->live_ && (int32_t)(want-g.ring->lastSubmitted())<=0 &&
+                (int32_t)(g.ring->peekCompleted()-want)<0) {
+                waited=g.clock.now_us(g.clock.cookie)-began;
+                if(waited<timeout_us) {
+                    native_adreno_wait_outer[2]=native_adreno_wait_outer[2]+1;
+                    if(g.clock.idle && !g.clock.idle(g.clock.cookie))continue;
+                }
+            }
             /* The connection's own core while it is live; a close that ran between two polls ends the wait. */
             IOLockLock(g.lock);
             status=connection->live_?connection->core_->dispatch(method,&poll,sizeof(poll),output,output_size,&g.clock):kIOReturnNotReady;
