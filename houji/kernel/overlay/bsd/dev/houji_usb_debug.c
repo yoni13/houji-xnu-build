@@ -498,7 +498,13 @@ void houji_usb_debug_start(void)
         SecureDTGetProperty(root,"compatible",&compatible,&compatible_n)!=kSuccess ||
         SecureDTGetProperty(root,"target-type",&target,&target_n)!=kSuccess ||
         !huc_board(compatible,compatible_n,target,target_n)) {
-        unote("HOUJI USB: houji/SM8650 ADT guard refused; no MMIO mapped\n");return;
+        char shown[96];unsigned k=0;
+        for (unsigned i=0;compatible && i<compatible_n && k+1<sizeof(shown);i++) {
+            char ch=((const char *)compatible)[i];shown[k++]=ch?(ch>=32&&ch<127?ch:'?'):'|';
+        }
+        shown[k]=0;
+        unote("HOUJI USB: houji/SM8650 ADT guard refused; compatible[%u]=%s target[%u]=%.16s; no MMIO mapped\n",
+            compatible_n,shown,target_n,target?(const char *)target:"(none)");return;
     }
     int test_target=0;
     PE_parse_boot_argn("houji_upload_test",&test_target,sizeof(test_target));
