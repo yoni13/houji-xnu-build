@@ -332,6 +332,66 @@ static void reboot_thread(void *arg __unused,wait_result_t result __unused)
     printf("HOUJI DEBUG: reboot_kernel returned\n");
     thread_terminate(current_thread());
 }
+/* Synthetic input for unattended UI tests over this console: the same HID entry points the touch and button drivers use.
+ * tap X Y | swipe X1 Y1 X2 Y2 MS | home. Panel pixels (0..1199, 0..2669). One gesture at a time, on its own thread. */
+extern void sweet_hid_touch(int, int, int, int);
+extern void sweet_hid_key(int, int);
+static struct { int kind, x1, y1, x2, y2, ms; } gesture;
+static int _Atomic gesture_busy;
+static void gesture_sleep_ms(unsigned ms)
+{
+    static int channel;uint64_t deadline;
+    clock_interval_to_deadline(ms,NSEC_PER_MSEC,&deadline);
+    (void)assert_wait_deadline(&channel,THREAD_UNINT,deadline);
+    thread_block(THREAD_CONTINUE_NULL);
+}
+static void gesture_thread(void *arg __unused,wait_result_t result __unused)
+{
+    if (gesture.kind==3) {
+        sweet_hid_key(3,1);gesture_sleep_ms(80);sweet_hid_key(3,0);
+    } else {
+        int steps=gesture.kind==1?1:(gesture.ms/8>2?gesture.ms/8:2);
+        sweet_hid_touch(0,1,gesture.x1,gesture.y1);
+        for (int i=1;i<=steps;i++) {
+            gesture_sleep_ms(gesture.kind==1?60:8);
+            int x=gesture.x1+(gesture.x2-gesture.x1)*i/steps,y=gesture.y1+(gesture.y2-gesture.y1)*i/steps;
+            sweet_hid_touch(0,1,x,y);
+        }
+        sweet_hid_touch(0,0,gesture.x2,gesture.y2);
+    }
+    os_atomic_store(&gesture_busy,0,release);
+    thread_terminate(current_thread());
+}
+static int gesture_numbers(const char *s,int *out,int max)
+{
+    int n=0;
+    while (*s && n<max) {
+        while (*s==' ') s++;
+        if (*s<'0' || *s>'9') break;
+        int v=0;while (*s>='0' && *s<='9') { v=v*10+(*s-'0');if (v>100000) return -1;s++; }
+        out[n++]=v;
+    }
+    while (*s==' ') s++;
+    return *s?-1:n;
+}
+static void gesture_command(const char *cmd)
+{
+    int v[5],n;
+    if (!strcmp(cmd,"home")) { gesture.kind=3; }
+    else if (!strncmp(cmd,"tap ",4) && (n=gesture_numbers(cmd+4,v,5))==2) {
+        gesture.kind=1;gesture.x1=gesture.x2=v[0];gesture.y1=gesture.y2=v[1];gesture.ms=0;
+    } else if (!strncmp(cmd,"swipe ",6) && (n=gesture_numbers(cmd+6,v,5))==5) {
+        gesture.kind=2;gesture.x1=v[0];gesture.y1=v[1];gesture.x2=v[2];gesture.y2=v[3];gesture.ms=v[4]>2000?2000:v[4];
+    } else { printf("HOUJI DEBUG: gesture syntax: tap X Y | swipe X1 Y1 X2 Y2 MS | home\n");return; }
+    if (gesture.kind!=3 && (gesture.x1>1199 || gesture.x2>1199 || gesture.y1>2669 || gesture.y2>2669)) {
+        printf("HOUJI DEBUG: gesture outside 1200x2670\n");return;
+    }
+    if (!os_atomic_cmpxchg(&gesture_busy,0,1,acquire)) { printf("HOUJI DEBUG: gesture busy\n");return; }
+    thread_t t;
+    if (kernel_thread_start(gesture_thread,NULL,&t)!=KERN_SUCCESS) { os_atomic_store(&gesture_busy,0,release);return; }
+    thread_deallocate(t);
+    printf("HOUJI DEBUG: gesture %s\n",cmd);
+}
 static void command_line(void)
 {
     u.command[u.command_n]=0;
@@ -345,6 +405,7 @@ static void command_line(void)
         }
     }
     else if (!strcmp(u.command,"ping")) printf("HOUJI DEBUG: pong HOUJIDBG001\n");
+    else if (!strcmp(u.command,"home") || !strncmp(u.command,"tap ",4) || !strncmp(u.command,"swipe ",6)) gesture_command(u.command);
     else if (!strcmp(u.command,"reboot")) {
         static bool requested;thread_t t;
         if (requested) printf("HOUJI DEBUG: reboot already in progress\n");
@@ -356,7 +417,7 @@ static void command_line(void)
             __DATE__,__TIME__,u.events,u.tx_bytes,u.rx_bytes,houji_debug_total(),houji_debug_dropped());
     else if (!strcmp(u.command,"replay")) {
         u.cursor=0;printf("HOUJI DEBUG: replay retained RAM log\n");
-    } else if (u.command_n) printf("HOUJI DEBUG: commands help status ping replay reboot\n");
+    } else if (u.command_n) printf("HOUJI DEBUG: commands help status ping replay reboot tap swipe home\n");
     u.command_n=0;u.command_overflow=false;
 }
 static void receive_done(unsigned length)
