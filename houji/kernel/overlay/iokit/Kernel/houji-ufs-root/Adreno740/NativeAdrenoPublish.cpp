@@ -986,6 +986,11 @@ static uint64_t gHoujiPresentSync[9];
 extern "C" int native_adreno_present_begin_frame(uint32_t desired){
  __atomic_fetch_add(&gHoujiPresentSync[0],1ull,__ATOMIC_RELAXED);
  if(!g.published || !g.lock || !g.ring)return 0;
+ /* Cheap first look without the lock: the copy retries every 500 us while
+  * the GPU renders, and taking g.lock each time competed with submits. */
+ if(desired && (int32_t)(g.ring->peekCompleted()-desired)<0){
+  __atomic_fetch_add(&gHoujiPresentSync[3],1ull,__ATOMIC_RELAXED);return -1;
+ }
  if(!IOLockTryLock(g.lock)){
   __atomic_fetch_add(&gHoujiPresentSync[2],1ull,__ATOMIC_RELAXED);
   uint64_t began=g.clock.now_us(g.clock.cookie);
