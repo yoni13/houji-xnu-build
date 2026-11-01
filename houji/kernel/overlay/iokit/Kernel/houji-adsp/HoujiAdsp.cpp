@@ -746,9 +746,9 @@ extern "C" void houji_power_start(void) {
 }
 extern "C" void houji_power_report(void) {
     const volatile int32_t *a = native_adsp_stats;
-    IOLog("HOUJI ADSP: stage=%d err=%d ipcc-irq=%d slave=%x items=%x qmp=%x rsc-drv=%d fw-KiB=%d ready-ms=%d glink-in=%d out=%d chan=%x "
-          "unserved=%d scm=%x/%x votes=%x text=%.95s\n",
-          a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15], native_adsp_text);
+    IOLog("HOUJI ADSP: stage=%d err=%d irq=%d slave=%x items=%x qmp=%x fw-KiB=%d ready-ms=%d glink=%d/%d chan=%x scm=%x/%x\n",
+          a[0], a[1], a[2], a[3], a[4], a[5], a[7], a[8], a[9], a[10], a[11], a[13], a[14]);
+    IOLog("HOUJI ADSP TEXT: %.90s\n", native_adsp_text);
     const volatile int32_t *b = native_battery_stats, *c = native_charger_stats;
     IOLog("HOUJI BATTERY: stage=%d pct=%d mV=%d mA=%d temp=%d flags=%x cycles-done=%d answers=%d to/err=%x notes=%d usb=%d full=%d design=%d "
           "cycles=%d drop=%x refused=%d\n", b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);

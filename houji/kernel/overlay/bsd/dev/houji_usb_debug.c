@@ -406,6 +406,14 @@ static void command_line(void)
     }
     else if (!strcmp(u.command,"ping")) printf("HOUJI DEBUG: pong HOUJIDBG001\n");
     else if (!strcmp(u.command,"shot")) { extern void houji_framebuffer_shot(unsigned,unsigned); houji_framebuffer_shot(150,334); }
+    else if (!strncmp(u.command,"shotr ",6)) {
+        extern void houji_framebuffer_shot_region(unsigned,unsigned,unsigned,unsigned,unsigned,unsigned);
+        int r[4];
+        if (gesture_numbers(u.command+6,r,4)==4) {
+            unsigned cols=r[2]>=r[3]?300:(unsigned)(300ull*r[2]/r[3]),rows=r[2]>=r[3]?(unsigned)(300ull*r[3]/r[2]):300;
+            houji_framebuffer_shot_region(r[0],r[1],r[2],r[3],cols?cols:1,rows?rows:1);
+        } else printf("HOUJI DEBUG: shotr X Y W H\n");
+    }
     else if (!strcmp(u.command,"home") || !strncmp(u.command,"tap ",4) || !strncmp(u.command,"swipe ",6)) gesture_command(u.command);
     else if (!strcmp(u.command,"reboot")) {
         static bool requested;thread_t t;

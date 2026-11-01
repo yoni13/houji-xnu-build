@@ -391,16 +391,16 @@ AppleCLCD::start(IOService *provider)
 
 /* Grayscale thumbnail of the panel for unattended UI checks over the USB debug console: one hex digit (4-bit luminance) per
  * cell, printed as SHOT rows. Reads the scanout memory only. */
-extern "C" void houji_framebuffer_shot(unsigned cols,unsigned rows)
+extern "C" void houji_framebuffer_shot_region(unsigned x0,unsigned y0,unsigned w,unsigned h,unsigned cols,unsigned rows)
 {
  AppleCLCD *fb=gHoujiPanel;
- if(!fb || !fb->fPixels || !cols || !rows || cols>300 || rows>700){printf("HOUJI SHOT: unavailable\n");return;}
- printf("HOUJI SHOT BEGIN %u %u panel=%ux%u\n",cols,rows,fb->fWidth,fb->fHeight);
+ if(!fb || !fb->fPixels || !cols || !rows || cols>300 || rows>700 || !w || !h || x0+w>fb->fWidth || y0+h>fb->fHeight){printf("HOUJI SHOT: unavailable\n");return;}
+ printf("HOUJI SHOT BEGIN %u %u panel=%ux%u region=%u,%u,%u,%u\n",cols,rows,fb->fWidth,fb->fHeight,x0,y0,w,h);
  char line[320];
  for(unsigned r=0;r<rows;r++){
-  const uint32_t y=(uint32_t)(((uint64_t)r*fb->fHeight+fb->fHeight/rows/2)/rows);
+  const uint32_t y=y0+(uint32_t)(((uint64_t)r*h+h/rows/2)/rows);
   for(unsigned c=0;c<cols;c++){
-   const uint32_t x=(uint32_t)(((uint64_t)c*fb->fWidth+fb->fWidth/cols/2)/cols);
+   const uint32_t x=x0+(uint32_t)(((uint64_t)c*w+w/cols/2)/cols);
    const uint8_t *p=(const uint8_t *)(fb->fPixels+(uint64_t)y*fb->fRowBytes+(uint64_t)x*4);
    const unsigned l=(p[2]*3u+p[1]*6u+p[0])/10u;
    line[c]="0123456789abcdef"[l>>4];
@@ -408,6 +408,11 @@ extern "C" void houji_framebuffer_shot(unsigned cols,unsigned rows)
   line[cols]=0;printf("SHOT %03u %s\n",r,line);
  }
  printf("HOUJI SHOT END\n");
+}
+extern "C" void houji_framebuffer_shot(unsigned cols,unsigned rows)
+{
+ AppleCLCD *fb=gHoujiPanel;
+ if(fb)houji_framebuffer_shot_region(0,0,fb->fWidth,fb->fHeight,cols,rows);
 }
 
 void
