@@ -350,7 +350,9 @@ IOReturn NativeAdrenoVm::publishMapped()
         const Mapping &m=mappings_[i];
         if(!m.memory)continue;
         if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
-        if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_))return fail(ArmSmmu4KIoError);
+        bool skipped=false;
+        if(m.memory->publishTracked(true,distrust_write_combined_,&skipped))return fail(ArmSmmu4KIoError);
+        if(skipped)native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;
     }
     return kIOReturnSuccess;
 }

@@ -35,6 +35,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/system.h>
+#include <pexpert/pexpert.h>
 #include <libkern/c++/OSArray.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
@@ -183,6 +184,58 @@ sweet_surface_copy(uint32_t id)
 	}
 	IOLockUnlock(sweet_surface_lock);
 	return s;
+}
+
+/* GPU publish dirty tracking. Only the kernel unlock trap bumps a surface's
+ * seed (the state page is read-only to users), so an unchanged seed means no
+ * CPU write unlock since the GPU side last cleaned the surface's lines. */
+extern "C" int
+houji_surface_seed_skip_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		int value = 1;
+		PE_parse_boot_argn("houji_gpu_seed_skip", &value, sizeof(value));
+		enabled = value ? 1 : 0;
+	}
+	return enabled;
+}
+
+/* Retained surface whose pixel memory starts on this physical page, or NULL. */
+extern "C" void *
+houji_surface_retain_for_physical(uint64_t physical)
+{
+	SweetSurface *found = NULL;
+	if (sweet_surface_lock == NULL) {
+		return NULL;
+	}
+	IOLockLock(sweet_surface_lock);
+	for (uint32_t id = 1; id < SWEET_SURFACE_MAX_ID && found == NULL; id++) {
+		SweetSurface *s = sweet_surface_table[id];
+		if (s == NULL || s->memory == NULL || s->state == NULL) {
+			continue;
+		}
+		IOByteCount length = 0;
+		addr64_t page = s->memory->getPhysicalSegment(0, &length, kIOMemoryMapperNone);
+		if (page != 0 && (page & ~0xfffULL) == (physical & ~0xfffULL)) {
+			s->retain();
+			found = s;
+		}
+	}
+	IOLockUnlock(sweet_surface_lock);
+	return found;
+}
+
+extern "C" uint32_t
+houji_surface_seed_of(void *surface)
+{
+	return *(volatile uint32_t *)sweet_surface_seed((SweetSurface *)surface);
+}
+
+extern "C" void
+houji_surface_release(void *surface)
+{
+	((SweetSurface *)surface)->release();
 }
 
 /* The table lock; the framebuffer may publish a surface before the root starts. */
