@@ -167,6 +167,7 @@ extern "C" int native_adreno_present_begin_frame(uint32_t);
 extern "C" uint32_t native_adreno_present_capture_fence(void);
 static uint64_t houji_fb_retired,houji_fb_waits,houji_fb_wait_blocked,houji_fb_wait_timeout,houji_fb_queue_full,houji_fb_queue_peak;
 static uint64_t houji_fb_last_wait_id,houji_fb_last_wait_mode,houji_fb_last_wait_ns;
+static uint64_t houji_fb_wait_ticks;   /* total time SwapWait blocked */
 struct HoujiDisplayFrame {
  uint8_t rec[SWEET_FB_SWAP_REC_SIZE]{};
  SweetSurface *surfaces[SWEET_FB_LAYERS]{};
@@ -530,7 +531,10 @@ static void houjiNoteSwapInterval(void){
  native_adreno_hitch_snapshot(snap);
  if(!last){memcpy(previous,snap,sizeof(snap));return;}
  uint64_t ns=0;absolutetime_to_nanoseconds(now-last,&ns);const uint64_t ms10=ns/100000; /* 0.1 ms */
+ static uint64_t previousWait;const uint64_t waitNow=__atomic_load_n(&houji_fb_wait_ticks,__ATOMIC_RELAXED);
+ uint64_t waitNs=0;absolutetime_to_nanoseconds(waitNow-previousWait,&waitNs);previousWait=waitNow;
  if(ms10>=200 && ms10<500 && houji_fb_hitch_logged<40){
+  IOLog("HOUJI HITCH SWAP: gap-ms=%llu.%llu swapwait-us=%llu\n",ms10/10,ms10%10,waitNs/1000);
   ++houji_fb_hitch_logged;uint64_t d[16];for(unsigned i=0;i<16;i++)d[i]=snap[i]-previous[i];
   IOLog("HOUJI HITCH: gap-ms=%llu.%llu gate n=%llu us=%llu wait=%llu audit=%llu GPU level=%llu busy-us=%llu | map n=%llu us=%llu free n=%llu us=%llu submit n=%llu us=%llu alloc=%llu fence-wait-us=%llu full=%llu depth=%llu\n",
    ms10/10,ms10%10,d[0],d[1],d[2],d[3],snap[4],d[5],d[6],d[7],d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15]);
@@ -612,6 +616,7 @@ extern "C" void houji_framebuffer_report(void)
 	}
 	houji_surface_use_report();
 	houjiReportRects();
+	{uint64_t ns=0;absolutetime_to_nanoseconds(__atomic_load_n(&houji_fb_wait_ticks,__ATOMIC_RELAXED),&ns);IOLog("HOUJI SWAP WAIT: blocked-us=%llu\n",ns/1000);}
 	IOLog("HOUJI FRAME LIFE: retired=%llu waits=%llu blocked=%llu wait-timeout=%llu queue-full=%llu peak=%llu wait-id=%llu wait-mode=%llu wait-ns=%llu; real CPU copy/store completion, not panel vblank\n",__atomic_load_n(&houji_fb_retired,__ATOMIC_RELAXED),__atomic_load_n(&houji_fb_waits,__ATOMIC_RELAXED),__atomic_load_n(&houji_fb_wait_blocked,__ATOMIC_RELAXED),__atomic_load_n(&houji_fb_wait_timeout,__ATOMIC_RELAXED),__atomic_load_n(&houji_fb_queue_full,__ATOMIC_RELAXED),__atomic_load_n(&houji_fb_queue_peak,__ATOMIC_RELAXED),__atomic_load_n(&houji_fb_last_wait_id,__ATOMIC_RELAXED),__atomic_load_n(&houji_fb_last_wait_mode,__ATOMIC_RELAXED),__atomic_load_n(&houji_fb_last_wait_ns,__ATOMIC_RELAXED));
 	previousTime = now; previousPresents = presents; previousSwaps = swaps;
 	previousTicks = ticks; previousBytes = bytes;
@@ -671,6 +676,7 @@ AppleCLCD::waitSwap(uint32_t id,uint64_t timeoutRaw)
   if(IOLockSleepDeadline(fLock,&fFrames,deadline,THREAD_ABORTSAFE)!=THREAD_AWAKENED)break;
  }
  bool done=fFrames.complete(id);IOLockUnlock(fLock);
+ if(blocked)__atomic_fetch_add(&houji_fb_wait_ticks,mach_absolute_time()-(deadline-ticks),__ATOMIC_RELAXED);
  if(!done)__atomic_fetch_add(&houji_fb_wait_timeout,1ull,__ATOMIC_RELAXED);
  return done?kIOReturnSuccess:kIOReturnTimeout;
 }
