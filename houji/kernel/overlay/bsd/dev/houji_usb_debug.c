@@ -27,6 +27,18 @@ extern unsigned houji_debug_copy(uint64_t *, char *, unsigned);
 extern uint64_t houji_debug_total(void);
 extern uint64_t houji_debug_dropped(void);
 void houji_usb_debug_start(void);
+void houji_usb_report(void);
+/* Early USB lines leave the rolling log long before a checkpoint; keep them. */
+static char usb_notes[3072];
+static unsigned usb_notes_n;
+static void note_add(const char *line,int n)
+{
+    if (n<=0) return;
+    if ((unsigned)n>=sizeof(usb_notes)-usb_notes_n) return;
+    memcpy(usb_notes+usb_notes_n,line,(unsigned)n);usb_notes_n+=(unsigned)n;usb_notes[usb_notes_n]=0;
+}
+#define unote(...) do { char _l[200]; int _n=snprintf(_l,sizeof(_l),__VA_ARGS__); \
+    printf("%s",_l); note_add(_l,_n<(int)sizeof(_l)?_n:(int)sizeof(_l)-1); } while (0)
 
 #define GCTL 0xc110
 #define GEVNTADRLO 0xc400
@@ -149,7 +161,7 @@ static void sync_dma(unsigned off,unsigned size)
 }
 static void fail(const char *why)
 {
-    if (!u.failed) printf("HOUJI USB: stopped: %s; permanent DMA retained\n",why);
+    if (!u.failed) unote("HOUJI USB: stopped: %s; permanent DMA retained\n",why);
     u.failed=true;
     if (upload_mode && upload.phase!=HRU_COMPLETE) {
         hru_abort(&upload,HRU_E_TRANSPORT);upload_publish();
@@ -234,7 +246,7 @@ static void configure(void)
         epcmd(5,SET_RESOURCE,1,0,0)) return;
     wr(DALEPENA,3|(1u<<2)|(1u<<3)|(1u<<5));
     u.configured=true; receive_arm();
-    printf("HOUJI USB: CDC ACM configured, bulk MPS %u\n",u.mps);
+    unote("HOUJI USB: CDC ACM configured, bulk MPS %u\n",u.mps);
 }
 static unsigned string_desc(unsigned index,uint8_t *data)
 {
@@ -291,7 +303,7 @@ static void handle_setup(void)
             if (!u.dtr && upload_mode && upload.phase!=HRU_COMPLETE) {
                 hru_abort(&upload,HRU_E_TRANSPORT);upload_publish();
             }
-            if (u.dtr && !old) printf("HOUJI USB: debug connected; help/status/ping/replay (read only)\n");
+            if (u.dtr && !old) unote("HOUJI USB: debug connected; help/status/ping/replay (read only)\n");
         }break;
     case VUSB_BREAK:break;
     case VUSB_CLEAR_HALT:
@@ -372,14 +384,14 @@ static void event(uint32_t e)
         unsigned type=(e>>8)&15;
         if (type==1) {
             if (u.configured) { stop_data();fail("bus reset after configuration; reboot to reconnect");return; }
-            wr(DCFG,rd(DCFG)&~(127u<<3));printf("HOUJI USB: bus reset\n");
+            wr(DCFG,rd(DCFG)&~(127u<<3));unote("HOUJI USB: bus reset\n");
         } else if (type==2) {
             unsigned speed=rd(DSTS)&7;
             if (speed!=0 && speed!=1 && speed!=3) { fail("unexpected non-USB2 speed");return; }
             u.mps=speed==0?512:64;
             (void)epcmd(0,SET_CONFIG,(64u<<3)|(2u<<30),(1u<<8)|(1u<<10),0);
             (void)epcmd(1,SET_CONFIG,(64u<<3)|(2u<<30),(1u<<8)|(1u<<10)|(1u<<25),0);
-            printf("HOUJI USB: connected speed=%u\n",speed);
+            unote("HOUJI USB: connected speed=%u\n",speed);
         } else if (!type && u.configured) fail("cable disconnect; reboot to reconnect");
         else if (type==9 || type==11) fail("controller/event overflow");
         return;
@@ -449,7 +461,7 @@ static void usb_thread(void *arg __unused,wait_result_t result __unused)
 static bool identity(void)
 {
     vm_offset_t s=u.smmu;
-    printf("HOUJI USB: SMMU id0=%08x id1=%08x id2=%08x scr0=%08x\n",
+    unote("HOUJI USB: SMMU id0=%08x id1=%08x id2=%08x scr0=%08x\n",
         read_reg(s,0x20),read_reg(s,0x24),read_reg(s,0x28),read_reg(s,0));
     if (!huc_layout(read_reg(s,0x20),read_reg(s,0x24),read_reg(s,0x28))) return false;
     unsigned matches=0;uint32_t route=0;
@@ -460,16 +472,16 @@ static bool identity(void)
         /* ABL's fastboot DMA used this same unmatched stream: sCR0.USFCFG=0
          * bypasses it to the VM's stage 2. With USFCFG=1 it would fault. */
         uint32_t scr0=read_reg(s,0);
-        printf("HOUJI USB: SID40 unmatched; sCR0 USFCFG=%u CLIENTPD=%u\n",(scr0>>10)&1,scr0&1);
+        unote("HOUJI USB: SID40 unmatched; sCR0 USFCFG=%u CLIENTPD=%u\n",(scr0>>10)&1,scr0&1);
         return !((scr0>>10)&1);
     }
-    if (matches!=1) { printf("HOUJI USB: SID40 matches %u\n",matches);return false; }
+    if (matches!=1) { unote("HOUJI USB: SID40 matches %u\n",matches);return false; }
     unsigned cb=route&255;uint32_t cbar=0,sctlr=1;
     if (((route>>16)&3)==0) {
         if (cb>=71) return false;
         cbar=read_reg(s,0x1000+4*cb);sctlr=read_reg(s,0x80000+0x1000*cb);
     }
-    printf("HOUJI USB: SID40 route=%08x cbar=%08x sctlr=%08x\n",route,cbar,sctlr);
+    unote("HOUJI USB: SID40 route=%08x cbar=%08x sctlr=%08x\n",route,cbar,sctlr);
     return huc_route(route,cbar,sctlr,((route>>16)&3)==0?read_reg(s,0x1800+4*cb):0)!=0;
 }
 void houji_usb_debug_start(void)
@@ -478,7 +490,7 @@ void houji_usb_debug_start(void)
     int enabled=0;PE_parse_boot_argn("houji_usb",&enabled,sizeof(enabled));
     if ((enabled!=1 && enabled!=2) || attempted) return;
     attempted=true;u.mps=512;u.coding[0]=0;u.coding[1]=0xc2;u.coding[2]=1;u.coding[6]=8;
-    printf("HOUJI USB: CDC ACM candidate001, RAM log and read-only commands\n");
+    unote("HOUJI USB: CDC ACM candidate001, RAM log and read-only commands\n");
     DTEntry root;
     void const *compatible=NULL,*target=NULL;
     unsigned compatible_n=0,target_n=0;
@@ -486,7 +498,7 @@ void houji_usb_debug_start(void)
         SecureDTGetProperty(root,"compatible",&compatible,&compatible_n)!=kSuccess ||
         SecureDTGetProperty(root,"target-type",&target,&target_n)!=kSuccess ||
         !huc_board(compatible,compatible_n,target,target_n)) {
-        printf("HOUJI USB: houji/SM8650 ADT guard refused; no MMIO mapped\n");return;
+        unote("HOUJI USB: houji/SM8650 ADT guard refused; no MMIO mapped\n");return;
     }
     int test_target=0;
     PE_parse_boot_argn("houji_upload_test",&test_target,sizeof(test_target));
@@ -498,29 +510,29 @@ void houji_usb_debug_start(void)
     vm_offset_t gcc=ml_io_map(0x139000,0x1000);
     if (!gcc) return;
     uint32_t power=read_reg(gcc,4),master=read_reg(gcc,0x18),cfg=read_reg(gcc,0x88),aggre=read_reg(gcc,0x8c);
-    printf("HOUJI USB: GCC power=%08x master=%08x cfg=%08x aggre=%08x\n",power,master,cfg,aggre);
+    unote("HOUJI USB: GCC power=%08x master=%08x cfg=%08x aggre=%08x\n",power,master,cfg,aggre);
     if (!(power&(1u<<31)) || ((master|cfg|aggre)&(1u<<31))) {
-        printf("HOUJI USB: clocks/power unavailable; controller untouched\n");return;
+        unote("HOUJI USB: clocks/power unavailable; controller untouched\n");return;
     }
     u.regs=ml_io_map(0xa600000,0xe000);u.smmu=ml_io_map(0x15000000,0x100000);
     if (!u.regs || !u.smmu) return;
     uint32_t id=rd(0xc120),hw=rd(0xc140);unsigned width=hw>>24;
-    printf("HOUJI USB: id=%08x hwparams0=%08x awidth=%u gctl=%08x dctl=%08x dsts=%08x\n",
+    unote("HOUJI USB: id=%08x hwparams0=%08x awidth=%u gctl=%08x dctl=%08x dsts=%08x\n",
         id,hw,width,rd(GCTL),rd(DCTL),rd(DSTS));
     if ((id>>16)!=0x5533 && (id>>16)!=0x3331) return;
     if (((rd(GCTL)>>12)&3)!=2 || !identity()) {
-        printf("HOUJI USB: device mode/identity guard refused; controller untouched\n");return;
+        unote("HOUJI USB: device mode/identity guard refused; controller untouched\n");return;
     }
-    if (width<36 || width>64) { printf("HOUJI USB: DMA address width guard refused\n");return; }
+    if (width<36 || width>64) { unote("HOUJI USB: DMA address width guard refused\n");return; }
     if (enabled==2) {
-        printf("HOUJI USB: read-only preflight passed; no DMA allocation or controller writes\n");return;
+        unote("HOUJI USB: read-only preflight passed; no DMA allocation or controller writes\n");return;
     }
     if (kmem_alloc_contig(kernel_map,&u.dma,DMA_SIZE,0x3fff,0,0,
         KMA_DATA|KMA_ZERO|KMA_PERMANENT,VM_KERN_MEMORY_IOKIT)!=KERN_SUCCESS) return;
     ppnum_t pn=pmap_find_phys(kernel_pmap,(addr64_t)u.dma);
     if (!pn) return;
     u.pa=ptoa_64(pn);
-    if (!vusb_dma_allowed(u.pa,DMA_SIZE,width)) { printf("HOUJI USB: owned DMA width/range guard refused\n");return; }
+    if (!vusb_dma_allowed(u.pa,DMA_SIZE,width)) { unote("HOUJI USB: owned DMA width/range guard refused\n");return; }
     for (unsigned off=0;off<DMA_SIZE;off+=PAGE_SIZE) {
         ppnum_t page=pmap_find_phys(kernel_pmap,(addr64_t)(u.dma+off));
         if (!page || ptoa_64(page)!=u.pa+off) return;
@@ -555,13 +567,13 @@ void houji_usb_debug_start(void)
     thread_t thread;
     if (kernel_thread_start(usb_thread,NULL,&thread)!=KERN_SUCCESS) { fail("poll thread creation");wr(DCTL,rd(DCTL)&~RUN);return; }
     thread_deallocate(thread);
-    printf("HOUJI USB: owned RAM base=%lx bytes=%lx; mode=%d\n",gPhysBase,gPhysSize,enabled);
-    printf("HOUJI USB: running; DMA=%llx; CDC serial HOUJIDBG001; awaiting enumeration\n",u.pa);
+    unote("HOUJI USB: owned RAM base=%lx bytes=%lx; mode=%d\n",gPhysBase,gPhysSize,enabled);
+    unote("HOUJI USB: running; DMA=%llx; CDC serial HOUJIDBG001; awaiting enumeration\n",u.pa);
     int hold=0;
     PE_parse_boot_argn("houji_usb_hold",&hold,sizeof(hold));
     if (hold==1) {
         static int hold_channel;
-        printf("HOUJI USB: diagnostic hold before root selection; reset to leave\n");
+        unote("HOUJI USB: diagnostic hold before root selection; reset to leave\n");
         for (;;) {
             uint64_t deadline;
             clock_interval_to_deadline(1000,NSEC_PER_MSEC,&deadline);
@@ -569,5 +581,12 @@ void houji_usb_debug_start(void)
             thread_block(THREAD_CONTINUE_NULL);
         }
     }
+}
+void houji_usb_report(void)
+{
+    if (!usb_notes_n) { printf("HOUJI USB REPORT: driver never started\n");return; }
+    printf("HOUJI USB REPORT BEGIN\n%sHOUJI USB REPORT END\n",usb_notes);
+    if (u.regs) printf("HOUJI USB STATE: events=%u setups=%u configured=%u dtr=%u failed=%u tx=%llu rx=%llu dsts=%08x dctl=%08x gevntcount=%08x\n",
+        u.events,u.setups,u.configured,u.dtr,u.failed,u.tx_bytes,u.rx_bytes,rd(DSTS),rd(DCTL),rd(GEVNTCOUNT));
 }
 #endif

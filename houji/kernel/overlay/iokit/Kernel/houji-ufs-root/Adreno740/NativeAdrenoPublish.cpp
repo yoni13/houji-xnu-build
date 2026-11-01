@@ -865,6 +865,7 @@ extern "C" IOReturn native_adreno_provider_poll(void){if(!g.published || !g.lock
 extern "C" void houji_touch_driver_report(void);
 extern "C" void houji_framebuffer_history_report(void);
 extern "C" void houji_cpu_dvfs_history_report(void);
+extern "C" void houji_usb_report(void);
 extern "C" void houji_gpu_dvfs_history_report(void);
 extern "C" volatile uint32_t native_adreno_client_stats[5][6];
 extern "C" volatile uint32_t native_adreno_window_overflow[4][3];
@@ -910,6 +911,7 @@ static void nativeAdrenoStopDiagnostics(void){
  }
  houji_cpu_scheduler_report();
  houji_cpu_dvfs_history_report();
+ houji_usb_report();
  houji_gpu_dvfs_history_report();
  houji_sandbox_abi_report();
  for(unsigned method=0;method<20;++method) {
