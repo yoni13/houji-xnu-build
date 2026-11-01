@@ -376,7 +376,9 @@ IOReturn NativeAdrenoVm::acquireImported()
         const Mapping &m=mappings_[i];
         if(!m.memory || !m.memory->imported() || !(m.permissions&ArmSmmu4KWrite))continue;
         if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;continue;}
-        if(m.memory->acquireDeviceWrites(0,m.memory->bytes()))return fail(ArmSmmu4KIoError);
+        bool deferred=false;
+        if(m.memory->acquireTracked(&deferred))return fail(ArmSmmu4KIoError);
+        if(deferred)native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;
     }
     return kIOReturnSuccess;
 }

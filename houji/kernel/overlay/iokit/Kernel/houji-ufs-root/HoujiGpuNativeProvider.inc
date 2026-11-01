@@ -90,7 +90,7 @@ extern "C" IOReturn native_adreno_board_quiesce(void){
  * last audited and the last TLBIALL covered; otherwise it takes the full gate. Map/unmap/free keep the full gate (idle GPU, audit,
  * TLB synchronization). At most kHoujiPipelineDepth jobs are in flight. Counters: light submits, light other, full fallbacks,
  * depth waits, fault refusals. */
-enum {kHoujiPipelineDepth=2};
+enum {kHoujiPipelineDepth=3};
 static uint32_t gHoujiPipeline=~0u;
 extern "C" {volatile uint64_t native_adreno_pipeline_stats[5];extern volatile uint32_t native_adreno_tlb_reuse;}
 extern "C" void native_adreno_submit_part(unsigned part,uint64_t began);

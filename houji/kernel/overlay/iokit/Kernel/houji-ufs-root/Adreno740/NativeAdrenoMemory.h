@@ -110,6 +110,9 @@ public:
     /* publishForDevice over the whole object, except an imported IOSurface
      * whose seed has not moved since its last publish (*skipped set). */
     IOReturn publishTracked(bool device_writes,bool include_write_combined,bool *skipped);
+    /* After GPU completion: acquireDeviceWrites over the whole object, except a known IOSurface, which is only marked for
+     * invalidation at its next CPU lock (*deferred set). */
+    IOReturn acquireTracked(bool *deferred);
     bool quarantined() const {return quarantined_;}
     uint32_t deviceReferences() const {return device_references_;}
     size_t bytes() const {return bytes_;}

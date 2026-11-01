@@ -10,6 +10,8 @@ extern "C" int houji_surface_seed_skip_enabled(void);
 extern "C" void *houji_surface_retain_for_physical(uint64_t physical);
 extern "C" uint32_t houji_surface_seed_of(void *surface);
 extern "C" void houji_surface_release(void *surface);
+extern "C" int houji_surface_lazy_acquire_enabled(void);
+extern "C" void houji_surface_mark_gpu_dirty(void *surface);
 
 static bool outputWidth(unsigned bits)
 {return bits==32 || bits==36 || bits==40 || bits==42 || bits==44 || bits==48;}
@@ -257,6 +259,18 @@ IOReturn NativeAdrenoMemory::publishTracked(bool writes,bool include_write_combi
         }
     }
     return publishForDevice(0,bytes_,writes,include_write_combined);
+}
+IOReturn NativeAdrenoMemory::acquireTracked(bool *deferred)
+{
+    *deferred=false;
+    if(imported_ && houji_surface_lazy_acquire_enabled()) {
+        if(!surface_state_ && owned_spans_ && owned_span_count_) {
+            surface_=houji_surface_retain_for_physical(owned_spans_[0].physical);
+            surface_state_=surface_?1:2;
+        }
+        if(surface_state_==1) {houji_surface_mark_gpu_dirty(surface_);*deferred=true;return kIOReturnSuccess;}
+    }
+    return acquireDeviceWrites(0,bytes_);
 }
 IOReturn NativeAdrenoMemory::acquireDeviceWrites(size_t offset,size_t bytes)
 {

@@ -460,6 +460,7 @@ static bool nativeAdrenoNonMutatingGpuMethod(uint32_t method) {
 static uint32_t gHoujiLastSubmittedFence;
 extern "C" IOReturn native_adreno_board_light_gate(int submit);
 extern "C" void houji_gate_hitch_snapshot(uint64_t out[6]);
+extern "C" void houji_surface_lazy_report(void);
 extern "C" {extern volatile uint64_t native_adreno_submit_parts[8][2];}
 extern "C" {extern volatile uint64_t native_adreno_pipeline_stats[5];extern volatile uint64_t native_adreno_tlb_stats[2];}
 /* Methods that may skip waiting for the GPU (see native_adreno_board_light_gate): no page table, SMMU or GPU register access,
@@ -961,6 +962,7 @@ extern "C" void native_adreno_perf_report(void){
   const char *names[8]={"retire","acquire-imported","hold","sample","ring","tlb","depth-wait","light-gate"};
   for(unsigned i=0;i<8;i++)IOLog("HOUJI SUBMIT PART: %s n=%llu us=%llu; live\n",names[i],native_adreno_submit_parts[i][0],native_adreno_submit_parts[i][1]);
  }
+ houji_surface_lazy_report();
  IOLog("HOUJI WAIT OUTER: waits=%llu total-us=%llu pauses=%llu max-us=%llu; live\n",native_adreno_wait_outer[0],native_adreno_wait_outer[1],native_adreno_wait_outer[2],native_adreno_wait_outer[3]);
  for(unsigned row=0;row<48;row++)if(native_adreno_metal_rows[row][0])IOLog("HOUJI METAL ROW %u: %.95s\n",row,native_adreno_metal_rows[row]);
 }
