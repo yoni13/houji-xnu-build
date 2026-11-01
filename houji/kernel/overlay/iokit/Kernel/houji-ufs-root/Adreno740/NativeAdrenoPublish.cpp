@@ -964,6 +964,7 @@ extern "C" void native_adreno_perf_report(void){
   for(unsigned i=0;i<8;i++)IOLog("HOUJI SUBMIT PART: %s n=%llu us=%llu; live\n",names[i],native_adreno_submit_parts[i][0],native_adreno_submit_parts[i][1]);
  }
  houji_surface_lazy_report();
+ IOLog("HOUJI DVFS LOCK: skipped-ticks=%llu retries=%llu; live\n",native_adreno_dvfs_skips[0],native_adreno_dvfs_skips[1]);
  IOLog("HOUJI WPTR: writes=%llu retried=%llu retries=%llu loop-us=%llu; live\n",native_adreno_wptr_stats[0],native_adreno_wptr_stats[1],native_adreno_wptr_stats[2],native_adreno_wptr_stats[3]);
  IOLog("HOUJI WAIT OUTER: waits=%llu total-us=%llu pauses=%llu max-us=%llu; live\n",native_adreno_wait_outer[0],native_adreno_wait_outer[1],native_adreno_wait_outer[2],native_adreno_wait_outer[3]);
  for(unsigned row=0;row<48;row++)if(native_adreno_metal_rows[row][0])IOLog("HOUJI METAL ROW %u: %.95s\n",row,native_adreno_metal_rows[row]);
@@ -1095,8 +1096,14 @@ extern "C" uint32_t native_adreno_present_capture_fence(void){
 }
 
 extern "C" void houji_gpu_dvfs_tick(void);
+/* Governor ticks skipped because submits held the lock for a whole retry window; live counter. */
+extern "C" {volatile uint64_t native_adreno_dvfs_skips[2];}
 extern "C" IOReturn native_adreno_dvfs_poll(void){
  if(!g.published || !g.lock || g.dying)return kIOReturnNotReady;
- if(!IOLockTryLock(g.lock))return kIOReturnBusy;
+ /* Under heavy rendering the issuer lock is almost always held; a single try skipped nearly every tick and the governor
+  * never ramped. Retry for up to 8 ms between submissions. */
+ bool locked=false;
+ for(unsigned i=0;i<8 && !(locked=IOLockTryLock(g.lock));i++){native_adreno_dvfs_skips[1]=native_adreno_dvfs_skips[1]+1;IOSleep(1);}
+ if(!locked){native_adreno_dvfs_skips[0]=native_adreno_dvfs_skips[0]+1;return kIOReturnBusy;}
  houji_gpu_dvfs_tick();IOLockUnlock(g.lock);return kIOReturnSuccess;
 }

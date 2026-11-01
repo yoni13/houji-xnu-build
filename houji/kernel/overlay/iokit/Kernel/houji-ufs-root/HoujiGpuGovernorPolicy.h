@@ -18,7 +18,8 @@ static inline unsigned houjiGpuChoose(struct HoujiGpuGovernorPolicy *p,
  uint64_t need=(uint64_t)hco_opp(cur)->khz*p->filtered/550;
  if(busy>=900 && need<(uint64_t)hco_opp(cur)->khz*3/2)
   need=(uint64_t)hco_opp(cur)->khz*3/2;
- if(queued>=2 && busy>=500)need=need*5/4;
+ /* Two or more queued jobs: the GPU is behind the render server; go straight to the thermal cap. */
+ if(queued>=2)need=(uint64_t)houjiGpuOpps[cap-1].khz;
  unsigned want=hco_at_least(need,cap),floor=1;p->reason=1;
  if(touch){floor=hco_at_least(680000,cap);p->reason=2;}
  if(wake){unsigned f=hco_at_least(578000,cap);if(f>floor)floor=f;p->reason=3;}
