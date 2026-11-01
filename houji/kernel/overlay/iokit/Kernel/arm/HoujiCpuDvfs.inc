@@ -136,6 +136,13 @@ static void worker(void*,wait_result_t){
 static void start(){
  if(started)return;started=true;PE_parse_boot_argn("houji_dvfs",&enabled,sizeof(enabled));
  if(!(enabled&1))return;
+ {char text[32]={};
+  if(PE_parse_boot_arg_str("houji_cpuf",text,sizeof text)){
+   unsigned v[3]={houjiDvfsFloors[0],houjiDvfsFloors[1],houjiDvfsFloors[2]},i=0;const char *p=text;
+   while(*p && i<3){unsigned x=0;bool any=false;while(*p>='0'&&*p<='9'){x=x*10+unsigned(*p-'0');p++;any=true;}if(any&&x<=100)v[i]=x;i++;if(*p==',')p++;else break;}
+   for(unsigned k=0;k<3;k++)houjiDvfsFloors[k]=v[k];
+  }
+  IOLog("HOUJI CPU DVFS FLOORS: frame=%u%% touch=%u%% recent=%u%%\n",houjiDvfsFloors[0],houjiDvfsFloors[1],houjiDvfsFloors[2]);}
  for(unsigned id=0;id<domains;id++)if(!init(id)){IOLog("HOUJI CPU DVFS: domain=%u factory validation refused; no frequency writes\n",id);return;}
  for(unsigned id=0;id<domains;id++)if(!vote(id,d[id].cur)){IOLog("HOUJI CPU DVFS: initial readback refused domain=%u\n",id);return;}
  thread_t t;if(kernel_thread_start(worker,nullptr,&t)==KERN_SUCCESS)thread_deallocate(t);
