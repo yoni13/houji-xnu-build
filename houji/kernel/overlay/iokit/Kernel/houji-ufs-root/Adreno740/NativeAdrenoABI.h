@@ -12,7 +12,7 @@
  * rather than ignored. */
 enum {
     NativeAdrenoAbiVersion = 1,
-    NativeAdrenoAbiMaxBuffers = 16,
+    NativeAdrenoAbiMaxBuffers = 64,   /* Turnip submits ~18 IBs per vkQueueSubmit; 16 split most into two kernel submits */
     NativeAdrenoAbiMaxBoBytesShift = 28, /* 256MiB per object */
     NativeAdrenoMethodQuery = 1,
     NativeAdrenoMethodBoAlloc = 2,
@@ -151,7 +151,7 @@ static_assert(sizeof(NativeAdrenoAbiBoAlloc) == 16, "ABI alloc layout");
 static_assert(sizeof(NativeAdrenoAbiBoMap) == 32, "ABI map layout");
 static_assert(sizeof(NativeAdrenoAbiBoImport) == 16, "ABI import layout");
 static_assert(sizeof(NativeAdrenoAbiSubmitBuffer) == 24, "ABI buffer layout");
-static_assert(sizeof(NativeAdrenoAbiSubmit) == 416, "ABI submit layout");
+static_assert(sizeof(NativeAdrenoAbiSubmit) == 1568, "ABI submit layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuMap) == 8, "ABI cpu map layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuMapReply) == 16, "ABI cpu map reply layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuUnmap) == 16, "ABI cpu unmap layout");

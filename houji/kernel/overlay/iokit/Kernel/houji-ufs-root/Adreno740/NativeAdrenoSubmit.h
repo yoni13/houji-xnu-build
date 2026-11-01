@@ -33,7 +33,7 @@ class NativeAdrenoSubmit final {
     struct Job {
         uint32_t fence=0;
         size_t count=0;
-        uint64_t handles[16]{};
+        uint64_t handles[64]{};
         uint32_t queue=0;
         bool active=false;
     } jobs_[8];

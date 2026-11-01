@@ -38,7 +38,7 @@ struct SubmitDiagScope {unsigned slot;uint64_t began;
  * and IB_SIZE in dwords (bits 0..19), exactly as the pinned adreno_pm4.xml
  * domain states and Linux msm_gem_submit.c converts the userspace byte size. */
 enum : uint32_t {SubmitIndirectBuffer=0x3f,SubmitIbWords=3,SubmitMaxJobs=8,
-    SubmitMaxBuffers=16,SubmitMaxIbBytes=0xfffffu*4u,
+    SubmitMaxBuffers=64,SubmitMaxIbBytes=0xfffffu*4u,
     SubmitAuditBytes=256u*1024u};   /* IB bytes the write-combine audit compares per submission */
 extern "C" {volatile uint32_t native_adreno_coherence[8];}
 /* The submission (1-based count) at which the write-combine audit found a dirty IB line or failed; 0 = never. */
