@@ -205,11 +205,14 @@ class AppleCLCD : public IOMobileFramebuffer {
 	IOTimerEventSource *fVsync;
 	IOWorkLoop         *fCopyWorkLoop;
 	IOInterruptEventSource *fCopyEvent;
+	IOTimerEventSource *fCopyRetry;   /* GPU not done yet: retry soon, not next tick */
 	uint64_t            fVsyncCount;
 	uint64_t            fVsyncPeriod, fNextVsync;
 
 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
 	static void copyFired(OSObject *owner, IOInterruptEventSource *sender, int count);
+	static void copyRetryFired(OSObject *owner, IOTimerEventSource *sender);
+	void copyQueued(void);
 
 public:
 	uint64_t      fPhys;
@@ -223,7 +226,7 @@ public:
 	uint32_t      fSwapID;
 	bool          fConsolePaused;
 	HoujiFrameQueue<HoujiDisplayFrame,8> fFrames;
-	int           fGpuSync=0,fGpuCache=0;
+	int           fGpuSync=0,fGpuCache=0,fImmediate=1;
 	uint32_t      fCacheLine=64;
 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
 	SweetSurface *fScanout;
@@ -313,6 +316,14 @@ AppleCLCD::start(IOService *provider)
 		return false;
 	}
 	fCopyEvent->enable();
+	fCopyRetry = IOTimerEventSource::timerEventSource(this, &AppleCLCD::copyRetryFired);
+	if (!fCopyRetry || fCopyWorkLoop->addEventSource(fCopyRetry) != kIOReturnSuccess) {
+		IOLog("HOUJI FB: copy retry timer setup failed\n");
+		return false;
+	}
+	/* Copy each frame as soon as it is queued. The notification timer is not
+	 * panel vblank, so waiting for its tick only added up to one period. */
+	PE_parse_boot_argn("houji_fb_immediate",&fImmediate,sizeof(fImmediate));
 	PE_parse_boot_argn("houji_fb_gpu_sync",&fGpuSync,sizeof(fGpuSync));
 	PE_parse_boot_argn("houji_fb_gpu_cache",&fGpuCache,sizeof(fGpuCache));
 	uint64_t ctr=0;__asm__ volatile("mrs %0, ctr_el0":"=r"(ctr));
@@ -419,20 +430,36 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 void
 AppleCLCD::copyFired(OSObject *owner, __unused IOInterruptEventSource *sender, __unused int count)
 {
- AppleCLCD *fb=(AppleCLCD *)owner;
+ ((AppleCLCD *)owner)->copyQueued();
+}
+
+void
+AppleCLCD::copyRetryFired(OSObject *owner, __unused IOTimerEventSource *sender)
+{
+ ((AppleCLCD *)owner)->copyQueued();
+}
+
+/* Runs only on fCopyWorkLoop. Drains the queue in order; a frame whose GPU
+ * work is unfinished stays queued and is retried after 500 us. */
+void
+AppleCLCD::copyQueued(void)
+{
+ AppleCLCD *fb=this;
  __atomic_add_fetch(&houji_fb_copy_wakes,1ull,__ATOMIC_RELAXED);
- IOLockLock(fb->fLock);
- const HoujiDisplayFrame *head=fb->fFrames.front();
- if(!head){IOLockUnlock(fb->fLock);return;}
- HoujiDisplayFrame frame=*head; /* queue retains every surface until real copy completion */
- IOLockUnlock(fb->fLock);
  const uint64_t began=mach_absolute_time();
- if(fb->present(frame)){
+ for(unsigned n=0;n<8;n++){
+  IOLockLock(fb->fLock);
+  const HoujiDisplayFrame *head=fb->fFrames.front();
+  if(!head){IOLockUnlock(fb->fLock);break;}
+  HoujiDisplayFrame frame=*head; /* queue retains every surface until real copy completion */
+  IOLockUnlock(fb->fLock);
+  if(!fb->present(frame)){if(fb->fImmediate)fb->fCopyRetry->setTimeoutUS(500);break;}
   IOLockLock(fb->fLock);
   const bool retired=fb->fFrames.finish(frame.id);
   if(retired){__atomic_fetch_add(&houji_fb_retired,1ull,__ATOMIC_RELAXED);IOLockWakeup(fb->fLock,&fb->fFrames,false);}
   IOLockUnlock(fb->fLock);
   if(retired)for(auto *surface:frame.surfaces)if(surface)surface->release();
+  if(!retired)break;
  }
  const uint64_t elapsed=mach_absolute_time()-began;
  __atomic_fetch_add(&houji_fb_copy_worker_ticks,elapsed,__ATOMIC_RELAXED);
@@ -562,7 +589,9 @@ AppleCLCD::swap(const uint8_t *rec)
  if(depth>__atomic_load_n(&houji_fb_queue_peak,__ATOMIC_RELAXED))__atomic_store_n(&houji_fb_queue_peak,(uint64_t)depth,__ATOMIC_RELAXED);
  IOLockUnlock(fLock);
  if(!queued){for(auto *surface:frame.surfaces)if(surface)surface->release();return kIOReturnTimeout;}
- __atomic_fetch_add(&sweet_fb_swap_count,1ull,__ATOMIC_RELAXED);return kIOReturnSuccess;
+ __atomic_fetch_add(&sweet_fb_swap_count,1ull,__ATOMIC_RELAXED);
+ if(fImmediate)fCopyEvent->interruptOccurred(nullptr,nullptr,0);
+ return kIOReturnSuccess;
 }
 
 IOReturn

@@ -457,6 +457,7 @@ static bool nativeAdrenoNonMutatingGpuMethod(uint32_t method) {
     default:return false;
     }
 }
+static uint32_t gHoujiLastSubmittedFence;
 static uint64_t nativeAdrenoDispatchPerf[20][4]; // calls, time us, max us, cached path
 extern "C" volatile uint64_t native_adreno_submit_cost[12];
 extern "C" volatile uint32_t native_adreno_io_coherent,native_adreno_coherent_skips[4],native_adreno_wc_audit[6],native_adreno_wc_distrusted;
@@ -521,6 +522,10 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         if(method==NativeAdrenoMethodBoMap && !status && connection->live_ && !connection->kernel_)
             if(NativeAdrenoClientRecord *record=clientRecord(connection->name_))
                 if(connection->core_->windowPeak()>>20>record->peak_mib)record->peak_mib=uint32_t(connection->core_->windowPeak()>>20);
+        /* Published inside the lock, before the submitter sees its reply, so a
+         * later SwapEnd can read it without waiting for the GPU gate. */
+        if(method==NativeAdrenoMethodSubmit && !status && g.ring)
+            __atomic_store_n(&gHoujiLastSubmittedFence,g.ring->lastSubmitted(),__ATOMIC_RELEASE);
         IOLockUnlock(g.lock);
     }
     native_adreno_metal_diag.inflight=0;
@@ -991,7 +996,9 @@ extern "C" int native_adreno_present_begin_frame(uint32_t desired){
   while(elapsed>old && !__atomic_compare_exchange_n(&gHoujiPresentSync[8],&old,elapsed,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
  }
  if(g.dying || !native_adreno_board_running()){IOLockUnlock(g.lock);return -1;}
- uint32_t fence=desired?desired:g.ring->lastSubmitted(),seen=0;
+ const uint32_t last=g.ring->lastSubmitted();
+ uint32_t fence=desired?desired:last,seen=0;
+ if((int32_t)(fence-last)>0)fence=last; /* never wait on a fence the ring has not issued */
  if(fence && g.ring->observeFence(fence,nullptr,0,&seen)!=NativeAdrenoRingFenceComplete){
   __atomic_fetch_add(&gHoujiPresentSync[3],1ull,__ATOMIC_RELAXED);IOLockUnlock(g.lock);return -1;
  }
@@ -1013,6 +1020,9 @@ extern "C" void native_adreno_present_sync_report(void){
 extern "C" int native_adreno_present_begin(void){return native_adreno_present_begin_frame(0);}
 extern "C" uint32_t native_adreno_present_capture_fence(void){
  if(!g.published || !g.lock || !g.ring)return 0;
+ /* Lock-free when known: taking g.lock here made SwapEnd wait behind a
+  * whole-GPU quiesce. The value only grows and covers the caller's submit. */
+ if(uint32_t fence=__atomic_load_n(&gHoujiLastSubmittedFence,__ATOMIC_ACQUIRE))return fence;
  IOLockLock(g.lock);
  uint32_t fence=(!g.dying && native_adreno_board_running())?g.ring->lastSubmitted():0;
  IOLockUnlock(g.lock);return fence;
