@@ -37,7 +37,7 @@ static void (*gMissing)(const char *, const char *);
 
 // What this device has been asked and refused, for the plugin's status line (native_bridge_metal_status): commits, render/compute pipelines made,
 // refusals, and the last two refusals' texts. Counters only; nothing here changes a result.
-static std::atomic<uint64_t> gCommits,gCommitFailures,gPipelines,gProblems,gCompleted,gScheduledInline;
+static std::atomic<uint64_t> gCommits,gCommitFailures,gPipelines,gProblems,gCompleted;
 // What the render server actually asks of the GPU (int-141: 59 commits in 200 s, and a desktop that behaves like CPU compositing): render passes,
 // draws, the pixels of their first colour attachment, compute dispatches, blits and the largest pass (pixels).
 static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBiggestPass,gFullScreenPasses;
@@ -1010,18 +1010,8 @@ static void scheduled(void *context);
   flushSurfaces(_surfaces);
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
   void *context=(__bridge_retained void *)self;
-  // A native scheduled handler makes the runtime post the Scheduled transition to a handler thread (WorkCounts
-  // scheduled_where_submitted stayed at 4 of 2000): every waitUntilScheduled then waited for that thread. Without
-  // Metal scheduled handlers there is nothing to run, so none is registered: the transition happens where the batch is
-  // submitted, and waitUntilScheduled waits on the runtime's own status alone.
-  bool wantsScheduled;
-  @synchronized(self){
-   wantsScheduled=_scheduledHandlers.count!=0;
-   if(!wantsScheduled){_schedulingDelivered=YES;gScheduledInline++;}
-  }
-  if(!wantsScheduled)dispatch_group_leave(_schedulingHandlers);
   if(nmb_command_buffer_on_completed(_handle,completed,context) &&
-     (!wantsScheduled || nmb_command_buffer_on_scheduled(_handle,scheduled,context)) && nmb_command_buffer_commit(_handle))return;
+     nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle))return;
   (void)CFBridgingRelease(context);   // refused registration/commit cannot call the registered handlers
   [self refuse:[@"commit: " stringByAppendingString:lastError()]];
  }
@@ -1829,8 +1819,8 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
    row("M %s q%llu cb%llu sub%llums grp%llu/%llu end-held%llu kept%llu",pol,u(c[0]),u(c[1]),u(c[2]/1000000),u(c[3]),u(c[4]),u(c[5]),u(c[6]));
    row("M held host%llu earlier%llu chk%llu ev%llu look%llu | sl%llu wC%llu wG%llu ps%llu gw%llu",u(c[7]),u(c[8]),u(c[9]),u(c[10]),u(c[11]),
     u(c[12]),u(c[13]),u(c[14]),u(c[15]),u(c[16]));
-   row("M at-submit%llu inl%llu gate%llu/%llu tl%llu fw%llu p0:%llu 1:%llu 2-3:%llu 4+:%llu",u(c[17]),u(gScheduledInline.load()),u(c[18]),u(c[19]),
-    u(c[20]),u(c[21]),u(c[22]),u(c[23]),u(c[24]),u(c[25]));
+   row("M at-submit%llu gate%llu/%llu tl%llu fw%llu pend0:%llu 1:%llu 2-3:%llu 4+:%llu",u(c[17]),u(c[18]),u(c[19]),u(c[20]),u(c[21]),
+    u(c[22]),u(c[23]),u(c[24]),u(c[25]));
   }
  }
  row("J scheduled wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitScheduled.count.load(),ms(gTimeWaitScheduled.total.load()),ms(gTimeWaitScheduled.slowest.load()));

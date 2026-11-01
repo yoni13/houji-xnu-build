@@ -67,7 +67,7 @@ static uint32_t ilog2(size_t value)
 }
 /* The last submissions as the CP will read them: [slot] fence, start index, end index, word count, then up to 112 ring words from the start. The board log
  * prints them, so a fence the GPU never wrote can be compared with the packets that should have written it. */
-extern "C" {volatile uint32_t native_adreno_ring_log[4][4+300];volatile uint32_t native_adreno_ring_log_count;}
+extern "C" {volatile uint32_t native_adreno_ring_log[4][4+112];volatile uint32_t native_adreno_ring_log_count;}
 /* Ring write sub-parts for the board's live profile (8 read pointer, 9 commands + record, 10 publish check, 11 barrier + WPTR). */
 extern "C" void native_adreno_submit_part(unsigned part,uint64_t began) __attribute__((weak));
 extern "C" uint64_t native_adreno_submit_part_now(void) __attribute__((weak));
@@ -276,7 +276,7 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,u
         const uint32_t total=(end-next_)&mask;
         volatile uint32_t *record=native_adreno_ring_log[slot];
         record[0]=seqno_+1;record[1]=next_;record[2]=end;record[3]=total;
-        for(uint32_t i=0;i<300;++i)record[4+i]=i<total?ring_[(next_+i)&mask]:0;
+        for(uint32_t i=0;i<112;++i)record[4+i]=i<total?ring_[(next_+i)&mask]:0;
         native_adreno_ring_log_count=native_adreno_ring_log_count+1;
     }
     ringPart(9,part);part=ringNow();

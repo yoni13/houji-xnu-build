@@ -19,7 +19,7 @@ extern "C" uint64_t native_adreno_provider_progress_token(void);
 extern "C" void native_adreno_provider_snapshot(void);
 extern "C" void native_adreno_perf_report(void);
 extern "C" int native_adreno_provider_stop(int(*)(void*),void*);
-extern "C" {extern volatile uint32_t native_adreno_ring_log[4][4+300];extern volatile uint32_t native_adreno_ring_log_count;}
+extern "C" {extern volatile uint32_t native_adreno_ring_log[4][4+112];extern volatile uint32_t native_adreno_ring_log_count;}
 static struct {
  NativeAdrenoTimer timer;unsigned phase,code,published,registry,rounds,draws,views,closes,publishes;
  uint32_t first_error,crc;uint64_t started_us,audited_generation=UINT64_MAX;
@@ -135,7 +135,7 @@ static int houjiProviderPublish(const volatile uint32_t*words,size_t bytes){
  if(!native_adreno_board_running() || !houjiApiInOperation() || houjiSubmitGuard() || s.published || s.pending || words!=houjiCpCpu() || bytes!=HHR_BYTES || !native_adreno_ring_log_count)return 1;
  const volatile uint32_t*log=native_adreno_ring_log[(native_adreno_ring_log_count-1)&3];
  const uint32_t seq=s.ring.lastSubmitted()+1,n=log[3];
- if(!seq || log[0]!=seq || log[1]!=s.end || log[2]>=HHR_WORDS || n<46 || n>42+4*64 || (n-42)%4 || log[2]!=((s.end+n)&(HHR_WORDS-1)))return 1;
+ if(!seq || log[0]!=seq || log[1]!=s.end || log[2]>=HHR_WORDS || n<46 || n>106 || (n-42)%4 || log[2]!=((s.end+n)&(HHR_WORDS-1)))return 1;
  const uint32_t head[]={hhr_pkt7(0x17,1),0x80000001,hhr_pkt7(0x46,1),0x32,hhr_pkt7(0x46,1),0x33,hhr_pkt7(0x26,0),hhr_pkt7(0x17,1),3,hhr_pkt7(0x65,1),0x101};
  /* The light prologue (unchanged tables): the flush, invalidate and wait-for-idle replaced by one 4-word CP_NOP. */
  const uint32_t light[]={hhr_pkt7(0x17,1),0x80000001,hhr_pkt7(0x10,4),0,0,0,0,hhr_pkt7(0x17,1),3,hhr_pkt7(0x65,1),0x101};
