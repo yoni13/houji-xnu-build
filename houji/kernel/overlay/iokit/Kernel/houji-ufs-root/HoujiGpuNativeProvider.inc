@@ -17,6 +17,7 @@ extern "C" unsigned native_adreno_provider_probe_result(void);
 extern "C" unsigned native_adreno_provider_probe_started(void);
 extern "C" uint64_t native_adreno_provider_progress_token(void);
 extern "C" void native_adreno_provider_snapshot(void);
+extern "C" void native_adreno_perf_report(void);
 extern "C" int native_adreno_provider_stop(int(*)(void*),void*);
 extern "C" {extern volatile uint32_t native_adreno_ring_log[4][4+112];extern volatile uint32_t native_adreno_ring_log_count;}
 static struct {

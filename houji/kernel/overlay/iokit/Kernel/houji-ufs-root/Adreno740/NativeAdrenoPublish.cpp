@@ -907,6 +907,16 @@ extern "C" unsigned houji_gpu_cached_timing(char *out,unsigned capacity) {
  return used;
 }
 
+/* Live profile for the USB log: cumulative per-method cost and the Metal
+ * plugin's own telemetry rows. Reads counters only; no lock, no GPU access. */
+extern "C" void native_adreno_perf_report(void){
+ for(unsigned method=0;method<20;++method){
+  uint64_t v[4];for(unsigned i=0;i<4;++i)v[i]=__atomic_load_n(&nativeAdrenoDispatchPerf[method][i],__ATOMIC_RELAXED);
+  if(v[0])IOLog("HOUJI ABI METHOD: id=%u calls=%llu total-us=%llu max-us=%llu no-drain=%llu; live\n",method,v[0],v[1],v[2],v[3]);
+ }
+ IOLog("HOUJI WAIT OUTER: waits=%llu total-us=%llu pauses=%llu max-us=%llu; live\n",native_adreno_wait_outer[0],native_adreno_wait_outer[1],native_adreno_wait_outer[2],native_adreno_wait_outer[3]);
+ for(unsigned row=0;row<48;row++)if(native_adreno_metal_rows[row][0])IOLog("HOUJI METAL ROW %u: %.95s\n",row,native_adreno_metal_rows[row]);
+}
 static void nativeAdrenoStopDiagnostics(void){
  const char *phases[]={"all","wc-reassert","publish","audit"};
  IOLog("HOUJI CACHE POLICY: coherent=%u skipped=%u/%u/%u/%u wc-reset=%u distrusted=%u dirty=%u stale=%u; cached observations only\n",native_adreno_io_coherent,native_adreno_coherent_skips[0],native_adreno_coherent_skips[1],native_adreno_coherent_skips[2],native_adreno_coherent_skips[3],native_adreno_wc_audit[5],native_adreno_wc_distrusted,native_adreno_wc_audit[2],native_adreno_wc_audit[3]);
