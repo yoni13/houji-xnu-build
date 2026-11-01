@@ -461,6 +461,7 @@ static uint32_t gHoujiLastSubmittedFence;
 extern "C" IOReturn native_adreno_board_light_gate(int submit);
 extern "C" void houji_gate_hitch_snapshot(uint64_t out[6]);
 extern "C" void houji_surface_lazy_report(void);
+extern "C" void houji_power_report(void);
 extern "C" void houji_cp_lease_report(void);
 extern "C" {extern volatile uint64_t native_adreno_prologue_stats[2];}
 extern "C" {extern volatile uint64_t native_adreno_wptr_stats[4];}
@@ -979,6 +980,7 @@ extern "C" void native_adreno_perf_report(void){
   for(unsigned i=0;i<12;i++)IOLog("HOUJI SUBMIT PART: %s n=%llu us=%llu; live\n",names[i],native_adreno_submit_parts[i][0],native_adreno_submit_parts[i][1]);
  }
  houji_surface_lazy_report();
+ houji_power_report();
  houji_cp_lease_report();
  IOLog("HOUJI PROLOGUE: light=%llu full=%llu; live\n",native_adreno_prologue_stats[0],native_adreno_prologue_stats[1]);
  IOLog("HOUJI DVFS LOCK: skipped-ticks=%llu retries=%llu; live\n",native_adreno_dvfs_skips[0],native_adreno_dvfs_skips[1]);

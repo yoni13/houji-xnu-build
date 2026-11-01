@@ -2092,7 +2092,7 @@ diff --git a/iokit/conf/files b/iokit/conf/files
 index 5fb0a52..68a64fa 100644
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -148,3 +148,32 @@ iokit/Kernel/IOWorkloadConfig.cpp			optional iokitcpp
+@@ -148,3 +148,46 @@ iokit/Kernel/IOWorkloadConfig.cpp			optional iokitcpp
  
  # Skywalk
  iokit/bsddev/skywalk/IOSkywalkSupport.cpp		optional iokitcpp skywalk
@@ -2125,6 +2125,20 @@ index 5fb0a52..68a64fa 100644
 +iokit/Kernel/houji-ufs-root/Adreno740/NativeAdrenoTimer.cpp optional iokitcpp
 +iokit/Kernel/houji-ufs-root/Adreno740/NativeAdrenoPublish.cpp optional iokitcpp
 +iokit/Kernel/houji-ufs-root/Adreno740/HoujiNativeAccelerator.cpp optional iokitcpp
++
++iokit/Kernel/houji-adsp/HoujiAdsp.cpp optional iokitcpp
++iokit/Kernel/houji-adsp/ShengBattery.cpp optional iokitcpp
++iokit/Kernel/houji-adsp/AdspFirmware.c optional iokit
++iokit/Kernel/houji-adsp/FatVolume.c optional iokit
++iokit/Kernel/houji-adsp/QcomGlink.c optional iokit
++iokit/Kernel/houji-adsp/QcomMdt.c optional iokit
++iokit/Kernel/houji-adsp/QcomQmp.c optional iokit
++iokit/Kernel/houji-adsp/QcomQrtr.c optional iokit
++iokit/Kernel/houji-adsp/QcomRpmh.c optional iokit
++iokit/Kernel/houji-adsp/QcomSmem.c optional iokit
++iokit/Kernel/houji-adsp/QcomSmp2p.c optional iokit
++iokit/Kernel/houji-adsp/ShengBattmgr.c optional iokit
++iokit/Kernel/houji-adsp/ShengQrtr.c optional iokit
 diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
 index f731d43..da6c812 100644
 --- a/iokit/conf/files.arm64

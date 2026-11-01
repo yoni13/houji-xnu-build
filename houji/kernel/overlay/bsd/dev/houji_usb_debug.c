@@ -573,6 +573,7 @@ static int identity(void)
 void houji_usb_debug_start(void)
 {
     static bool attempted;
+    { extern void houji_power_start(void); static bool power; if (!power) { power=true; houji_power_start(); } }
     int enabled=0;PE_parse_boot_argn("houji_usb",&enabled,sizeof(enabled));
     if ((enabled!=1 && enabled!=2) || attempted) return;
     attempted=true;u.mps=512;u.coding[0]=0;u.coding[1]=0xc2;u.coding[2]=1;u.coding[6]=8;
