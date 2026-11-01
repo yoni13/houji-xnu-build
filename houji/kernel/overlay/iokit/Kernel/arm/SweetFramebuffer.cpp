@@ -494,6 +494,18 @@ get32(const uint8_t *p, uint32_t off)
 	return v;
 }
 
+/* Intervals between consecutive SwapEnd calls: <10, 10-14, 14-20 (60 fps), 20-25, 25-36 (30 fps), 36-50, >=50 ms (idle gap).
+ * Gaps under 50 ms count as animation; their total time gives the frame rate while something moves. */
+static uint64_t houji_fb_interval_hist[7],houji_fb_anim_frames,houji_fb_anim_ticks,houji_fb_last_swap;
+static void houjiNoteSwapInterval(void){
+ const uint64_t now=mach_absolute_time(),last=__atomic_exchange_n(&houji_fb_last_swap,now,__ATOMIC_RELAXED);
+ if(!last)return;
+ uint64_t ns=0;absolutetime_to_nanoseconds(now-last,&ns);const uint64_t ms10=ns/100000; /* 0.1 ms */
+ static const uint64_t edge[6]={100,140,200,250,360,500};
+ unsigned b=0;while(b<6 && ms10>=edge[b])++b;
+ __atomic_fetch_add(&houji_fb_interval_hist[b],1ull,__ATOMIC_RELAXED);
+ if(b<6){__atomic_fetch_add(&houji_fb_anim_frames,1ull,__ATOMIC_RELAXED);__atomic_fetch_add(&houji_fb_anim_ticks,now-last,__ATOMIC_RELAXED);}
+}
 static uint32_t sweet_fb_swaps_logged;
 static uint64_t sweet_fb_swap_count;
 static uint64_t houji_fb_present_count;
@@ -552,6 +564,16 @@ extern "C" void houji_framebuffer_report(void)
 	    __atomic_load_n(&houji_fb_missed_timer_ticks, __ATOMIC_RELAXED));
 	uint64_t cacheNs=0;absolutetime_to_nanoseconds(__atomic_load_n(&houji_fb_cache_ticks,__ATOMIC_RELAXED),&cacheNs);
 	IOLog("HOUJI DISPLAY SYNC: deferred=%llu cache-bytes=%llu cache-us=%llu cache-denied=%llu; completed-GPU surface reads\n",__atomic_load_n(&houji_fb_sync_deferred,__ATOMIC_RELAXED),__atomic_load_n(&houji_fb_cache_bytes,__ATOMIC_RELAXED),cacheNs/1000,__atomic_load_n(&houji_fb_cache_denied,__ATOMIC_RELAXED));
+	{
+	 static uint64_t prevHist[7],prevFrames,prevTicks;uint64_t h[7],frames,ticks,ns=0;
+	 for(unsigned i=0;i<7;i++){h[i]=__atomic_load_n(&houji_fb_interval_hist[i],__ATOMIC_RELAXED);}
+	 frames=__atomic_load_n(&houji_fb_anim_frames,__ATOMIC_RELAXED);ticks=__atomic_load_n(&houji_fb_anim_ticks,__ATOMIC_RELAXED);
+	 absolutetime_to_nanoseconds(ticks-prevTicks,&ns);
+	 IOLog("HOUJI FRAME PACE: <10=%llu 10-14=%llu 14-20=%llu 20-25=%llu 25-36=%llu 36-50=%llu idle=%llu animating-fps-milli=%llu animating-ms=%llu; SwapEnd intervals this window\n",
+	  h[0]-prevHist[0],h[1]-prevHist[1],h[2]-prevHist[2],h[3]-prevHist[3],h[4]-prevHist[4],h[5]-prevHist[5],h[6]-prevHist[6],
+	  ns?(frames-prevFrames)*1000000000000ULL/ns:0,ns/1000000);
+	 for(unsigned i=0;i<7;i++)prevHist[i]=h[i];prevFrames=frames;prevTicks=ticks;
+	}
 	houji_surface_use_report();
 	houjiReportRects();
 	IOLog("HOUJI FRAME LIFE: retired=%llu waits=%llu blocked=%llu wait-timeout=%llu queue-full=%llu peak=%llu wait-id=%llu wait-mode=%llu wait-ns=%llu; real CPU copy/store completion, not panel vblank\n",__atomic_load_n(&houji_fb_retired,__ATOMIC_RELAXED),__atomic_load_n(&houji_fb_waits,__ATOMIC_RELAXED),__atomic_load_n(&houji_fb_wait_blocked,__ATOMIC_RELAXED),__atomic_load_n(&houji_fb_wait_timeout,__ATOMIC_RELAXED),__atomic_load_n(&houji_fb_queue_full,__ATOMIC_RELAXED),__atomic_load_n(&houji_fb_queue_peak,__ATOMIC_RELAXED),__atomic_load_n(&houji_fb_last_wait_id,__ATOMIC_RELAXED),__atomic_load_n(&houji_fb_last_wait_mode,__ATOMIC_RELAXED),__atomic_load_n(&houji_fb_last_wait_ns,__ATOMIC_RELAXED));
@@ -590,6 +612,7 @@ AppleCLCD::swap(const uint8_t *rec)
  IOLockUnlock(fLock);
  if(!queued){for(auto *surface:frame.surfaces)if(surface)surface->release();return kIOReturnTimeout;}
  __atomic_fetch_add(&sweet_fb_swap_count,1ull,__ATOMIC_RELAXED);
+ houjiNoteSwapInterval();
  if(fImmediate)fCopyEvent->interruptOccurred(nullptr,nullptr,0);
  return kIOReturnSuccess;
 }
