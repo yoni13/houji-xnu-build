@@ -85,6 +85,36 @@ extern "C" IOReturn native_adreno_board_quiesce(void){
  a.phase=11;s.published=s.pending=0;s.iteration=s.seq+1;
  return kIOReturnSuccess;
 }
+/* Pipelined gate (houji_gpu_pipeline=1, default). Calls that never touch page tables, SMMU or GPU registers (alloc, CPU map/unmap,
+ * queues) do not wait for the GPU. A submission may queue behind running work only while the tables are exactly those the full gate
+ * last audited and the last TLBIALL covered; otherwise it takes the full gate. Map/unmap/free keep the full gate (idle GPU, audit,
+ * TLB synchronization). At most kHoujiPipelineDepth jobs are in flight. Counters: light submits, light other, full fallbacks,
+ * depth waits, fault refusals. */
+enum {kHoujiPipelineDepth=2};
+static uint32_t gHoujiPipeline=~0u;
+extern "C" {volatile uint64_t native_adreno_pipeline_stats[5];extern volatile uint32_t native_adreno_tlb_reuse;}
+extern "C" IOReturn native_adreno_board_light_gate(int submit){
+ if(!native_adreno_board_running())return kIOReturnNotReady;
+ if(gHoujiPipeline==~0u){uint32_t v=1;PE_parse_boot_argn("houji_gpu_pipeline",&v,sizeof(v));gHoujiPipeline=v;native_adreno_tlb_reuse=v?1:0;}
+ auto&a=gHoujiApi;auto&s=gHoujiSubmit;
+ if(!gHoujiPipeline || gHoujiLive.mode==1 || a.phase!=11 || houjiSubmitGuard()){native_adreno_pipeline_stats[2]=native_adreno_pipeline_stats[2]+1;return native_adreno_board_quiesce();}
+ if(!submit){native_adreno_pipeline_stats[1]=native_adreno_pipeline_stats[1]+1;return kIOReturnSuccess;}
+ if(gHoujiProvider.audited_generation!=gHoujiVm.binding.state->generation || !a.vm.tlbCurrent()){
+  native_adreno_pipeline_stats[2]=native_adreno_pipeline_stats[2]+1;return native_adreno_board_quiesce();
+ }
+ /* The fault checks of houjiSubmitDrainPointers, without requiring an empty ring. */
+ uint32_t protect=0,irq=0;
+ if(houjiFullRaw32(0x3d02084,&protect) || houjiFullRaw32(0x3d00804,&irq) || protect || (irq&~((1u<<0)|(1u<<17)|(1u<<18)|(1u<<20)))){
+  native_adreno_pipeline_stats[4]=native_adreno_pipeline_stats[4]+1;s.protect=protect;s.irq=irq;return kIOReturnIOError;
+ }
+ if(a.submit.outstanding()>=kHoujiPipelineDepth){
+  native_adreno_pipeline_stats[3]=native_adreno_pipeline_stats[3]+1;
+  if(a.submit.waitDepth(kHoujiPipelineDepth,&a.clock,500000))return kIOReturnTimeout;
+ }
+ s.published=s.pending=0;s.iteration=s.ring.lastSubmitted()+1;
+ native_adreno_pipeline_stats[0]=native_adreno_pipeline_stats[0]+1;
+ return kIOReturnSuccess;
+}
 static bool houjiProviderTlbValue(uint64_t v){return native_adreno_board_running() && houjiApiInOperation() && (v>>48)==0x751 && (v&UINT64_C(0x0000ffffffffffff))>=0x10000 && (v&UINT64_C(0x0000ffffffffffff))<0x80000;}
 static int houjiProviderPublish(const volatile uint32_t*words,size_t bytes){
  auto&s=gHoujiSubmit;auto&p=gHoujiProvider;

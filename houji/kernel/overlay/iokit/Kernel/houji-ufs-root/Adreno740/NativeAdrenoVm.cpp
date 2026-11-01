@@ -333,15 +333,28 @@ IOReturn NativeAdrenoVm::describe(uint64_t handle,uint64_t *iova,size_t *bytes,
 /* TLBIALL of the bank before a submission. Where a table update has observed the bank's image (each region's whole-verification
  * update remembers its register offset), the invalidation alone: the image and faults were observed there and every 64th table
  * operation since (int-159: a submission spent 1.3 ms in the kernel, most of it reading SMMU registers). */
+/* Board switch: 1 lets a submission reuse the previous TLBIALL while the tables are unchanged (the pipelined submit gate needs it,
+ * because SMMU register access requires an idle GPU). Counters: invalidations skipped, performed. */
+extern "C" {volatile uint32_t native_adreno_tlb_reuse;volatile uint64_t native_adreno_tlb_stats[2];}
+uint64_t NativeAdrenoVm::tableGeneration() const
+{
+    uint64_t sum=0;
+    for(const auto &region:regions_)if(region.state)sum+=region.state->generation;
+    return sum;
+}
 IOReturn NativeAdrenoVm::invalidateTlb()
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
+    if(native_adreno_tlb_reuse && tlbCurrent()) {native_adreno_tlb_stats[0]=native_adreno_tlb_stats[0]+1;return kIOReturnSuccess;}
     ArmSmmu4KProgramResult r;
     uint64_t offset=0;
     for(const auto &region:regions_)if(region.state && region.state->context_offset)offset=region.state->context_offset;
     const ArmSmmu4KStatus status=offset?ArmSmmu4KSyncContextTlb(&io_,offset,context_->asid,1,budget_,&r):
         ArmSmmu4KInvalidateAllOwnedContext(&io_,streams_->bank,context_,budget_,&r);
-    return status?fail(status):kIOReturnSuccess;
+    if(status)return fail(status);
+    tlb_generation_=tableGeneration();tlb_valid_=true;
+    native_adreno_tlb_stats[1]=native_adreno_tlb_stats[1]+1;
+    return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoVm::publishMapped()
 {

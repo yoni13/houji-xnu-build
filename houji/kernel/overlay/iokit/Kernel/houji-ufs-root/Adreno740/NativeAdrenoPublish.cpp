@@ -458,6 +458,21 @@ static bool nativeAdrenoNonMutatingGpuMethod(uint32_t method) {
     }
 }
 static uint32_t gHoujiLastSubmittedFence;
+extern "C" IOReturn native_adreno_board_light_gate(int submit);
+extern "C" {extern volatile uint64_t native_adreno_pipeline_stats[5];extern volatile uint64_t native_adreno_tlb_stats[2];}
+/* Methods that may skip waiting for the GPU (see native_adreno_board_light_gate): no page table, SMMU or GPU register access,
+ * except the submission itself, which the gate admits only under unchanged, already synchronized tables. */
+static bool nativeAdrenoPipelinedMethod(uint32_t method) {
+    switch(method) {
+    case NativeAdrenoMethodSubmit:
+    case NativeAdrenoMethodBoAlloc:
+    case NativeAdrenoMethodBoCpuMap:
+    case NativeAdrenoMethodBoCpuUnmap:
+    case NativeAdrenoMethodCreateQueue:
+    case NativeAdrenoMethodCloseQueue:return true;
+    default:return false;
+    }
+}
 static uint64_t nativeAdrenoDispatchPerf[20][4]; // calls, time us, max us, cached path
 extern "C" volatile uint64_t native_adreno_submit_cost[12];
 extern "C" volatile uint32_t native_adreno_io_coherent,native_adreno_coherent_skips[4],native_adreno_wc_audit[6],native_adreno_wc_distrusted;
@@ -511,7 +526,8 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         IOLockLock(g.lock);
         const uint64_t began=g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
         const bool cached=nativeAdrenoNonMutatingGpuMethod(method);
-        status=cached?kIOReturnSuccess:native_adreno_board_quiesce();
+        status=cached?kIOReturnSuccess:nativeAdrenoPipelinedMethod(method)?
+            native_adreno_board_light_gate(method==NativeAdrenoMethodSubmit):native_adreno_board_quiesce();
         if(!status)status=connection->live_?connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
         if(method<20) {
             const uint64_t elapsed=g.clock.now_us?g.clock.now_us(g.clock.cookie)-began:0;
@@ -921,6 +937,11 @@ extern "C" void native_adreno_perf_report(void){
    IOLog("HOUJI SUBMIT COST: phase=%s calls=%llu total-us=%llu max-us=%llu; live\n",phases[phase],v[0],v[1],v[2]);
   }
   IOLog("HOUJI COHERENT SKIPS: %u/%u/%u/%u wc-trusted-audit=%u/%u/%u/%u reset=%u distrusted=%u; live\n",native_adreno_coherent_skips[0],native_adreno_coherent_skips[1],native_adreno_coherent_skips[2],native_adreno_coherent_skips[3],native_adreno_wc_audit[0],native_adreno_wc_audit[1],native_adreno_wc_audit[2],native_adreno_wc_audit[3],native_adreno_wc_audit[5],native_adreno_wc_distrusted);
+ }
+ {
+  IOLog("HOUJI PIPELINE: light-submits=%llu light-other=%llu full-fallbacks=%llu depth-waits=%llu fault-refusals=%llu TLB-reused=%llu TLB-invalidated=%llu jobs=%lu; live\n",
+   native_adreno_pipeline_stats[0],native_adreno_pipeline_stats[1],native_adreno_pipeline_stats[2],native_adreno_pipeline_stats[3],native_adreno_pipeline_stats[4],
+   native_adreno_tlb_stats[0],native_adreno_tlb_stats[1],g.submit?g.submit->outstanding():0ul);
  }
  IOLog("HOUJI WAIT OUTER: waits=%llu total-us=%llu pauses=%llu max-us=%llu; live\n",native_adreno_wait_outer[0],native_adreno_wait_outer[1],native_adreno_wait_outer[2],native_adreno_wait_outer[3]);
  for(unsigned row=0;row<48;row++)if(native_adreno_metal_rows[row][0])IOLog("HOUJI METAL ROW %u: %.95s\n",row,native_adreno_metal_rows[row]);

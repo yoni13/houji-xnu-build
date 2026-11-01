@@ -63,6 +63,10 @@ class NativeAdrenoVm final {
     ArmSmmu4KStatus observeStreamsOnly() const;
     ArmSmmu4KStatus observeCheap();
     unsigned since_audit_=0;
+    /* Table generation (both regions) the last TLBIALL covered. */
+    uint64_t tlb_generation_=0;
+    bool tlb_valid_=false;
+    uint64_t tableGeneration() const;
     IOReturn fail(ArmSmmu4KStatus);
     Mapping *find(uint64_t);
     void insert(size_t,unsigned);
@@ -96,6 +100,9 @@ public:
      * synchronizes by ASID; this is the stronger form the submit path uses before each submission (int-070: on sheng the CP read
      * zeros from an IB whose table entry and DRAM were both correct, after the address had been mapped to other pages before). */
     IOReturn invalidateTlb();
+    /* No table change since the last TLBIALL: maps fill only invalid leaves (never cached) and unmaps synchronize themselves, so
+     * a further TLBIALL adds nothing. Any map/unmap advances the generation and makes the next submission invalidate again. */
+    bool tlbCurrent() const {return tlb_valid_ && tableGeneration()==tlb_generation_;}
     /* Cleans and invalidates the CPU caches over every mapped BO (whole objects; imported ones through their physical pages), so
      * no CPU cache line can hold data the GPU should see or hide what it wrote. Lines are physically tagged, so this also reaches
      * lines a user mapping of the same pages left behind. int-070 runs it before every submission. */

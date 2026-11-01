@@ -289,6 +289,18 @@ IOReturn NativeAdrenoSubmit::waitAll(const NativeAdrenoRingClock *clock,uint32_t
     }
     return kIOReturnSuccess;
 }
+IOReturn NativeAdrenoSubmit::waitDepth(size_t depth,const NativeAdrenoRingClock *clock,uint32_t timeout_us)
+{
+    if(!attached_ || poisoned_)return kIOReturnNotReady;
+    if(!depth)return kIOReturnBadArgument;
+    while(outstanding()>=depth) {
+        Job *oldest=nullptr;
+        for(auto &job:jobs_)if(job.active && (!oldest || job.fence-oldest->fence>0x80000000u))oldest=&job;
+        const IOReturn status=wait(oldest->fence,clock,timeout_us);
+        if(status)return status;
+    }
+    return kIOReturnSuccess;
+}
 IOReturn NativeAdrenoSubmit::waitRange(uint32_t first,uint32_t count,const NativeAdrenoRingClock *clock,uint32_t timeout_us)
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
