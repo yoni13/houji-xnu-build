@@ -16,6 +16,20 @@ static void submitDiagRecord(unsigned slot,uint64_t began) {
     uint64_t peak=__atomic_load_n(&native_adreno_submit_cost[slot+2],__ATOMIC_RELAXED);
     while(us>peak && !__atomic_compare_exchange_n(&native_adreno_submit_cost[slot+2],&peak,us,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
 }
+/* Finer parts, [part][0]=count [1]=us: 0 retireCompleted, 1 acquireImported (job release), 2 holdJob, 3 sample/peek words,
+ * 4 ring write, 5 TLB step; 6 depth wait and 7 light gate are recorded by the board. */
+extern "C" {volatile uint64_t native_adreno_submit_parts[8][2];}
+extern "C" void native_adreno_submit_part(unsigned part,uint64_t began)
+{
+    if(!began || part>=8)return;
+    const uint64_t end=submitDiagNow();if(end<began)return;
+    __atomic_fetch_add(&native_adreno_submit_parts[part][0],1ull,__ATOMIC_RELAXED);
+    __atomic_fetch_add(&native_adreno_submit_parts[part][1],end-began,__ATOMIC_RELAXED);
+}
+extern "C" uint64_t native_adreno_submit_part_now(void) {return submitDiagNow();}
+struct PartScope {unsigned part;uint64_t began;
+    explicit PartScope(unsigned p):part(p),began(submitDiagNow()){}
+    ~PartScope(){native_adreno_submit_part(part,began);}};
 struct SubmitDiagScope {unsigned slot;uint64_t began;
     explicit SubmitDiagScope(unsigned s):slot(s),began(submitDiagNow()){}
     ~SubmitDiagScope(){submitDiagRecord(slot,began);}};
@@ -67,7 +81,9 @@ IOReturn NativeAdrenoSubmit::release(Job &job)
         if(retired)status=retired;else ++stats_.references_retired;
     }
     if(status)return poison();
-    if(vm_->acquireImported())return poison();
+    IOReturn acquired;
+    {PartScope part(1);acquired=vm_->acquireImported();}
+    if(acquired)return poison();
     job={};return kIOReturnSuccess;
 }
 IOReturn NativeAdrenoSubmit::detach()
@@ -119,10 +135,12 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
         for(size_t j=0;j<handle_count;++j)if(handles[j]==buffer.handle) {known=true;break;}
         if(!known)handles[handle_count++]=buffer.handle;
     }
-    IOReturn swept=retireCompleted();
+    IOReturn swept;
+    {PartScope part(0);swept=retireCompleted();}
     if(swept)return swept;
     Job *job=free();
     if(!job)return kIOReturnBusy;
+    const uint64_t hold_began=submitDiagNow();
     for(size_t i=0;i<handle_count;++i) {
         IOReturn status=vm_->holdJob(handles[i]);
         if(status) {
@@ -131,6 +149,7 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
         }
         ++stats_.references_held;
     }
+    native_adreno_submit_part(2,hold_began);
     uint32_t value=0;
     /* int-070: the first IB word as the kernel's cacheable alias and DRAM see it before any maintenance, then DRAM after the CPU
      * caches over every mapped BO are cleaned and invalidated. The board shows the last submission's record on a stall. */
@@ -186,11 +205,11 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
             native_adreno_wc_distrusted=native_adreno_coherence[0]+1;
         }
     }
-    (void)vm_->sampleWord(buffers[0].iova,&cached,&before);
+    {PartScope part(3);(void)vm_->sampleWord(buffers[0].iova,&cached,&before);}
     IOReturn status;
     {SubmitDiagScope measured(6);status=vm_->publishMapped();}
     if(!status) {
-        (void)vm_->sampleWord(buffers[0].iova,&ignored,&after);
+        {PartScope part(3);(void)vm_->sampleWord(buffers[0].iova,&ignored,&after);}
         native_adreno_coherence[0]=native_adreno_coherence[0]+1;
         native_adreno_coherence[1]=cached;native_adreno_coherence[2]=before;native_adreno_coherence[3]=after;
         if(cached!=before || before!=after) {
@@ -199,7 +218,7 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
             }
             native_adreno_coherence[4]=native_adreno_coherence[4]+1;
         }
-        status=vm_->invalidateTlb();
+        {PartScope part(5);status=vm_->invalidateTlb();}
     }
     if(status) {
         for(size_t i=0;i<handle_count;++i) {vm_->retireJobAfterCompletion(handles[i]);++stats_.references_retired;}
@@ -207,13 +226,13 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
     }
     {
         const uint32_t slot=native_adreno_ib_log_count&3;uint32_t head[28];
-        (void)vm_->peekWords(buffers[0].iova,head,28);
+        {PartScope part(3);(void)vm_->peekWords(buffers[0].iova,head,28);}
         native_adreno_ib_log[slot][0]=ring_->lastSubmitted()+1;native_adreno_ib_log[slot][1]=(uint32_t)buffers[0].iova;
         native_adreno_ib_log[slot][2]=(uint32_t)(buffers[0].iova>>32);native_adreno_ib_log[slot][3]=(uint32_t)buffers[0].bytes;
         for(unsigned i=0;i<28;++i)native_adreno_ib_log[slot][4+i]=head[i];
         native_adreno_ib_log_count=native_adreno_ib_log_count+1;
     }
-    status=ring_->submitFramed(words,word_count,&value);
+    {PartScope part(4);status=ring_->submitFramed(words,word_count,&value);}
     if(status) {
         /* A poisoned ring may already have consumed the WPTR write, so the
          * referenced buffers cannot be retired here. */

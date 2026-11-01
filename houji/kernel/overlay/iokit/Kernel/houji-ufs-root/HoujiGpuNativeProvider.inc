@@ -93,8 +93,12 @@ extern "C" IOReturn native_adreno_board_quiesce(void){
 enum {kHoujiPipelineDepth=2};
 static uint32_t gHoujiPipeline=~0u;
 extern "C" {volatile uint64_t native_adreno_pipeline_stats[5];extern volatile uint32_t native_adreno_tlb_reuse;}
+extern "C" void native_adreno_submit_part(unsigned part,uint64_t began);
+extern "C" uint64_t native_adreno_submit_part_now(void);
+struct HoujiPartScope {unsigned part;uint64_t began;explicit HoujiPartScope(unsigned p):part(p),began(native_adreno_submit_part_now()){}~HoujiPartScope(){native_adreno_submit_part(part,began);}};
 extern "C" IOReturn native_adreno_board_light_gate(int submit){
  if(!native_adreno_board_running())return kIOReturnNotReady;
+ HoujiPartScope whole(7);
  if(gHoujiPipeline==~0u){uint32_t v=1;PE_parse_boot_argn("houji_gpu_pipeline",&v,sizeof(v));gHoujiPipeline=v;native_adreno_tlb_reuse=v?1:0;}
  auto&a=gHoujiApi;auto&s=gHoujiSubmit;
  if(!gHoujiPipeline || gHoujiLive.mode==1 || a.phase!=11 || houjiSubmitGuard()){native_adreno_pipeline_stats[2]=native_adreno_pipeline_stats[2]+1;return native_adreno_board_quiesce();}
@@ -109,6 +113,7 @@ extern "C" IOReturn native_adreno_board_light_gate(int submit){
  }
  if(a.submit.outstanding()>=kHoujiPipelineDepth){
   native_adreno_pipeline_stats[3]=native_adreno_pipeline_stats[3]+1;
+  HoujiPartScope depth(6);
   if(a.submit.waitDepth(kHoujiPipelineDepth,&a.clock,500000))return kIOReturnTimeout;
  }
  s.published=s.pending=0;s.iteration=s.ring.lastSubmitted()+1;
