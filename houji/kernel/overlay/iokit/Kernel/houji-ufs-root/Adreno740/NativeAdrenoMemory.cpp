@@ -6,6 +6,10 @@ extern "C" {volatile uint32_t native_adreno_trace_stage;}
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <kern/task.h>
+extern "C" int houji_surface_seed_skip_enabled(void);
+extern "C" void *houji_surface_retain_for_physical(uint64_t physical);
+extern "C" uint32_t houji_surface_seed_of(void *surface);
+extern "C" void houji_surface_release(void *surface);
 
 static bool outputWidth(unsigned bits)
 {return bits==32 || bits==36 || bits==40 || bits==42 || bits==44 || bits==48;}
@@ -233,10 +237,6 @@ IOReturn NativeAdrenoMemory::publishForDevice(size_t offset,size_t bytes,bool wr
     return NativeAdrenoMaintainOwnedPages(static_cast<unsigned char *>(mapping_)+begin,end-begin,
         writes?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
 }
-extern "C" int houji_surface_seed_skip_enabled(void);
-extern "C" void *houji_surface_retain_for_physical(uint64_t physical);
-extern "C" uint32_t houji_surface_seed_of(void *surface);
-extern "C" void houji_surface_release(void *surface);
 IOReturn NativeAdrenoMemory::publishTracked(bool writes,bool include_write_combined,bool *skipped)
 {
     *skipped=false;
