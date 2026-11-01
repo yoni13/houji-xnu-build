@@ -10,7 +10,7 @@
  * with tools/sweet-crash.py). A thread blocked in a syscall shows the
  * syscall stub in pc and its caller in lr/bt.
  *
- * Diagnostic profile: first sample 60 s after start, then every 20 s, 40 samples at most.
+ * First sample 90 s after start, then every 120 s, 40 samples at most.
  */
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -138,11 +138,11 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
 		thread_terminate(current_thread());
 		return;
 	}
-	(void)tsleep(&chan, PZERO, "sweetsmp", 60 * hz);
+	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
 	for (int i = 0; i < 40; i++) {
 		printf("SMP --- sample %d\n", i);
 		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
-		(void)tsleep(&chan, PZERO, "sweetsmp", 20 * hz);
+		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
 	}
 	thread_terminate(current_thread());
 }
