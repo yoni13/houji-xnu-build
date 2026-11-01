@@ -120,6 +120,10 @@ uint32_t sheng_battmgr_next(ShengBattmgr *b, uint8_t out[SHENG_BATTMGR_REQUEST_B
  * (CDP 3) its 1.5 A; others (dedicated chargers, Type-C current, PD contracts) are the firmware's own. */
 static uint32_t wanted_limit(const ShengBattmgr *b, int port)
 {
+    /* houji: a PD contract (adapter type 6) from a computer's Type-C port stayed at the firmware's 100 mA although the source offered
+     * 1.2 A (usb max). Ask for what the source advertised, at most 3 A; the firmware backs off if the bus sags. */
+    if (port == 6 && ((b->valid >> BmUsbMax) & 1) && b->value[BmUsbMax] > 0)
+        return b->value[BmUsbMax] > 3000000 ? 3000000u : (uint32_t)b->value[BmUsbMax];
     return port == 1 ? b->sdp_limit_ua : port == 3 ? 1500000u : 0u;
 }
 
