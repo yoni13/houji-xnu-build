@@ -228,7 +228,8 @@ static void stop_data(void)
 {
     for (unsigned ep=2;ep<6;ep++) {
         if (u.busy[ep]) {
-            if (!u.resource[ep] || epcmd(ep,END|FORCE_REMOVE|(u.resource[ep]<<16),0,0,0)) return;
+            if (!u.resource[ep]) { fail("active endpoint without transfer resource"); return; }
+            if (epcmd(ep,END|FORCE_REMOVE|(u.resource[ep]<<16),0,0,0)) return;
             u.busy[ep]=false;
         }
     }
@@ -290,7 +291,7 @@ static void handle_setup(void)
     case VUSB_CONFIG:
         /* Reconfiguration while transfers are live is stopped, never recycled
          * before a controller reset drains stale completion events. */
-        if (!value && u.configured) { fail("host deconfigured; reboot to reconnect"); return; }
+        if (!value && u.configured) { stop_data();if (u.failed) return;unote("HOUJI USB: host deconfigured\n");break; }
         if (value) configure();break;
     case VUSB_GET_CONFIG:data[0]=u.configured?1:0;n=1;break;
     case VUSB_STATUS:data[0]=data[1]=0;n=2;break;
@@ -334,8 +335,8 @@ static void command_line(void)
     }
     else if (!strcmp(u.command,"ping")) printf("HOUJI DEBUG: pong HOUJIDBG001\n");
     else if (!strcmp(u.command,"status"))
-        printf("HOUJI DEBUG: HOUJIDBG001 events=%u tx=%llu rx=%llu log=%llu dropped=%llu\n",
-            u.events,u.tx_bytes,u.rx_bytes,houji_debug_total(),houji_debug_dropped());
+        printf("HOUJI DEBUG: HOUJIDBG001 candidate002 build %s %s events=%u tx=%llu rx=%llu log=%llu dropped=%llu\n",
+            __DATE__,__TIME__,u.events,u.tx_bytes,u.rx_bytes,houji_debug_total(),houji_debug_dropped());
     else if (!strcmp(u.command,"replay")) {
         u.cursor=0;printf("HOUJI DEBUG: replay retained RAM log\n");
     } else if (u.command_n) printf("HOUJI DEBUG: commands help status ping replay; queries only\n");
@@ -384,7 +385,8 @@ static void event(uint32_t e)
         if ((e&0xfe)!=0) { fail("unexpected device event format");return; }
         unsigned type=(e>>8)&15;
         if (type==1) {
-            if (u.configured) { stop_data();fail("bus reset after configuration; reboot to reconnect");return; }
+            /* Host re-enumeration: end data transfers, then serve a fresh setup. */
+            if (u.configured) { stop_data();if (u.failed) return;unote("HOUJI USB: bus reset while configured; data endpoints ended\n"); }
             wr(DCFG,rd(DCFG)&~(127u<<3));unote("HOUJI USB: bus reset\n");
         } else if (type==2) {
             unsigned speed=rd(DSTS)&7;
@@ -393,7 +395,10 @@ static void event(uint32_t e)
             (void)epcmd(0,SET_CONFIG,(64u<<3)|(2u<<30),(1u<<8)|(1u<<10),0);
             (void)epcmd(1,SET_CONFIG,(64u<<3)|(2u<<30),(1u<<8)|(1u<<10)|(1u<<25),0);
             unote("HOUJI USB: connected speed=%u\n",speed);
-        } else if (!type && u.configured) fail("cable disconnect; reboot to reconnect");
+        } else if (!type) {
+            if (u.configured) { stop_data();if (u.failed) return; }
+            unote("HOUJI USB: cable disconnect; waiting for host\n");
+        }
         else if (type==9 || type==11) fail("controller/event overflow");
         return;
     }
@@ -492,7 +497,7 @@ void houji_usb_debug_start(void)
     int enabled=0;PE_parse_boot_argn("houji_usb",&enabled,sizeof(enabled));
     if ((enabled!=1 && enabled!=2) || attempted) return;
     attempted=true;u.mps=512;u.coding[0]=0;u.coding[1]=0xc2;u.coding[2]=1;u.coding[6]=8;
-    unote("HOUJI USB: CDC ACM candidate001, RAM log and read-only commands\n");
+    unote("HOUJI USB: CDC ACM candidate002 build %s %s, RAM log and read-only commands\n",__DATE__,__TIME__);
     DTEntry root;
     void const *compatible=NULL,*target=NULL;
     unsigned compatible_n=0,target_n=0;
