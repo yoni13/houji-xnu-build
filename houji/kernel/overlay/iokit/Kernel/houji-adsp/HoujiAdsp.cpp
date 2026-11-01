@@ -696,7 +696,7 @@ extern "C" void sheng_adsp_probe(void) {
 namespace {
 struct Poller {void (*fn)(void *); void *context;};
 Poller gPollers[4];
-unsigned _Atomic gPollerCount;
+unsigned gPollerCount;
 void pollerThread(void *, wait_result_t) {
     thread_set_thread_name(current_thread(), "houji-adsp-irq");
     for (;;) {

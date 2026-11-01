@@ -695,8 +695,8 @@ extern "C" int native_ufs_part_find(const char *name, uint32_t *lun, uint64_t *f
 {
   if (!name || !lun || !first || !blocks || !gHost.ready) return 0;
   static uint8_t block[4096];
-  static IOLock *lock = IOLockAlloc();
-  if (!lock) return 0;
+  static IOLock *lock;
+  if (!__atomic_load_n(&lock, __ATOMIC_ACQUIRE)) {IOLock *made = IOLockAlloc(), *none = nullptr; if (!made) return 0; if (!__atomic_compare_exchange_n(&lock, &none, made, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) IOLockFree(made);}
   IOLockLock(lock);
   int found = 0;
   for (uint32_t l = 0; l < 6 && !found; l++) {
