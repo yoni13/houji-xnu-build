@@ -5,6 +5,7 @@
  */
 #include <IOKit/IOMemoryDescriptor.h>
 #include "HoujiDvfsPolicy.h"
+#include "HoujiThermal.inc"
 extern "C" uint64_t houji_cpu_idle_mach(int);
 extern "C" uint64_t houji_gpu_submit_activity(void);
 static uint64_t houjiTouchTime;
@@ -29,6 +30,7 @@ static unsigned enabled;
 struct History {
  uint64_t upMs,us,boostUs,frameUs,maxTickUs;
  uint32_t core[8],request[4],stateMin[4],stateMax[4],throttled[4],changes[4];
+ int cpuMax,gpuMax,hottest;unsigned levelMax;
 };
 static History history[48];
 static unsigned historyCount;
@@ -66,6 +68,9 @@ static void worker(void*,wait_result_t){
  uint64_t last=mach_absolute_time(),idle[8]={},report=last,boost=0,frameTicks=0,frameUntil=0;
  uint64_t submits=houji_gpu_submit_activity(),sumUs=0,boostUs=0,frameUs=0,maxTickUs=0;
  uint64_t coreUs[8]={},requestUs[4]={};
+ HoujiThermal::Reading heat{};bool sensing=HoujiThermal::init();unsigned heatLevel=sensing?0:2,heatTick=0,levelMax=0;
+ int cpuMax=-1000,gpuMax=-1000,hotMax=-1000;
+ if(!sensing)IOLog("HOUJI THERMAL: sensors unavailable; fixed level 2 CPU cap\n");
  unsigned recent=0,quiet[4]={},stateMin[4]={UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX},stateMax[4]={},throttled[4]={},changes[4]={};
  nanoseconds_to_absolutetime(300000000,&boost);
  nanoseconds_to_absolutetime(300000000,&frameTicks);
@@ -86,6 +91,14 @@ static void worker(void*,wait_result_t){
   }
   uint64_t touch=houji_dvfs_touch_time();bool boosted=touch && now>=touch && now-touch<boost;
   if(boosted)boostUs+=us;if(framing)frameUs+=us;
+  if(sensing && ++heatTick>=6){heatTick=0;
+   if(HoujiThermal::read(heat)){unsigned next=HoujiThermal::level(heatLevel,heat.hottest);
+    if(next!=heatLevel)IOLog("HOUJI THERMAL LEVEL: %u->%u hottest=%d.%dC sensor=%u/%u cpu=%d.%dC gpu=%d.%dC\n",heatLevel,next,heat.hottest/10,heat.hottest%10,heat.hottestId>>4,heat.hottestId&15,heat.cpu/10,heat.cpu%10,heat.gpu/10,heat.gpu%10);
+    heatLevel=next;
+    if(heat.cpu>cpuMax)cpuMax=heat.cpu;if(heat.gpu>gpuMax)gpuMax=heat.gpu;if(heat.hottest>hotMax)hotMax=heat.hottest;
+   }else if(heatLevel<2){heatLevel=2;IOLog("HOUJI THERMAL: read failed valid=%u invalid=%u; level 2 CPU cap\n",heat.valid,heat.invalid);}
+  }
+  if(heatLevel>levelMax)levelMax=heatLevel;
   for(unsigned id=0;id<domains;id++){
    auto&w=d[id];if(w.bad)continue;
    w.load=busy[id];w.state=read(w,0x20);uint32_t state=(w.state&255)*19200;
@@ -93,7 +106,10 @@ static void worker(void*,wait_result_t){
    if(state<stateMin[id])stateMin[id]=state;if(state>stateMax[id])stateMax[id]=state;
    if(w.load>=500 && state && uint64_t(state)*5<uint64_t(w.khz[w.cur])*4)++throttled[id];
    unsigned floor=houjiDvfsInteractiveFloor(w.khz,w.n,w.load,id!=0,boosted,framing,&quiet[id]);
+   unsigned cap=HoujiThermal::capIndex(w.khz,w.n,id?HoujiThermal::bigPct[heatLevel]:HoujiThermal::littlePct[heatLevel]);
+   if(floor>cap)floor=cap;
    unsigned at=houjiDvfsChoose(w.khz,w.n,w.cur,w.load,floor,&w.low);
+   if(at>cap)at=cap;
    if(at!=w.cur && !vote(id,at)){w.bad=1;IOLog("HOUJI CPU DVFS FAIL: domain=%u request/readback mismatch; domain writes disabled\n",id);}
    w.readback=read(w,0x320);w.state=read(w,0x20);
   }
@@ -103,9 +119,12 @@ static void worker(void*,wait_result_t){
    if(count<48 && sumUs){auto&h=history[count];uint64_t upNs=0;absolutetime_to_nanoseconds(now,&upNs);
     h.upMs=upNs/1000000;h.us=sumUs;h.boostUs=boostUs;h.frameUs=frameUs;h.maxTickUs=maxTickUs;
     for(unsigned c=0;c<8;c++)h.core[c]=(uint32_t)(coreUs[c]/sumUs);
+    h.cpuMax=cpuMax;h.gpuMax=gpuMax;h.hottest=hotMax;h.levelMax=levelMax;
     for(unsigned id=0;id<domains;id++){auto&w=d[id];h.request[id]=(uint32_t)(requestUs[id]/sumUs);h.stateMin[id]=stateMin[id];h.stateMax[id]=stateMax[id];h.throttled[id]=throttled[id];h.changes[id]=w.changes-changes[id];}
     __atomic_store_n(&historyCount,count+1,__ATOMIC_RELEASE);
    }
+   IOLog("HOUJI THERMAL: hottest=%d.%dC sensor=%u/%u cpu=%d.%dC gpu=%d.%dC ddr=%d.%dC level=%u window-max=%d.%dC valid=%u invalid=%u\n",heat.hottest/10,heat.hottest%10,heat.hottestId>>4,heat.hottestId&15,heat.cpu/10,heat.cpu%10,heat.gpu/10,heat.gpu%10,heat.ddr/10,heat.ddr%10,heatLevel,hotMax/10,hotMax%10,heat.valid,heat.invalid);
+   cpuMax=gpuMax=hotMax=-1000;levelMax=heatLevel;
    sumUs=boostUs=frameUs=maxTickUs=0;for(auto&c:coreUs)c=0;
    for(unsigned id=0;id<domains;id++){requestUs[id]=0;stateMin[id]=UINT32_MAX;stateMax[id]=throttled[id]=0;changes[id]=d[id].changes;}
    for(unsigned id=0;id<domains;id++){auto&w=d[id];IOLog("HOUJI CPU DVFS: d=%u req-kHz=%u read-index=%u state-kHz=%u load-permille=%u changes=%u bad=%u touch-boost=%u; domain-state hardware sample, not cycle measurement\n",id,w.khz[w.cur],w.readback,(w.state&255)*19200,w.load,w.changes,w.bad,boosted);}
@@ -124,6 +143,6 @@ extern "C" void houji_cpu_dvfs_history_report(void){
  using namespace HoujiCpuDvfs;
  unsigned count=__atomic_load_n(&historyCount,__ATOMIC_ACQUIRE);if(count>48)count=48;
  for(unsigned i=0;i<count;i++){const auto&h=history[i];
-  IOLog("HOUJI CPU WINDOW: up-ms=%llu span-ms=%llu core-permille=%u,%u,%u,%u,%u,%u,%u,%u mean-req-kHz=%u,%u,%u,%u state-min=%u,%u,%u,%u state-max=%u,%u,%u,%u throttle=%u,%u,%u,%u changes=%u,%u,%u,%u touch-ms=%llu frame-ms=%llu max-tick-us=%llu\n",h.upMs,h.us/1000,h.core[0],h.core[1],h.core[2],h.core[3],h.core[4],h.core[5],h.core[6],h.core[7],h.request[0],h.request[1],h.request[2],h.request[3],h.stateMin[0],h.stateMin[1],h.stateMin[2],h.stateMin[3],h.stateMax[0],h.stateMax[1],h.stateMax[2],h.stateMax[3],h.throttled[0],h.throttled[1],h.throttled[2],h.throttled[3],h.changes[0],h.changes[1],h.changes[2],h.changes[3],h.boostUs/1000,h.frameUs/1000,h.maxTickUs);
+  IOLog("HOUJI CPU WINDOW: up-ms=%llu span-ms=%llu core-permille=%u,%u,%u,%u,%u,%u,%u,%u mean-req-kHz=%u,%u,%u,%u state-min=%u,%u,%u,%u state-max=%u,%u,%u,%u throttle=%u,%u,%u,%u changes=%u,%u,%u,%u touch-ms=%llu frame-ms=%llu max-tick-us=%llu heat-max-dC=%d,%d,%d level-max=%u\n",h.upMs,h.us/1000,h.core[0],h.core[1],h.core[2],h.core[3],h.core[4],h.core[5],h.core[6],h.core[7],h.request[0],h.request[1],h.request[2],h.request[3],h.stateMin[0],h.stateMin[1],h.stateMin[2],h.stateMin[3],h.stateMax[0],h.stateMax[1],h.stateMax[2],h.stateMax[3],h.throttled[0],h.throttled[1],h.throttled[2],h.throttled[3],h.changes[0],h.changes[1],h.changes[2],h.changes[3],h.boostUs/1000,h.frameUs/1000,h.maxTickUs,h.cpuMax,h.gpuMax,h.hottest,h.levelMax);
  }
 }

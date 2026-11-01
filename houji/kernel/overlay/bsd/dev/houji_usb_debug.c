@@ -456,6 +456,13 @@ static bool identity(void)
     for (unsigned i=0;i<107;i++) if (vusb_stream_match(read_reg(s,0x800+4*i))) {
         matches++;route=read_reg(s,0xc00+4*i);
     }
+    if (!matches) {
+        /* ABL's fastboot DMA used this same unmatched stream: sCR0.USFCFG=0
+         * bypasses it to the VM's stage 2. With USFCFG=1 it would fault. */
+        uint32_t scr0=read_reg(s,0);
+        printf("HOUJI USB: SID40 unmatched; sCR0 USFCFG=%u CLIENTPD=%u\n",(scr0>>10)&1,scr0&1);
+        return !((scr0>>10)&1);
+    }
     if (matches!=1) { printf("HOUJI USB: SID40 matches %u\n",matches);return false; }
     unsigned cb=route&255;uint32_t cbar=0,sctlr=1;
     if (((route>>16)&3)==0) {
