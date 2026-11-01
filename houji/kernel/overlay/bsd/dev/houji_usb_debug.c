@@ -20,6 +20,8 @@
 #include "houji_usb_protocol.h"
 #include "houji_ram_upload.h"
 #include <machine/atomic.h>
+#include <sys/reboot.h>
+extern int reboot_kernel(int, char *);
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
@@ -305,7 +307,7 @@ static void handle_setup(void)
             if (!u.dtr && upload_mode && upload.phase!=HRU_COMPLETE) {
                 hru_abort(&upload,HRU_E_TRANSPORT);upload_publish();
             }
-            if (u.dtr && !old) unote("HOUJI USB: debug connected; help/status/ping/replay (read only)\n");
+            if (u.dtr && !old) unote("HOUJI USB: debug connected; help/status/ping/replay/reboot\n");
         }break;
     case VUSB_BREAK:break;
     case VUSB_CLEAR_HALT:
@@ -321,6 +323,15 @@ static void handle_setup(void)
     else if (u.set_line) transfer(0,DATA,64,T_DATA);
     else stall();
 }
+/* XNU's own reboot: sync and unmount, then halt_all_cpus -> PSCI reset
+ * (houji_panic_recovery=1). The host armed the no-wipe recovery BCB. */
+static void reboot_thread(void *arg __unused,wait_result_t result __unused)
+{
+    printf("HOUJI DEBUG: reboot requested over USB; syncing filesystems\n");
+    reboot_kernel(RB_AUTOBOOT,(char *)"houji usb debug reboot");
+    printf("HOUJI DEBUG: reboot_kernel returned\n");
+    thread_terminate(current_thread());
+}
 static void command_line(void)
 {
     u.command[u.command_n]=0;
@@ -334,12 +345,18 @@ static void command_line(void)
         }
     }
     else if (!strcmp(u.command,"ping")) printf("HOUJI DEBUG: pong HOUJIDBG001\n");
+    else if (!strcmp(u.command,"reboot")) {
+        static bool requested;thread_t t;
+        if (requested) printf("HOUJI DEBUG: reboot already in progress\n");
+        else if (kernel_thread_start(reboot_thread,NULL,&t)==KERN_SUCCESS) { requested=true;thread_deallocate(t); }
+        else printf("HOUJI DEBUG: reboot thread failed\n");
+    }
     else if (!strcmp(u.command,"status"))
         printf("HOUJI DEBUG: HOUJIDBG001 candidate002 build %s %s events=%u tx=%llu rx=%llu log=%llu dropped=%llu\n",
             __DATE__,__TIME__,u.events,u.tx_bytes,u.rx_bytes,houji_debug_total(),houji_debug_dropped());
     else if (!strcmp(u.command,"replay")) {
         u.cursor=0;printf("HOUJI DEBUG: replay retained RAM log\n");
-    } else if (u.command_n) printf("HOUJI DEBUG: commands help status ping replay; queries only\n");
+    } else if (u.command_n) printf("HOUJI DEBUG: commands help status ping replay reboot\n");
     u.command_n=0;u.command_overflow=false;
 }
 static void receive_done(unsigned length)
