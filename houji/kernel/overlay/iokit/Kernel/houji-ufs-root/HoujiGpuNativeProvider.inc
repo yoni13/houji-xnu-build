@@ -115,6 +115,13 @@ extern "C" IOReturn native_adreno_board_light_gate(int submit){
  native_adreno_pipeline_stats[0]=native_adreno_pipeline_stats[0]+1;
  return kIOReturnSuccess;
 }
+/* Gate and GPU governor counters for the display's hitch log; plain loads, no lock. */
+extern "C" void houji_gate_hitch_snapshot(uint64_t out[6]){
+ auto load=[](const uint64_t *v){return __atomic_load_n(v,__ATOMIC_RELAXED);};
+ out[0]=load(&gHoujiGatePerf.count);out[1]=load(&gHoujiGatePerf.total);out[2]=load(&gHoujiGatePerf.phase[0]);
+ out[3]=load(&gHoujiGatePerf.phase[2])+load(&gHoujiGatePerf.phase[3])+load(&gHoujiGatePerf.phase[4]);
+ out[4]=gHoujiDvfs.level;out[5]=gHoujiDvfs.busyNs/1000;
+}
 static bool houjiProviderTlbValue(uint64_t v){return native_adreno_board_running() && houjiApiInOperation() && (v>>48)==0x751 && (v&UINT64_C(0x0000ffffffffffff))>=0x10000 && (v&UINT64_C(0x0000ffffffffffff))<0x80000;}
 static int houjiProviderPublish(const volatile uint32_t*words,size_t bytes){
  auto&s=gHoujiSubmit;auto&p=gHoujiProvider;

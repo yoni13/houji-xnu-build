@@ -459,6 +459,7 @@ static bool nativeAdrenoNonMutatingGpuMethod(uint32_t method) {
 }
 static uint32_t gHoujiLastSubmittedFence;
 extern "C" IOReturn native_adreno_board_light_gate(int submit);
+extern "C" void houji_gate_hitch_snapshot(uint64_t out[6]);
 extern "C" {extern volatile uint64_t native_adreno_pipeline_stats[5];extern volatile uint64_t native_adreno_tlb_stats[2];}
 /* Methods that may skip waiting for the GPU (see native_adreno_board_light_gate): no page table, SMMU or GPU register access,
  * except the submission itself, which the gate admits only under unchanged, already synchronized tables. */
@@ -923,6 +924,18 @@ extern "C" unsigned houji_gpu_cached_timing(char *out,unsigned capacity) {
  return used;
 }
 
+/* One snapshot per displayed frame for the hitch log: [0..5] gate count/total/wait/audit-us, GPU level, GPU busy-us;
+ * [6..13] map/free/submit/alloc calls and us (map n,us, free n,us, submit n,us, alloc n, fence-wait us);
+ * [14] full fallbacks, [15] depth waits. */
+extern "C" void native_adreno_hitch_snapshot(uint64_t out[16]){
+ houji_gate_hitch_snapshot(out);
+ auto load=[](unsigned m,unsigned i){return __atomic_load_n(&nativeAdrenoDispatchPerf[m][i],__ATOMIC_RELAXED);};
+ out[6]=load(NativeAdrenoMethodBoMap,0);out[7]=load(NativeAdrenoMethodBoMap,1);
+ out[8]=load(NativeAdrenoMethodBoFree,0);out[9]=load(NativeAdrenoMethodBoFree,1);
+ out[10]=load(NativeAdrenoMethodSubmit,0);out[11]=load(NativeAdrenoMethodSubmit,1);
+ out[12]=load(NativeAdrenoMethodBoAlloc,0);out[13]=native_adreno_wait_outer[1];
+ out[14]=native_adreno_pipeline_stats[2];out[15]=native_adreno_pipeline_stats[3];
+}
 /* Live profile for the USB log: cumulative per-method cost and the Metal
  * plugin's own telemetry rows. Reads counters only; no lock, no GPU access. */
 extern "C" void native_adreno_perf_report(void){

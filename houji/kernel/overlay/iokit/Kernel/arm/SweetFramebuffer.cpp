@@ -497,10 +497,21 @@ get32(const uint8_t *p, uint32_t off)
 /* Intervals between consecutive SwapEnd calls: <10, 10-14, 14-20 (60 fps), 20-25, 25-36 (30 fps), 36-50, >=50 ms (idle gap).
  * Gaps under 50 ms count as animation; their total time gives the frame rate while something moves. */
 static uint64_t houji_fb_interval_hist[7],houji_fb_anim_frames,houji_fb_anim_ticks,houji_fb_last_swap;
+extern "C" void native_adreno_hitch_snapshot(uint64_t out[16]);
+static uint32_t houji_fb_hitch_logged;
+/* SwapEnd is serialized per client; backboardd is the only one, so the previous snapshot needs no lock. */
 static void houjiNoteSwapInterval(void){
  const uint64_t now=mach_absolute_time(),last=__atomic_exchange_n(&houji_fb_last_swap,now,__ATOMIC_RELAXED);
- if(!last)return;
+ static uint64_t previous[16];uint64_t snap[16];
+ native_adreno_hitch_snapshot(snap);
+ if(!last){memcpy(previous,snap,sizeof(snap));return;}
  uint64_t ns=0;absolutetime_to_nanoseconds(now-last,&ns);const uint64_t ms10=ns/100000; /* 0.1 ms */
+ if(ms10>=200 && ms10<500 && houji_fb_hitch_logged<40){
+  ++houji_fb_hitch_logged;uint64_t d[16];for(unsigned i=0;i<16;i++)d[i]=snap[i]-previous[i];
+  IOLog("HOUJI HITCH: gap-ms=%llu.%llu gate n=%llu us=%llu wait=%llu audit=%llu GPU level=%llu busy-us=%llu | map n=%llu us=%llu free n=%llu us=%llu submit n=%llu us=%llu alloc=%llu fence-wait-us=%llu full=%llu depth=%llu\n",
+   ms10/10,ms10%10,d[0],d[1],d[2],d[3],snap[4],d[5],d[6],d[7],d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15]);
+ }
+ memcpy(previous,snap,sizeof(snap));
  static const uint64_t edge[6]={100,140,200,250,360,500};
  unsigned b=0;while(b<6 && ms10>=edge[b])++b;
  __atomic_fetch_add(&houji_fb_interval_hist[b],1ull,__ATOMIC_RELAXED);
@@ -573,6 +584,7 @@ extern "C" void houji_framebuffer_report(void)
 	  h[0]-prevHist[0],h[1]-prevHist[1],h[2]-prevHist[2],h[3]-prevHist[3],h[4]-prevHist[4],h[5]-prevHist[5],h[6]-prevHist[6],
 	  ns?(frames-prevFrames)*1000000000000ULL/ns:0,ns/1000000);
 	 for(unsigned i=0;i<7;i++)prevHist[i]=h[i];prevFrames=frames;prevTicks=ticks;
+	 houji_fb_hitch_logged=0;
 	}
 	houji_surface_use_report();
 	houjiReportRects();
