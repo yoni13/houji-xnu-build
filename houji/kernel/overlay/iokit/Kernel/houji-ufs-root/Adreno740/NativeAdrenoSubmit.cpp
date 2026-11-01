@@ -18,7 +18,7 @@ static void submitDiagRecord(unsigned slot,uint64_t began) {
 }
 /* Finer parts, [part][0]=count [1]=us: 0 retireCompleted, 1 acquireImported (job release), 2 holdJob, 3 sample/peek words,
  * 4 ring write, 5 TLB step; 6 depth wait and 7 light gate are recorded by the board. */
-extern "C" {volatile uint64_t native_adreno_submit_parts[12][2];}
+extern "C" {volatile uint64_t native_adreno_submit_parts[12][2];volatile uint32_t native_adreno_light_prologue;}
 extern "C" void native_adreno_submit_part(unsigned part,uint64_t began)
 {
     if(!began || part>=12)return;
@@ -208,6 +208,8 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
     {PartScope part(3);(void)vm_->sampleWord(buffers[0].iova,&cached,&before);}
     IOReturn status;
     {SubmitDiagScope measured(6);status=vm_->publishMapped();}
+    /* Before invalidateTlb records the current tables: a change since the previous submission keeps the full prologue. */
+    ring_->requestLightPrologue(native_adreno_light_prologue && vm_->tlbCurrent());
     if(!status) {
         {PartScope part(3);(void)vm_->sampleWord(buffers[0].iova,&ignored,&after);}
         native_adreno_coherence[0]=native_adreno_coherence[0]+1;

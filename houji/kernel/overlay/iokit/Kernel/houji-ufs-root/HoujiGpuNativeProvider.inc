@@ -92,14 +92,15 @@ extern "C" IOReturn native_adreno_board_quiesce(void){
  * depth waits, fault refusals. */
 enum {kHoujiPipelineDepth=3};
 static uint32_t gHoujiPipeline=~0u;
-extern "C" {volatile uint64_t native_adreno_pipeline_stats[5];extern volatile uint32_t native_adreno_tlb_reuse;}
+extern "C" {volatile uint64_t native_adreno_pipeline_stats[5];extern volatile uint32_t native_adreno_tlb_reuse;extern volatile uint32_t native_adreno_light_prologue;}
 extern "C" void native_adreno_submit_part(unsigned part,uint64_t began);
 extern "C" uint64_t native_adreno_submit_part_now(void);
 struct HoujiPartScope {unsigned part;uint64_t began;explicit HoujiPartScope(unsigned p):part(p),began(native_adreno_submit_part_now()){}~HoujiPartScope(){native_adreno_submit_part(part,began);}};
 extern "C" IOReturn native_adreno_board_light_gate(int submit){
  if(!native_adreno_board_running())return kIOReturnNotReady;
  HoujiPartScope whole(7);
- if(gHoujiPipeline==~0u){uint32_t v=1;PE_parse_boot_argn("houji_gpu_pipeline",&v,sizeof(v));gHoujiPipeline=v;native_adreno_tlb_reuse=v?1:0;}
+ if(gHoujiPipeline==~0u){uint32_t v=1;PE_parse_boot_argn("houji_gpu_pipeline",&v,sizeof(v));gHoujiPipeline=v;native_adreno_tlb_reuse=v?1:0;
+  uint32_t light=1;PE_parse_boot_argn("houji_gpu_light_prologue",&light,sizeof(light));native_adreno_light_prologue=light?1:0;}
  auto&a=gHoujiApi;auto&s=gHoujiSubmit;
  if(!gHoujiPipeline || gHoujiLive.mode==1 || a.phase!=11 || houjiSubmitGuard()){native_adreno_pipeline_stats[2]=native_adreno_pipeline_stats[2]+1;return native_adreno_board_quiesce();}
  if(!submit){native_adreno_pipeline_stats[1]=native_adreno_pipeline_stats[1]+1;return kIOReturnSuccess;}
@@ -135,7 +136,11 @@ static int houjiProviderPublish(const volatile uint32_t*words,size_t bytes){
  const uint32_t seq=s.ring.lastSubmitted()+1,n=log[3];
  if(!seq || log[0]!=seq || log[1]!=s.end || log[2]>=HHR_WORDS || n<46 || n>106 || (n-42)%4 || log[2]!=((s.end+n)&(HHR_WORDS-1)))return 1;
  const uint32_t head[]={hhr_pkt7(0x17,1),0x80000001,hhr_pkt7(0x46,1),0x32,hhr_pkt7(0x46,1),0x33,hhr_pkt7(0x26,0),hhr_pkt7(0x17,1),3,hhr_pkt7(0x65,1),0x101};
- for(unsigned i=0;i<11;i++)if(log[4+i]!=head[i])return 1;
+ /* The light prologue (unchanged tables): the flush, invalidate and wait-for-idle replaced by one 4-word CP_NOP. */
+ const uint32_t light[]={hhr_pkt7(0x17,1),0x80000001,hhr_pkt7(0x10,4),0,0,0,0,hhr_pkt7(0x17,1),3,hhr_pkt7(0x65,1),0x101};
+ bool full=true,lite=true;
+ for(unsigned i=0;i<11;i++){if(log[4+i]!=head[i])full=false;if(log[4+i]!=light[i])lite=false;}
+ if(!full && !lite)return 1;
  const unsigned ibs=(n-42)/4;
  for(unsigned i=0;i<ibs;i++){unsigned at=4+11+4*i;uint64_t va=log[at+1]|((uint64_t)log[at+2]<<32);uint32_t count=log[at+3];
   if(log[at]!=0x70bf8003 || !count || count>0xfffff || (va&3) || va<0x10000000 || va>=0x80000000 || count*4ull>0x80000000-va)return 1;
