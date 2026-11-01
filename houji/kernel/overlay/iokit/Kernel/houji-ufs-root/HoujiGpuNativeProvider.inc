@@ -100,7 +100,8 @@ extern "C" IOReturn native_adreno_board_light_gate(int submit){
  if(!native_adreno_board_running())return kIOReturnNotReady;
  HoujiPartScope whole(7);
  if(gHoujiPipeline==~0u){uint32_t v=1;PE_parse_boot_argn("houji_gpu_pipeline",&v,sizeof(v));gHoujiPipeline=v;native_adreno_tlb_reuse=v?1:0;
-  uint32_t light=1;PE_parse_boot_argn("houji_gpu_light_prologue",&light,sizeof(light));native_adreno_light_prologue=light?1:0;}
+  /* Off by default: no measured gain (heavy frames 25.7 vs 25.9 ms), and it relies on Turnip's own UCHE invalidation. */
+  uint32_t light=0;PE_parse_boot_argn("houji_gpu_light_prologue",&light,sizeof(light));native_adreno_light_prologue=light?1:0;}
  auto&a=gHoujiApi;auto&s=gHoujiSubmit;
  if(!gHoujiPipeline || gHoujiLive.mode==1 || a.phase!=11 || houjiSubmitGuard()){native_adreno_pipeline_stats[2]=native_adreno_pipeline_stats[2]+1;return native_adreno_board_quiesce();}
  if(!submit){native_adreno_pipeline_stats[1]=native_adreno_pipeline_stats[1]+1;return kIOReturnSuccess;}
