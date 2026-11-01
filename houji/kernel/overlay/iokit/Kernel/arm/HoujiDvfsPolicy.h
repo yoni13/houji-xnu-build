@@ -3,15 +3,15 @@
 #define HOUJI_DVFS_POLICY_H
 #include <stdint.h>
 /* Sheng's interaction policy, adapted to houji's four validated domains.
- * A sustained render stream holds 60% for 300 ms after its last activity;
- * P cores use their qualified cap during touch and a 50% floor until quiet.
+ * A sustained render stream holds 45% for 300 ms after its last activity;
+ * P cores use a 65% touch floor and a 30% floor until quiet.
  * This chooses indices only; board code still validates and votes the LUT. */
 static inline unsigned houjiDvfsInteractiveFloor(const uint32_t *khz,unsigned n,
  unsigned busy,bool performance,bool touch,bool frame,unsigned *quiet) {
  if(!n)return 0;
  *quiet=busy<100?(*quiet<12?*quiet+1:12):0;
- unsigned pct=frame?60:0;
- if(performance){if(touch)pct=100;else if(*quiet<12 && pct<50)pct=50;}
+ unsigned pct=frame?45:0;
+ if(performance){if(touch && pct<65)pct=65;else if(*quiet<12 && pct<30)pct=30;}
  unsigned floor=0;while(floor+1<n && (uint64_t)khz[floor]*100<(uint64_t)khz[n-1]*pct)++floor;
  return floor;
 }

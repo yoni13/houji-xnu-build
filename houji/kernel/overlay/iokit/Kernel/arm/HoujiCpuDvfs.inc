@@ -67,11 +67,11 @@ static void worker(void*,wait_result_t){
  uint64_t submits=houji_gpu_submit_activity(),sumUs=0,boostUs=0,frameUs=0,maxTickUs=0;
  uint64_t coreUs[8]={},requestUs[4]={};
  unsigned recent=0,quiet[4]={},stateMin[4]={UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX},stateMax[4]={},throttled[4]={},changes[4]={};
- nanoseconds_to_absolutetime(1000000000,&boost);
+ nanoseconds_to_absolutetime(300000000,&boost);
  nanoseconds_to_absolutetime(300000000,&frameTicks);
  for(unsigned c=0;c<8;c++)idle[c]=houji_cpu_idle_mach(c);
  for(;;){
-  IOSleep(20);uint64_t now=mach_absolute_time(),dt=now-last;last=now;
+  IOSleep(40);uint64_t now=mach_absolute_time(),dt=now-last;last=now;
   if(!dt)continue;unsigned busy[4]={};uint64_t dtNs=0;absolutetime_to_nanoseconds(dt,&dtNs);uint64_t us=dtNs/1000;
   sumUs+=us;if(us>maxTickUs)maxTickUs=us;
   uint64_t nextSubmits=houji_gpu_submit_activity();recent=((recent<<1)|(nextSubmits!=submits))&15;submits=nextSubmits;
