@@ -197,6 +197,8 @@ class IOMobileFramebuffer : public IOService {
 OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
 
 class IOMobileFramebufferUserClient;
+class AppleCLCD;
+static AppleCLCD *gHoujiPanel;
 
 class AppleCLCD : public IOMobileFramebuffer {
 	OSDeclareDefaultStructors(AppleCLCD);
@@ -294,6 +296,7 @@ AppleCLCD::start(IOService *provider)
 	fScanout = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
 	fSurface = sweet_surface_create_buffer(HOUJI_LOGICAL_W,HOUJI_LOGICAL_H,(HOUJI_LOGICAL_W*4+63)&~63u,SWEET_FB_FORMAT_BGRA);
 	fPixels = fScanout != NULL ? fScanout->kernelAddress() : 0;
+	gHoujiPanel=this;
 	fWorkLoop = IOWorkLoop::workLoop();
 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL || !fSurface) {
 		IOLog("SWEET FB: setup failed\n");
@@ -383,6 +386,27 @@ AppleCLCD::start(IOService *provider)
 	IOLog("HOUJI FB: native 1200x2670 canvas, owned render target, exact pixel copy; no resampling; touch stays normalized\n");
 	IOLog("HOUJI FB: notification timer=%u Hz, asynchronous queued copy; inherited panel timing is not measured\n",notifyHz);
 	return true;
+}
+
+/* Grayscale thumbnail of the panel for unattended UI checks over the USB debug console: one hex digit (4-bit luminance) per
+ * cell, printed as SHOT rows. Reads the scanout memory only. */
+extern "C" void houji_framebuffer_shot(unsigned cols,unsigned rows)
+{
+ AppleCLCD *fb=gHoujiPanel;
+ if(!fb || !fb->fPixels || !cols || !rows || cols>300 || rows>700){printf("HOUJI SHOT: unavailable\n");return;}
+ printf("HOUJI SHOT BEGIN %u %u panel=%ux%u\n",cols,rows,fb->fWidth,fb->fHeight);
+ char line[320];
+ for(unsigned r=0;r<rows;r++){
+  const uint32_t y=(uint32_t)(((uint64_t)r*fb->fHeight+fb->fHeight/rows/2)/rows);
+  for(unsigned c=0;c<cols;c++){
+   const uint32_t x=(uint32_t)(((uint64_t)c*fb->fWidth+fb->fWidth/cols/2)/cols);
+   const uint8_t *p=(const uint8_t *)(fb->fPixels+(uint64_t)y*fb->fRowBytes+(uint64_t)x*4);
+   const unsigned l=(p[2]*3u+p[1]*6u+p[0])/10u;
+   line[c]="0123456789abcdef"[l>>4];
+  }
+  line[cols]=0;printf("SHOT %03u %s\n",r,line);
+ }
+ printf("HOUJI SHOT END\n");
 }
 
 void

@@ -405,6 +405,7 @@ static void command_line(void)
         }
     }
     else if (!strcmp(u.command,"ping")) printf("HOUJI DEBUG: pong HOUJIDBG001\n");
+    else if (!strcmp(u.command,"shot")) { extern void houji_framebuffer_shot(unsigned,unsigned); houji_framebuffer_shot(150,334); }
     else if (!strcmp(u.command,"home") || !strncmp(u.command,"tap ",4) || !strncmp(u.command,"swipe ",6)) gesture_command(u.command);
     else if (!strcmp(u.command,"reboot")) {
         static bool requested;thread_t t;
@@ -417,7 +418,7 @@ static void command_line(void)
             __DATE__,__TIME__,u.events,u.tx_bytes,u.rx_bytes,houji_debug_total(),houji_debug_dropped());
     else if (!strcmp(u.command,"replay")) {
         u.cursor=0;printf("HOUJI DEBUG: replay retained RAM log\n");
-    } else if (u.command_n) printf("HOUJI DEBUG: commands help status ping replay reboot tap swipe home\n");
+    } else if (u.command_n) printf("HOUJI DEBUG: commands help status ping replay reboot tap swipe home shot\n");
     u.command_n=0;u.command_overflow=false;
 }
 static void receive_done(unsigned length)
