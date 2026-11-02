@@ -407,7 +407,13 @@ static void type_thread(void *arg __unused,wait_result_t result __unused)
 static void type_command(const char *text)
 {
     if (!os_atomic_cmpxchg(&type_busy,0,1,acquire)) { printf("HOUJI DEBUG: typing busy\n");return; }
-    strlcpy(type_text,text,sizeof(type_text));
+    /* "\n" in the text is the Return key */
+    size_t o=0;
+    for (const char *c=text;*c && o<sizeof(type_text)-1;c++) {
+        if (c[0]=='\\' && c[1]=='n') { type_text[o++]='\n'; c++; }
+        else type_text[o++]=*c;
+    }
+    type_text[o]=0;
     thread_t t;
     if (kernel_thread_start(type_thread,NULL,&t)!=KERN_SUCCESS) { bzero(type_text,sizeof(type_text));os_atomic_store(&type_busy,0,release);return; }
     thread_deallocate(t);

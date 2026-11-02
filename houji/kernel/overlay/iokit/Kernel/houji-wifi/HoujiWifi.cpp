@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Wi-Fi bring-up on houji (Xiaomi 14, SM8650): the WCN7850 ("Kiwi v2") on PCIe0. Adapted from UniXNU-sheng's WifiProbe.cpp (SM8550, the same
-// chip on the same controller). Boot argument houji_wifi: 0 off (default), 1 a read-only survey, 2 power and link training, 3 also the
+// chip on the same controller). Boot argument houji_wifi: 0 off, 1 a read-only survey, 2 power and link training, 3 also the
 // endpoint's configuration read, 4 also its BAR and MHI registers, 5 (default) the Wi-Fi module (firmware, scan, en0; USB console "wifi ..." commands).
 // What differs from sheng, from Linux gcc-sm8650.c, tcsrcc-sm8650.c, icc sm8650.c and the board's devicetree:
 // - GDSC collapse votes at 0x5214c (0x52020 on SM8550); the NoC branches report at 0x10058 / 0x10064 / 0x10074;
