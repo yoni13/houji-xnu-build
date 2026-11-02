@@ -726,6 +726,45 @@ extern "C" void sheng_battery_start(void);
 extern "C" {extern volatile int32_t native_charger_stats[16];}
 // Starts the DSP (houji_adsp: 1 survey only, 2 start, default 2) and then the battery power source (houji_battery, default 1), after a
 // delay so the boot's own GPU and UFS qualification runs alone.
+// ---- GPS groundwork: the modem (MPSS) image, read only ----
+// GNSS runs in the modem. Before anything starts it: the modem's stock image (modemfirmware_a, NAME.mdt + .bNN) is parsed and placed in
+// its carveouts from the board's devicetree (mpss 0x8bc00000 + 0xf400000, PAS 4; q6_mpss_dtb 0x9b000000 + 0x80000). No SCM call, no
+// write. [0] stage (1 modem parsed, 2 dtb parsed, 3 both fit; negative: the step that failed), [1] modem bytes, [2] modem span,
+// [3] segments, [4] relocatable, [5] dtb span, [6] lowest address, [7] parse/place error
+extern "C" {volatile int32_t native_modem_stats[8];}
+static int surveyImage(const char *path, uint64_t base, uint64_t size, volatile int32_t *st, bool modem) {
+    void *file = nullptr; uint64_t bytes = 0;
+    int rc = sheng_fw_open(path, &file, &bytes);
+    if (rc) return 100 + rc;
+    QcomMdtImage *image = IOMallocType(QcomMdtImage);
+    rc = qcom_mdt_parse(image, bytes, fileRead, file);
+    if (!rc) {
+        unsigned loads = 0;
+        for (unsigned i = 0; i < image->count && !rc; ++i) {
+            if (!image->segment[i].load) continue;
+            ++loads;
+            uint64_t at = 0;
+            if (qcom_mdt_place(image, i, base, size, &at)) rc = 200 + (int)i;
+        }
+        if (modem) {st[1] = (int32_t)bytes; st[2] = (int32_t)qcom_mdt_span(image); st[3] = (int32_t)loads; st[4] = image->relocatable;
+                    st[6] = (int32_t)image->min_address;}
+        else st[5] = (int32_t)qcom_mdt_span(image);
+        if (!rc && qcom_mdt_span(image) > size) rc = 300;
+    }
+    IOFreeType(image, QcomMdtImage);
+    sheng_fw_close(file);
+    return rc;
+}
+static void houjiModemSurvey() {
+    volatile int32_t *st = native_modem_stats;
+    int rc = surveyImage("modemfw:modem", 0x8bc00000ull, 0xf400000ull, st, true);
+    if (rc) {st[0] = -1; st[7] = rc; return;}
+    st[0] = 1;
+    rc = surveyImage("modemfw:modem_dtb", 0x9b000000ull, 0x80000ull, st, false);
+    if (rc) {st[0] = -2; st[7] = rc; return;}
+    st[0] = 3;
+}
+
 static void houjiPowerThread(void *, wait_result_t) {
     thread_set_thread_name(current_thread(), "houji-power");
     unsigned delay = 45;
@@ -735,6 +774,9 @@ static void houjiPowerThread(void *, wait_result_t) {
     unsigned battery = 1;
     PE_parse_boot_argn("houji_battery", &battery, sizeof battery);
     if (battery == 1 && !native_battery_stats[0]) sheng_battery_start();
+    unsigned modem = 1;
+    PE_parse_boot_argn("houji_modem", &modem, sizeof modem);
+    if (modem) houjiModemSurvey();
     thread_terminate(current_thread());
 }
 extern "C" void houji_wifi_start(void);
@@ -753,6 +795,8 @@ extern "C" void houji_power_start(void) {
 extern "C" void houji_power_report(void) {
     houji_wifi_report();
     houji_buttons_report();
+    {const volatile int32_t *m = native_modem_stats;
+     if (m[0]) IOLog("HOUJI MODEM: stage=%d bytes=%d span=%x segments=%d relocatable=%d dtb-span=%x min=%x err=%d\n", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);}
     const volatile int32_t *a = native_adsp_stats;
     IOLog("HOUJI ADSP: stage=%d err=%d irq=%d slave=%x items=%x qmp=%x fw-KiB=%d ready-ms=%d glink=%d/%d chan=%x scm=%x/%x\n",
           a[0], a[1], a[2], a[3], a[4], a[5], a[7], a[8], a[9], a[10], a[11], a[13], a[14]);

@@ -26,8 +26,10 @@ struct partition {
     uint64_t cached;  // block in block (UINT64_MAX: none)
     uint8_t block[4096];
 };
-static struct partition *gPart;
-static FatVolume *gVolume;
+// Volume 0: the firmware partition (modem_a, else modem_b); volume 1 (houji): the modem's own, modemfirmware_a or _b ("modemfw:" paths).
+static struct partition *gParts[2];
+static FatVolume *gVolumes[2];
+#define gVolume gVolumes[0]
 // The ADSP and Wi-Fi threads share the volume and its one-block cache.
 static lck_grp_t *gFwLockGroup;
 static lck_mtx_t *gFwLock;
@@ -71,27 +73,29 @@ static int partitionRead(void *context, uint64_t offset, void *to, size_t length
     return 0;
 }
 
-static int mountPartition(void)
+static int mountVolume(unsigned which)
 {
-    static const char *const names[] = {"modem_a", "modem_b"};
-    if (gVolume) return 0;
+    static const char *const names[2][2] = {{"modem_a", "modem_b"}, {"modemfirmware_a", "modemfirmware_b"}};
+    if (gVolumes[which]) return 0;
     struct partition *p = IOMallocType(struct partition);
     FatVolume *v = IOMallocType(FatVolume);
     int rc = ENOENT;
     for (unsigned i = 0; i < 2 && rc; ++i) {
         uint64_t blocks = 0;
         // ENXIO while the UFS driver is not ready yet: the caller tries again later
-        if (!native_ufs_part_find(names[i], &p->lun, &p->first, &blocks)) {rc = ENXIO; continue;}
+        if (!native_ufs_part_find(names[which][i], &p->lun, &p->first, &blocks)) {rc = ENXIO; continue;}
         p->cached = UINT64_MAX;
         rc = fat_mount(v, blocks * 4096, partitionRead, p) ? EFTYPE : 0;
     }
     if (rc) {IOFreeType(p, struct partition); IOFreeType(v, FatVolume); return rc;}
-    gPart = p;
-    gVolume = v;
+    gParts[which] = p;
+    gVolumes[which] = v;
     return 0;
 }
+static int mountPartition(void) {return mountVolume(0);}
 
 struct modem_image {
+    FatVolume *volume;
     QcomMdtSplit split;
     FatFile piece[QCOM_MDT_MAX_SEGMENTS];
 };
@@ -99,29 +103,31 @@ struct modem_image {
 static int pieceRead(void *context, unsigned piece, uint64_t offset, void *to, size_t length)
 {
     struct modem_image *m = context;
-    return fat_read(gVolume, &m->piece[piece], offset, to, length);
+    return fat_read(m->volume, &m->piece[piece], offset, to, length);
 }
 
-static int openModem(const char *name, struct modem_image **image, uint64_t *size)
+static int openModem(unsigned which, const char *name, struct modem_image **image, uint64_t *size)
 {
     char path[48];
-    int rc = mountPartition();
+    int rc = mountVolume(which);
     if (rc) return rc;
+    FatVolume *const vol = gVolumes[which];
     struct modem_image *m = IOMallocType(struct modem_image);
+    m->volume = vol;
     snprintf(path, sizeof path, "image/%s.b00", name);
     FatFile headers;
-    rc = fat_open(gVolume, path, &headers);
+    rc = fat_open(vol, path, &headers);
     if (rc == FatNotFound) rc = ENOENT;
     else if (rc) rc = EIO;
     else if (headers.size < 52 || headers.size > 64 * 1024) rc = EFTYPE;
     uint8_t *bytes = rc ? NULL : IOMallocData(headers.size);
-    if (!rc && fat_read(gVolume, &headers, 0, bytes, headers.size)) rc = EIO;
+    if (!rc && fat_read(vol, &headers, 0, bytes, headers.size)) rc = EIO;
     if (!rc && qcom_mdt_split(&m->split, bytes, headers.size)) rc = EFTYPE;
     if (bytes) IOFreeData(bytes, headers.size);
     for (unsigned i = 0; !rc && i < m->split.count; ++i) {
         if (!m->split.piece[i].size) continue;
         snprintf(path, sizeof path, "image/%s.b%02u", name, i);
-        if (fat_open(gVolume, path, &m->piece[i])) rc = ENOENT;
+        if (fat_open(vol, path, &m->piece[i])) rc = ENOENT;
         else if (m->piece[i].size < m->split.piece[i].size) rc = EFTYPE;
     }
     if (rc) {IOFreeType(m, struct modem_image); return rc;}
@@ -137,10 +143,11 @@ struct sheng_fw {
 
 int sheng_fw_open(const char *path, void **handle, uint64_t *size)
 {
-    if (strncmp(path, "modem:", 6)) return ENOENT;
+    const unsigned which = !strncmp(path, "modemfw:", 8) ? 1 : 0;
+    if (!which && strncmp(path, "modem:", 6)) return ENOENT;
     struct sheng_fw *fw = IOMallocType(struct sheng_fw);
     fwLock();
-    const int error = openModem(path + 6, &fw->modem, size);
+    const int error = openModem(which, path + (which ? 8 : 6), &fw->modem, size);
     fwUnlock();
     if (error) {IOFreeType(fw, struct sheng_fw); return error;}
     *handle = fw;
