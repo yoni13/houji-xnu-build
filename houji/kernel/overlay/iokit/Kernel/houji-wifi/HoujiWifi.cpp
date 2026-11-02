@@ -783,9 +783,39 @@ void wifiThread(void *arg, wait_result_t) {
 }
 }  // namespace
 
+// launchd loads the wireless daemon only on hardware whose device tree has a node named wlan (its _LimitLoadToDeviceTree), as Apple's
+// boot loaders describe the radio at /arm-io/wlan. Added here, during bsd_init and so before launchd reads its job list, with the radio's
+// address, which the daemon also wants in /chosen (mac-address-wifi0) to derive the private addresses of networks.
+static void publishWlanNode(void) {
+    uint8_t mac[6];
+    boardMac(mac);
+    if (IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane)) {
+        if (!chosen->getProperty("mac-address-wifi0")) chosen->setProperty("mac-address-wifi0", mac, sizeof mac);
+        chosen->release();
+    }
+    IORegistryEntry *armio = IORegistryEntry::fromPath("/arm-io", gIODTPlane);
+    if (!armio) {IOLog("HOUJI WIFI: no /arm-io in the device tree; the wireless daemon will not load\n"); return;}
+    if (IORegistryEntry *existing = IORegistryEntry::fromPath("/arm-io/wlan", gIODTPlane)) {existing->release(); armio->release(); return;}
+    IORegistryEntry *wlan = OSTypeAlloc(IORegistryEntry);
+    if (wlan && wlan->init()) {
+        static const char name[] = "wlan", compatible[] = "wlan-pcie,wcn7850", type[] = "wlan";
+        wlan->setName(name);
+        wlan->setProperty("name", (void *)name, sizeof name);
+        wlan->setProperty("compatible", (void *)compatible, sizeof compatible);
+        wlan->setProperty("device_type", (void *)type, sizeof type);
+        wlan->setProperty("local-mac-address", mac, sizeof mac);
+        const bool attached = wlan->attachToParent(armio, gIODTPlane);
+        IOLog("HOUJI WIFI: /arm-io/wlan %s, address %02x:%02x:%02x:%02x:%02x:%02x\n", attached ? "added" : "not attached", mac[0], mac[1], mac[2],
+              mac[3], mac[4], mac[5]);
+    }
+    OSSafeReleaseNULL(wlan);
+    armio->release();
+}
+
 extern "C" void houji_wifi_start(void) {
     unsigned stage = 0;
     if (!PE_parse_boot_argn("houji_wifi", &stage, sizeof stage) || !stage || native_wifi_stats[0]) return;
+    if (stage >= 5) publishWlanNode();
     thread_t thread = nullptr;
     if (kernel_thread_start(wifiThread, reinterpret_cast<void *>(uintptr_t(stage)), &thread) == KERN_SUCCESS) thread_deallocate(thread);
     else native_wifi_stats[0] = (uint32_t)-7;
