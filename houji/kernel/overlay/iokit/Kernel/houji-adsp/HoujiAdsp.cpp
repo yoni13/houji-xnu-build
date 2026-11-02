@@ -793,6 +793,7 @@ void rmtfsReceive(void *, QcomQrtr *q, uint32_t port, uint32_t node, uint32_t fr
     QcomQmiMessage m;
     if (qcom_qmi_parse(data, length, &m) || m.type != QCOM_QMI_REQUEST) return;
     ms[7] = ms[7] + 1;
+    IOLog("HOUJI RMTFS: request %u length %u\n", m.message, m.length);
     uint8_t out[64];
     uint32_t n = 0, size = 0, caller = 0;
     const uint8_t *id = qcom_qmi_tlv(&m, 0x01, &size);
@@ -826,9 +827,16 @@ void rmtfsReceive(void *, QcomQrtr *q, uint32_t port, uint32_t node, uint32_t fr
             else {for (uint64_t k = 0; k < bytes; ++k) gRmtfs[caller].data[off + k] = shared[k]; ms[10] = ms[10] + (int32_t)(bytes >> 10);}
         }
         __asm__ volatile("dsb sy" ::: "memory");
+        if (!ok || count == 0) {
+            uint32_t e[3] = {}; if (v && vsize >= skip + 12) memcpy(e, v + skip, 12);
+            IOLog("HOUJI RMTFS: iovec %s caller %u known %d dir %d/%u vsize %u count %u skip %u first %u/%x/%u part %u\n", ok ? "ok" : "refused",
+                  caller, known, dir ? dir[0] : -1, dsize, vsize, count, skip, e[0], e[1], e[2], caller < 4 ? gRmtfs[caller].size : 0);
+        }
         n = qmiResponse(out, m, ok ? 0 : 1, ok ? 0 : 0x30);
         break; }
     case 4: {   // the shared buffer
+        {uint32_t bs = 0; const uint8_t *b = qcom_qmi_tlv(&m, 0x02, &bs); uint32_t want = 0; if (b && bs == 4) memcpy(&want, b, 4);
+         IOLog("HOUJI RMTFS: buffer of %u bytes asked by caller %u\n", want, caller);}
         n = qmiResponse(out, m, 0, 0);
         const uint64_t at = kRmtfsBase; n = qmiAdd(out, n, 0x10, &at, 8);
         break; }
