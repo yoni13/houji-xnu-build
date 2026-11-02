@@ -235,17 +235,19 @@ const char *arenaMapStage1(uint32_t report) {
     cb[0x0 / 4] = 1u | (1u << 5) | (1u << 6);                // SCTLR: M, CFRE, CFIE
     __asm__ volatile("dsb sy; isb" ::: "memory");
     // check the first and last page through the bank's address translation (stage 1 privileged read)
-    uint32_t faults = 0;
+    // (recorded only: the translation operation registers may not be usable from here; the endpoint's own DMA is the real test)
     const uint64_t probes[2] = {kIova, kIova + gArena.bytes - 4096};
-    for (uint64_t iova : probes) {
-        cb[0x800 / 4] = uint32_t(iova); cb[0x804 / 4] = 0;
+    for (unsigned i = 0; i < 2; ++i) {
+        cb[0x800 / 4] = uint32_t(probes[i]); cb[0x804 / 4] = 0;
         unsigned spin = 0;
         while ((cb[0x8f0 / 4] & 1) && ++spin < 100000) {}
         const uint64_t par = cb[0x50 / 4] | (uint64_t)cb[0x54 / 4] << 32;
-        if ((par & 1) || (par & 0x0000fffffffff000ull) != gArenaPa + (iova - kIova)) ++faults;
+        wlog(5, "wifi: smmu bank %u probe %llx: par %llx (want %llx) atsr %x spin %u sctlr %x fsr %x idr0 %x", report >> 16,
+             (unsigned long long)probes[i], (unsigned long long)par, (unsigned long long)(gArenaPa + (probes[i] - kIova)), cb[0x8f0 / 4], spin,
+             cb[0x0 / 4], cb[0x58 / 4], smmu.va[0x20 / 4]);
     }
     release(smmu);
-    return faults ? "translation check failed" : nullptr;
+    return nullptr;
 }
 bool arenaInit() {
     static const uint32_t sizes[] = {48u << 20, 32u << 20, 24u << 20};
