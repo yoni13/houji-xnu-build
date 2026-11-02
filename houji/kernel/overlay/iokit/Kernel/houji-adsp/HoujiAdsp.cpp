@@ -920,6 +920,16 @@ bool modemStart() {
                  (unsigned long long)c.x0, (unsigned long long)d.x0);
         mnote("pas ", text);
     }
+    {   // houji_modem=3: the main image's init alone, for comparison with the dtb's
+        unsigned mode = 0; PE_parse_boot_argn("houji_modem", &mode, sizeof mode);
+        if (mode == 3) {
+            rc = authenticateHeader(gMImage, kMPas, kMBase, true);
+            char text[64]; snprintf(text, sizeof text, " | main rc %d x0 %x br %llx", rc, (unsigned)native_adsp_stats[13], (unsigned long long)gBridge);
+            strlcat(native_mpss_text, text, sizeof native_mpss_text);
+            scm(QCOM_SCM_PAS_SHUTDOWN, qcom_scm_args(1, 0, 0, 0), kMPas, 0, 0);
+            mfail(MsDtb, 3); return false;
+        }
+    }
     if ((rc = authenticateHeader(gMDtbImage, kMPasDtb, kMDtbBase, true)) || (rc = loadSegments(gMDtbImage, kMDtbBase, kMDtbSize)) ||
         (rc = scmOk(scm(QCOM_SCM_PAS_AUTH_AND_RESET, qcom_scm_args(1, 0, 0, 0), kMPasDtb, 0, 0)) ? 0 : -3)) {
         char text[64]; snprintf(text, sizeof text, " | x0 %x x1 %x br %llx/%llx", (unsigned)native_adsp_stats[13], (unsigned)native_adsp_stats[14],
