@@ -871,7 +871,8 @@ void mpump() {
 void mcounters() {
     ms[13] = gMQrtr.hello_received;
     ms[6] = (int32_t)gMQrtr.remote_count;
-    ms[14] = qcom_qrtr_find_remote(&gMQrtr, 0x10) >= 0;
+    const int loc = qcom_qrtr_find_remote(&gMQrtr, 0x10);
+    ms[14] = loc >= 0 ? (int32_t)(gMQrtr.remote[loc].node << 16 | (gMQrtr.remote[loc].port & 0xffff) | 0x40000000) : 0;
     unsigned at = 0;
     for (uint32_t i = 0; i < gMQrtr.remote_count && at + 12 < sizeof native_mpss_text; ++i)
         at += (unsigned)snprintf(native_mpss_text + at, sizeof native_mpss_text - at, "%s%x:%x", at ? " " : "", gMQrtr.remote[i].service,
