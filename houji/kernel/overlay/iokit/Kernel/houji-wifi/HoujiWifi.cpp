@@ -28,6 +28,7 @@
 
 extern "C" int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *);   // HoujiAdsp.cpp: the 2 ms poller
 extern "C" const char *houji_smmu_route_stream(uint16_t stream, uint64_t dma, uint64_t bytes, uint32_t report[3]);   // HoujiUfsRead.cpp
+extern "C" void sheng_wifi_net_start(const uint8_t mac[6]);   // WifiNet.cpp: en0 and the registry entries the system looks for
 extern "C" int houji_modem_file(const char *path, uint8_t **data, size_t *size, size_t max);   // AdspFirmware.c
 
 // [0] stage (negative: the step that failed), [1] vote 0x52008, [2] vote 0x52000, [3] GDSC, [4] halt bits (bit i: branch i of kBranches off),
@@ -554,7 +555,13 @@ void wifiStack(volatile uint32_t *m, uint64_t barBytes, volatile uint32_t *cfg, 
     uint64_t nextReport = 0;
     for (uint64_t n = 0;; ++n) {
         const int busy = nw_wifi_step();
-        if (!scanned && nw_wifi_stats.stage >= 4) {scanned = true; wlog(5, "wifi: driver up, first scan: %d", nw_wifi_scan(nullptr, 0));}
+        if (!scanned && nw_wifi_stats.stage >= 4) {
+            scanned = true;
+            unsigned net = 1;
+            PE_parse_boot_argn("houji_wifi_net", &net, sizeof net);
+            if (net) {nw_wifi_status st; nw_wifi_status_get(&st); sheng_wifi_net_start(st.mac);}   // en0; its events chain to the ones above
+            wlog(5, "wifi: driver up, first scan: %d", nw_wifi_scan(nullptr, 0));
+        }
         if (__atomic_exchange_n(&gScanDone, 0u, __ATOMIC_ACQ_REL)) listScan();
         if (__atomic_load_n(&gCommand.pending, __ATOMIC_ACQUIRE)) {runCommand(gCommand.text); __atomic_store_n(&gCommand.pending, 0u, __ATOMIC_RELEASE);}
         if (!busy) {if (gMsiAttached) msiWait(10); else IOSleep(1);}
@@ -801,3 +808,14 @@ extern "C" void houji_wifi_command(const char *text) {
     gMsiWake = 1;
     thread_wakeup(event_t(&gMsiWake));
 }
+
+// For WifiNet.cpp: its log lines, a prompt send of a queued frame, and the module's events it receives once en0 exists (they keep this
+// file's log and the console's scan listing).
+extern "C" void native_wifi_logf(int level, const char *fmt, ...) {
+    char line[160]; va_list ap; va_start(ap, fmt); vsnprintf(line, sizeof line, fmt, ap); va_end(ap);
+    pLog(level, line);
+}
+extern "C" void sheng_wifi_wake(void) {gMsiWake = 1; thread_wakeup(event_t(&gMsiWake));}
+extern "C" void houji_wifi_on_scan_done(void) {onScanDone();}
+extern "C" void houji_wifi_on_connect_done(int result) {onConnectDone(result);}
+extern "C" void houji_wifi_on_link_lost(int reason) {onLinkLost(reason);}
