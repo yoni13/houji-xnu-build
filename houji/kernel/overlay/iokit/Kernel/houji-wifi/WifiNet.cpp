@@ -69,7 +69,7 @@ enum {
   kRadioInfo = 54, kScanReqMultiple = 86, kScanCacheClear = 90, kCurrentNetwork = 103, kChannelsInfo = 207, kHwSupportedChannels = 254,
 };
 // events
-enum { kEvPowerChanged = 1, kEvSsidChanged = 2, kEvBssidChanged = 3, kEvLinkChanged = 4, kEvAssocDone = 9, kEvScanDone = 10 };
+enum { kEvPowerChanged = 1, kEvSsidChanged = 2, kEvBssidChanged = 3, kEvLinkChanged = 4, kEvAssocDone = 9, kEvScanDone = 10, kEvRsnHandshakeDone = 20 };
 // results of an association, as the framework numbers them
 enum { kAssocOk = 1, kAssocFailed = 2, kAssocTimeout = 9, kAssocBadKey = 21 };
 
@@ -148,6 +148,8 @@ void on_connect_done(int result) {
     nw_wifi_status st; nw_wifi_status_get(&st);
     link_event ev; memset(&ev, 0, sizeof ev); ev.rssi = st.signal_dbm; ev.noise = static_cast<uint16_t>(-95); ev.snr = static_cast<uint16_t>(st.signal_dbm + 95);
     post_event(kEvLinkChanged, &ev, sizeof ev);
+    // (houji) the module ran the 4-way handshake itself: the daemon waits for this before it calls the join complete (as itlwm posts it)
+    if (gKeyed) { post_event(kEvRsnHandshakeDone, nullptr, 0); log(6, "wifi-net: handshake-done event posted"); }
   }
 }
 void on_link_lost(int reason) {
