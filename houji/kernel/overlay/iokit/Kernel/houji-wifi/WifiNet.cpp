@@ -170,6 +170,16 @@ void note_frame(const uint8_t *e, size_t n, bool out) {
   k.ip4++; const uint8_t *ip = e + 14; const unsigned ihl = (ip[0] & 15) * 4;
   if (ip[9] != 17 || n < 14 + ihl + 8) return;
   const uint8_t *udp = ip + ihl; const unsigned sp = udp[0] << 8 | udp[1], dp = udp[2] << 8 | udp[3];
+  if (sp == 53 || dp == 53) {   // DNS: the name asked, and an answer's result code and count (houji)
+    const uint8_t *d = udp + 8; const size_t dl = n - (d - e); static unsigned shown[2];
+    if (dl < 12 || shown[out]++ >= 40) return;
+    char name[80]; size_t o = 12, w = 0;
+    while (o < dl && d[o] && w < sizeof name - 2) { unsigned l = d[o++]; for (unsigned i = 0; i < l && o < dl && w < sizeof name - 2; i++) name[w++] = static_cast<char>(d[o++]); name[w++] = '.'; }
+    name[w] = 0;
+    log(6, "wifi-net: dns %s id %02x%02x %s rcode %u answers %u qtype %u", dir, d[0], d[1], name, d[3] & 15, d[6] << 8 | d[7],
+        o + 2 < dl ? (d[o + 1] << 8 | d[o + 2]) : 0);
+    return;
+  }
   if (!((sp == 67 || sp == 68) && (dp == 67 || dp == 68))) return;
   k.dhcp++; const uint8_t *b = udp + 8; const size_t bl = n - (b - e); unsigned msg = 0;
   for (size_t o = 240; bl >= 240 && o + 2 <= bl && b[o] != 255; o += b[o] ? 2 + b[o + 1] : 1) if (b[o] == 53 && o + 2 < bl) { msg = b[o + 2]; break; }
