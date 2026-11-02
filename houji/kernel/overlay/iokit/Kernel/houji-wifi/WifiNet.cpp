@@ -168,6 +168,14 @@ void note_frame(const uint8_t *e, size_t n, bool out) {
   if (type == 0x86dd) { k.ip6++; return; }
   if (type != 0x0800 || n < 34) { k.other++; return; }
   k.ip4++; const uint8_t *ip = e + 14; const unsigned ihl = (ip[0] & 15) * 4;
+  // (houji) where outgoing connections go: the first TCP SYNs and UDP datagrams, with the next-hop hardware address
+  if (out && n >= 14 + ihl + 14 && (ip[9] == 6 || ip[9] == 17)) {
+    const uint8_t *l4 = ip + ihl; static unsigned shownOut;
+    const bool syn = ip[9] == 6 && (l4[13] & 0x12) == 0x02;
+    if ((syn || ip[9] == 17) && shownOut++ < 40)
+      log(6, "wifi-net: out %s %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u via %02x:%02x:%02x:%02x:%02x:%02x", syn ? "syn" : "udp", ip[12], ip[13], ip[14], ip[15],
+          l4[0] << 8 | l4[1], ip[16], ip[17], ip[18], ip[19], l4[2] << 8 | l4[3], e[0], e[1], e[2], e[3], e[4], e[5]);
+  }
   if (ip[9] != 17 || n < 14 + ihl + 8) return;
   const uint8_t *udp = ip + ihl; const unsigned sp = udp[0] << 8 | udp[1], dp = udp[2] << 8 | udp[3];
   if (sp == 53 || dp == 53) {   // DNS: the name asked, and an answer's result code and count (houji)
