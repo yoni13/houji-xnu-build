@@ -330,10 +330,11 @@ int64_t shmBridge(uint64_t pa, uint64_t size) {
 }
 int authenticateHeader(Image &image, uint32_t pas, uint64_t base, bool bridge = false) {
     const uint64_t bytes = (qcom_mdt_metadata_size(&image.mdt) + 4095) & ~4095ull;
-    // (houji) for the modem: below 4 GiB and mapped uncached, as qcom_scm_pas_init_image requires ("non-cachable to avoid XPU
+    // (houji) for the modem: below 4 GiB and mapped normal non-cacheable (write combine: device memory faults on the unaligned stores
+    // of the metadata copy), as qcom_scm_pas_init_image requires ("non-cachable to avoid XPU
     // violations"); never an SHM bridge of our own: the hypervisor makes one for a PIL call and a buffer already bridged is refused.
     image.meta = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, (IOOptionBits)kIODirectionInOut | (IOOptionBits)kIOMemoryPhysicallyContiguous |
-                                                                 (bridge ? (IOOptionBits)kIOMapInhibitCache : 0), bytes,
+                                                                 (bridge ? (IOOptionBits)kIOMapWriteCombineCache : 0), bytes,
                                                                  bridge ? 0x00000000fffff000ull : 0xfffffffffffff000ull);
     if (!image.meta || image.meta->prepare() != kIOReturnSuccess) return -12;
     uint8_t *va = static_cast<uint8_t *>(image.meta->getBytesNoCopy());
