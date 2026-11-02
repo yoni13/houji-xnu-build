@@ -392,6 +392,26 @@ static void gesture_command(const char *cmd)
     thread_deallocate(t);
     printf("HOUJI DEBUG: gesture %s\n",cmd);
 }
+/* "type TEXT": a hardware keyboard types TEXT (a password, too: it is never logged here). */
+static char type_text[64];
+static volatile uint32_t type_busy;
+static void type_thread(void *arg __unused,wait_result_t result __unused)
+{
+    extern int sweet_hid_type(const char *);
+    const int n=sweet_hid_type(type_text);
+    bzero(type_text,sizeof(type_text));
+    printf("HOUJI DEBUG: typed %d characters\n",n);
+    os_atomic_store(&type_busy,0,release);
+    thread_terminate(current_thread());
+}
+static void type_command(const char *text)
+{
+    if (!os_atomic_cmpxchg(&type_busy,0,1,acquire)) { printf("HOUJI DEBUG: typing busy\n");return; }
+    strlcpy(type_text,text,sizeof(type_text));
+    thread_t t;
+    if (kernel_thread_start(type_thread,NULL,&t)!=KERN_SUCCESS) { bzero(type_text,sizeof(type_text));os_atomic_store(&type_busy,0,release);return; }
+    thread_deallocate(t);
+}
 static void command_line(void)
 {
     u.command[u.command_n]=0;
@@ -415,6 +435,7 @@ static void command_line(void)
         } else printf("HOUJI DEBUG: shotr X Y W H\n");
     }
     else if (!strcmp(u.command,"home") || !strncmp(u.command,"tap ",4) || !strncmp(u.command,"swipe ",6)) gesture_command(u.command);
+    else if (!strncmp(u.command,"type ",5)) { type_command(u.command+5); bzero(u.command,sizeof(u.command)); }
     else if (!strncmp(u.command,"wifi ",5)) { extern void houji_wifi_command(const char *); houji_wifi_command(u.command+5); bzero(u.command,sizeof(u.command)); }
     else if (!strcmp(u.command,"reboot")) {
         static bool requested;thread_t t;
