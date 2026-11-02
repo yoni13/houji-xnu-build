@@ -889,20 +889,6 @@ bool modemStart() {
         if (rc) {mfail(MsRails, rc); return false;}
     }
     ms[0] = MsRails;
-    static const uint64_t regions[3][2] = {{0x86b00000, 0x4900000}, {0x8b400000, 0x800000}, {0x84800000, 0x200000}};
-    const uint32_t msa = kVmMssMsa, both[2] = {kVmHlos, kVmMssMsa};
-    for (auto &r : regions) if (scmAssign(r[0], r[1], &msa, 1)) {mfail(MsAssign, (int)ms[11]); return false;}
-    ms[0] = MsAssign;
-    if (scmAssign(kRmtfsBase, kRmtfsSize, both, 2)) {mfail(MsRmtfs, -1); return false;}
-    if (!mapWindow(gRmtfsMem, kRmtfsBase, kRmtfsSize) || !loadRmtfs()) {mfail(MsRmtfs, -2); return false;}
-    for (uint64_t i = 0; i < kRmtfsSize; i += 4) *reinterpret_cast<volatile uint32_t *>(gRmtfsMem.va + i) = 0;
-    gMQueue = static_cast<MPacket *>(IOMallocData(sizeof(MPacket) * 16));
-    gMChannelStorage = static_cast<uint8_t *>(IOMallocData(4096 * 8));
-    if (!gMQueue || !gMChannelStorage) {mfail(MsRmtfs, -12); return false;}
-    qcom_qrtr_init(&gMQrtr, 1, mqrtrSend, nullptr);
-    qcom_qrtr_add_service(&gMQrtr, QCOM_SERVLOC_SERVICE, QCOM_SERVLOC_INSTANCE, 1, mlocator, nullptr);
-    qcom_qrtr_add_service(&gMQrtr, 14, 1, 2, rmtfsReceive, nullptr);
-    ms[0] = MsRmtfs;
     {   // what the secure world says about the two PAS ids, then a shutdown of each in case an earlier stage left one initialised
         char text[96];
         const ScmResult a = scm(QCOM_SCM_PAS_IS_SUPPORTED, qcom_scm_args(1, 0, 0, 0), kMPasDtb, 0, 0);
@@ -919,6 +905,20 @@ bool modemStart() {
         strlcat(native_mpss_text, text, sizeof native_mpss_text);
         mfail(MsDtb, rc); return false;}
     ms[0] = MsDtb;
+    static const uint64_t regions[3][2] = {{0x86b00000, 0x4900000}, {0x8b400000, 0x800000}, {0x84800000, 0x200000}};
+    const uint32_t msa = kVmMssMsa, both[2] = {kVmHlos, kVmMssMsa};
+    for (auto &r : regions) if (scmAssign(r[0], r[1], &msa, 1)) {mfail(MsAssign, (int)ms[11]); return false;}
+    ms[0] = MsAssign;
+    if (scmAssign(kRmtfsBase, kRmtfsSize, both, 2)) {mfail(MsRmtfs, -1); return false;}
+    if (!mapWindow(gRmtfsMem, kRmtfsBase, kRmtfsSize) || !loadRmtfs()) {mfail(MsRmtfs, -2); return false;}
+    for (uint64_t i = 0; i < kRmtfsSize; i += 4) *reinterpret_cast<volatile uint32_t *>(gRmtfsMem.va + i) = 0;
+    gMQueue = static_cast<MPacket *>(IOMallocData(sizeof(MPacket) * 16));
+    gMChannelStorage = static_cast<uint8_t *>(IOMallocData(4096 * 8));
+    if (!gMQueue || !gMChannelStorage) {mfail(MsRmtfs, -12); return false;}
+    qcom_qrtr_init(&gMQrtr, 1, mqrtrSend, nullptr);
+    qcom_qrtr_add_service(&gMQrtr, QCOM_SERVLOC_SERVICE, QCOM_SERVLOC_INSTANCE, 1, mlocator, nullptr);
+    qcom_qrtr_add_service(&gMQrtr, 14, 1, 2, rmtfsReceive, nullptr);
+    ms[0] = MsRmtfs;
     if ((rc = authenticateHeader(gMImage, kMPas, kMBase)) || (rc = loadSegments(gMImage, kMBase, kMSize))) {mfail(MsLoaded, rc); return false;}
     ms[0] = MsLoaded;
     // GLINK items before the start: the modem looks for the descriptor when it comes up
