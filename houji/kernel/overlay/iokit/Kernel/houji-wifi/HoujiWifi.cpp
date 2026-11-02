@@ -224,7 +224,9 @@ void bringUp(Window &gcc, Window &tlmm, unsigned stage) {
     for (unsigned i = 0; i < sizeof kBranches / sizeof kBranches[0]; ++i)
         if (g[kBranches[i] / 4] & (1u << 31)) off |= 1u << i;
     native_wifi_stats[11] = power | off << 8;
-    if (off & ~(1u << 4)) {native_wifi_stats[0] = (uint32_t)-12; return;}   // the pipe branch runs only once the PHY drives it
+    // The pipe branch runs only once the PHY drives it. On SM8650 the NoC branches (cnoc_sf voted, aggre_noc and ddrss_sf halt-skip in
+    // gcc-sm8650.c) read off here, as Linux never checks them; only the controller's own branches must run before its registers are read.
+    if (off & kNeeded) {native_wifi_stats[0] = (uint32_t)-12; return;}
     pulseReset(g, kPcieBcr);
     pulseReset(g, kPhyBcr);
     native_wifi_stats[0] = 12;
