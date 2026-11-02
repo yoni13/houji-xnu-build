@@ -175,6 +175,77 @@ void wlog(int level, const char *fmt, ...) {
     char line[160]; va_list ap; va_start(ap, fmt); vsnprintf(line, sizeof line, fmt, ap); va_end(ap);
     pLog(level, line);
 }
+// When no such buffer is free (the usual case 50 s into the boot) the buffer may sit anywhere and the endpoint's context bank gets a stage 1
+// table instead (as UniXNU-sheng's storage driver gives it): 4 KiB granule, 32-bit input, L1 -> L2 with 2 MiB blocks mapping kIova upward.
+constexpr uint64_t kIova = 0x10000000ull;
+uint64_t gArenaPa;   // physical address of the buffer; gArena.iova is what the endpoint uses
+bool gTranslated;
+IOBufferMemoryDescriptor *gTables;
+bool arenaTranslated() {
+    static const uint32_t sizes[] = {48u << 20, 32u << 20, 24u << 20};
+    constexpr uint32_t kBlock = 2u << 20;
+    for (uint32_t bytes : sizes) {
+        gArenaBuffer = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+            kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryMapperNone, bytes + kBlock, kBlock);
+        if (!gArenaBuffer) continue;
+        IOByteCount contiguous = 0;
+        uint64_t pa = gArenaBuffer->getPhysicalSegment(0, &contiguous, kIOMemoryMapperNone);
+        if (!pa || contiguous < bytes + kBlock) {gArenaBuffer->release(); gArenaBuffer = nullptr; continue;}
+        const uint64_t shift = (kBlock - (pa & (kBlock - 1))) & (kBlock - 1);
+        uint8_t *cached = static_cast<uint8_t *>(gArenaBuffer->getBytesNoCopy());
+        bzero(cached, bytes + kBlock);
+        for (uint64_t off = 0; off < bytes + kBlock; off += 64) __asm__ volatile("dc civac, %0" :: "r"(cached + off) : "memory");
+        __asm__ volatile("dsb sy" ::: "memory");
+        gArenaMap = gArenaBuffer->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
+        if (!gArenaMap) {gArenaBuffer->release(); gArenaBuffer = nullptr; continue;}
+        gArena.va = reinterpret_cast<uint8_t *>(gArenaMap->getVirtualAddress()) + shift;
+        gArenaPa = pa + shift;
+        gArena.iova = kIova;
+        gArena.bytes = bytes;
+        gTranslated = true;
+        return true;
+    }
+    return false;
+}
+// The routed context bank (report: slot | bank << 16) translates kIova.. onto the buffer.
+const char *arenaMapStage1(uint32_t report) {
+    constexpr uint32_t kBlock = 2u << 20;
+    gTables = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+        kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryMapperNone, 8192, 4096);
+    if (!gTables) return "no table memory";
+    uint64_t *l1 = static_cast<uint64_t *>(gTables->getBytesNoCopy()), *l2 = l1 + 512;
+    bzero(l1, 8192);
+    const uint64_t tablesPa = gTables->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+    l1[0] = (tablesPa + 4096) | 3;
+    for (uint32_t i = 0; i < gArena.bytes / kBlock; ++i)   // block, non-global, AF, inner shareable, EL0 RW, attribute 0
+        l2[(kIova >> 21) + i] = (gArenaPa + (uint64_t)i * kBlock) | (1ull << 11) | (1ull << 10) | (3ull << 8) | (1ull << 6) | 1;
+    for (uint32_t off = 0; off < 8192; off += 64) __asm__ volatile("dc civac, %0" :: "r"(reinterpret_cast<uint8_t *>(l1) + off) : "memory");
+    __asm__ volatile("dsb sy" ::: "memory");
+    Window smmu = {};
+    if (!mapWindow(smmu, 0x15000000, 0xd0000)) return "SMMU map failed";
+    const uint32_t pages = 1u << (((smmu.va[0x24 / 4] >> 28) & 7) + 1);
+    volatile uint32_t *cb = smmu.va + (pages + (report >> 16)) * 4096 / 4;
+    cb[0x0 / 4] = 0;                                         // stage 1 off while the table is set
+    cb[0x20 / 4] = uint32_t(tablesPa); cb[0x24 / 4] = uint32_t(tablesPa >> 32);
+    cb[0x10 / 4] = 5;                                        // TCR2: 48-bit output
+    cb[0x30 / 4] = 32u | (1u << 23);                         // T0SZ 32, non-cacheable walks, 4 KiB granule, no TTBR1
+    cb[0x38 / 4] = 0xff;                                     // MAIR attribute 0: write-back
+    cb[0x618 / 4] = 0; cb[0x7f0 / 4] = 0;                    // invalidate the context's TLB, sync
+    __asm__ volatile("dsb sy" ::: "memory");
+    cb[0x0 / 4] = 1u | (1u << 5) | (1u << 6);                // SCTLR: M, CFRE, CFIE
+    __asm__ volatile("dsb sy; isb" ::: "memory");
+    // check the first and last page through the bank's address translation (stage 1 privileged read)
+    uint32_t faults = 0;
+    for (uint64_t iova : {kIova, kIova + gArena.bytes - 4096}) {
+        cb[0x800 / 4] = uint32_t(iova); cb[0x804 / 4] = 0;
+        unsigned spin = 0;
+        while ((cb[0x8f0 / 4] & 1) && ++spin < 100000) {}
+        const uint64_t par = cb[0x50 / 4] | (uint64_t)cb[0x54 / 4] << 32;
+        if ((par & 1) || (par & 0x0000fffffffff000ull) != gArenaPa + (iova - kIova)) ++faults;
+    }
+    release(smmu);
+    return faults ? "translation check failed" : nullptr;
+}
 bool arenaInit() {
     static const uint32_t sizes[] = {48u << 20, 32u << 20, 24u << 20};
     for (uint32_t bytes : sizes) {
@@ -191,11 +262,11 @@ bool arenaInit() {
         gArenaMap = gArenaBuffer->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
         if (!gArenaMap) {gArenaBuffer->release(); gArenaBuffer = nullptr; continue;}
         gArena.va = reinterpret_cast<uint8_t *>(gArenaMap->getVirtualAddress());
-        gArena.iova = pa;
+        gArena.iova = gArenaPa = pa;
         gArena.bytes = bytes;
         break;
     }
-    if (!gArenaBuffer) return false;
+    if (!gArenaBuffer && !arenaTranslated()) return false;
     if (!gArena.blocks) gArena.blocks = static_cast<Arena::Block *>(IOMallocData(kArenaBlocks * sizeof(Arena::Block)));
     if (!gArena.blocks) return false;
     gArena.blocks[0] = {4096, (uint32_t)(gArena.bytes - 4096), false}; gArena.count = 1;   // the first page is the MSI target
@@ -455,9 +526,11 @@ void wifiStack(volatile uint32_t *m, uint64_t barBytes, volatile uint32_t *cfg, 
     PE_parse_boot_argn("houji_wifi_debug", &gDebug, sizeof gDebug);
     if (!arenaInit()) {native_wifi_stats[0] = (uint32_t)-20; return;}
     uint32_t route[3] = {};
-    const char *why = houji_smmu_route_stream(0x1401, gArena.iova, gArena.bytes, route);
-    wlog(6, "wifi: DMA window %llx + %zu MiB, stream 0x1401 route %s slot %u bank %u", (unsigned long long)gArena.iova, gArena.bytes >> 20,
-         why ? why : "ok", route[0] & 0xffff, route[0] >> 16);
+    const char *why = houji_smmu_route_stream(0x1401, gArenaPa, gArena.bytes, route);
+    if (!why && gTranslated) why = arenaMapStage1(route[0]);
+    wlog(5, "wifi: DMA window %zu MiB at %llx (bus %llx, %s), stream 0x1401 route %s slot %u bank %u", gArena.bytes >> 20,
+         (unsigned long long)gArenaPa, (unsigned long long)gArena.iova, gTranslated ? "stage 1 table" : "pass-through", why ? why : "ok",
+         route[0] & 0xffff, route[0] >> 16);
     if (why) {native_wifi_stats[0] = (uint32_t)-21; return;}
     if (!findCaps()) {native_wifi_stats[0] = (uint32_t)-22; return;}
     static const struct lx_platform plat = {pNow, pSleep, pPoll, pLog, pHalt, hAlloc, hFree, pDmaAlloc, pDmaFree, pDmaMap, pDmaSync, pFwGet};
