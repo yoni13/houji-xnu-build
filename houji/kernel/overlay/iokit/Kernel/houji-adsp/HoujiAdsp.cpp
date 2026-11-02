@@ -739,8 +739,11 @@ static void houjiPowerThread(void *, wait_result_t) {
 }
 extern "C" void houji_wifi_start(void);
 extern "C" void houji_wifi_report(void);
+extern "C" void houji_buttons_start(void);
+extern "C" void houji_buttons_report(void);
 extern "C" void houji_power_start(void) {
     houji_wifi_start();
+    houji_buttons_start();
     unsigned mode = 2;
     PE_parse_boot_argn("houji_adsp", &mode, sizeof mode);
     if (!mode) return;
@@ -749,6 +752,7 @@ extern "C" void houji_power_start(void) {
 }
 extern "C" void houji_power_report(void) {
     houji_wifi_report();
+    houji_buttons_report();
     const volatile int32_t *a = native_adsp_stats;
     IOLog("HOUJI ADSP: stage=%d err=%d irq=%d slave=%x items=%x qmp=%x fw-KiB=%d ready-ms=%d glink=%d/%d chan=%x scm=%x/%x\n",
           a[0], a[1], a[2], a[3], a[4], a[5], a[7], a[8], a[9], a[10], a[11], a[13], a[14]);
