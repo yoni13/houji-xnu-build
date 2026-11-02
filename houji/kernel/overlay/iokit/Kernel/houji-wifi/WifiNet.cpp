@@ -34,6 +34,7 @@ extern "C" {
 #include <kern/locks.h>
 #include <kern/thread.h>
 #include <kern/thread_call.h>
+#include <kern/clock.h>
 #include <sys/systm.h>
 #include <stdarg.h>
 #include "nw_abi.h"
@@ -388,7 +389,12 @@ errno_t if_ioctl(ifnet_t, unsigned long cmd, void *data) {
     // every request with its answer, for the first few hundred; then a type's first one only
     static unsigned shown; const int type = rq->req_type; const bool first = type >= 0 && type < 256 && !(gLogged[type / 32] & (1u << (type % 32)));
     if (type >= 0 && type < 256) gLogged[type / 32] |= 1u << (type % 32);
-    if (shown < 300 || first) { ++shown; log(6, "wifi-net: request %u: type %d %s len %u val %d -> %d (len %u val %d)", shown, type, cmd == SIOCSA80211 ? "set" : "get", len, val, e, rq->req_len, rq->req_val); }
+    // (houji) and, after that, the first eight failures of each type and every request for a minute after a join
+    static uint8_t fails[512]; static uint64_t joinedAt;
+    if (type == kAssociate && cmd == SIOCSA80211) joinedAt = mach_absolute_time();
+    uint64_t sinceJoin = ~0ull; if (joinedAt) absolutetime_to_nanoseconds(mach_absolute_time() - joinedAt, &sinceJoin);
+    const bool failLog = e && type >= 0 && type < 512 && fails[type] < 8 && ++fails[type];
+    if (shown < 300 || first || failLog || sinceJoin < 60000000000ull) { ++shown; log(6, "wifi-net: request %u: type %d %s len %u val %d -> %d (len %u val %d)", shown, type, cmd == SIOCSA80211 ? "set" : "get", len, val, e, rq->req_len, rq->req_val); }
     return e;
   }
   case SIOCGIFMEDIA: {
