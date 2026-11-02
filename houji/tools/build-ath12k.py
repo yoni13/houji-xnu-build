@@ -17,6 +17,10 @@ port = Path(__file__).resolve().parent.parent
 darwin = sys.platform == 'darwin'
 
 subprocess.run(['bash', str(module / 'tools/fetch-sources.sh')], check=True, stdout=subprocess.DEVNULL)
+# houji patches to the module's own sources (houji/kernel/ath12k-module/*.patch, -p1 in the module directory; already applied ones are kept)
+for patch in sorted((port / 'kernel/ath12k-module').glob('*.patch')):
+    if subprocess.run(['patch', '-p1', '-R', '--dry-run', '-s', '-d', str(module), '-i', str(patch)], capture_output=True).returncode:
+        subprocess.run(['patch', '-p1', '--forward', '-d', str(module), '-i', str(patch)], check=True)
 subprocess.run(['bash', str(module / 'tools/prepare.sh')], check=True, stdout=subprocess.DEVNULL)
 # houji patches: applied to private copies of the files they touch (the prepared tree holds links into deps/linux)
 for patch in sorted((port / 'kernel/ath12k').glob('*.patch')):
