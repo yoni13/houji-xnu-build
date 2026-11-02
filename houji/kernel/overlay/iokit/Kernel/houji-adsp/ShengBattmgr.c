@@ -38,9 +38,10 @@ static const struct {uint8_t opcode, property, slow;} kFields[BmFields] = {
     [BmChargeCurrent] = {SHENG_BATTMGR_OP_BATTERY_GET, 12, 0},
     [BmRealType] = {SHENG_BATTMGR_OP_BOARD_GET, 0x07, 0},
     [BmPowerMax] = {SHENG_BATTMGR_OP_BOARD_GET, 0x33, 0},
-    [BmPdVerified] = {SHENG_BATTMGR_OP_BOARD_GET, 0x18, 0},
-    [BmAuthentic] = {SHENG_BATTMGR_OP_BOARD_GET, 0x03, 1},
-    [BmSlaveAuthentic] = {SHENG_BATTMGR_OP_BOARD_GET, 0xa5, 1},
+    /* houji numbering (stock qti_battery_charger): battery authentic 5, VERIFY_PROCESS 20, PD verified 32 */
+    [BmPdVerified] = {SHENG_BATTMGR_OP_BOARD_GET, 32, 0},
+    [BmAuthentic] = {SHENG_BATTMGR_OP_BOARD_GET, 5, 1},
+    [BmVerifyProcess] = {SHENG_BATTMGR_OP_BOARD_GET, 20, 0},
     [BmInputSuspend] = {SHENG_BATTMGR_OP_BOARD_GET, 0x2a, 0},
 };
 #define NO_CYCLE 0xff
@@ -96,7 +97,7 @@ void sheng_battmgr_refresh(ShengBattmgr *b, int slow)
 
 uint32_t sheng_battmgr_next(ShengBattmgr *b, uint8_t out[SHENG_BATTMGR_REQUEST_BYTES])
 {
-    if (b->in_flight || b->limit_in_flight) return 0;
+    if (b->in_flight || b->limit_in_flight || b->set_in_flight) return 0;
     if (b->limit_due) {
         header(out, SHENG_BATTMGR_OP_USB_SET);
         put32(out + 12, 0);
@@ -105,6 +106,16 @@ uint32_t sheng_battmgr_next(ShengBattmgr *b, uint8_t out[SHENG_BATTMGR_REQUEST_B
         b->limit_in_flight = b->limit_due;
         b->limit_due = 0;
         b->limit_tries++;
+        return SHENG_BATTMGR_REQUEST_BYTES;
+    }
+    if (b->set_count) {
+        header(out, b->set_queue[0].opcode);
+        put32(out + 12, 0);
+        put32(out + 16, b->set_queue[0].property);
+        put32(out + 20, b->set_queue[0].value);
+        b->set_in_flight = b->set_queue[0].opcode;
+        b->set_queue[0] = b->set_queue[1];
+        b->set_count--;
         return SHENG_BATTMGR_REQUEST_BYTES;
     }
     if (b->cursor == NO_CYCLE || b->cursor >= BmFields) return 0;
@@ -120,10 +131,6 @@ uint32_t sheng_battmgr_next(ShengBattmgr *b, uint8_t out[SHENG_BATTMGR_REQUEST_B
  * (CDP 3) its 1.5 A; others (dedicated chargers, Type-C current, PD contracts) are the firmware's own. */
 static uint32_t wanted_limit(const ShengBattmgr *b, int port)
 {
-    /* houji: a PD contract (adapter type 6) from a computer's Type-C port stayed at the firmware's 100 mA although the source offered
-     * 1.2 A (usb max). Ask for what the source advertised, at most 3 A; the firmware backs off if the bus sags. */
-    if (port == 6 && ((b->valid >> BmUsbMax) & 1) && b->value[BmUsbMax] > 0)
-        return b->value[BmUsbMax] > 3000000 ? 3000000u : (uint32_t)b->value[BmUsbMax];
     return port == 1 ? b->sdp_limit_ua : port == 3 ? 1500000u : 0u;
 }
 
@@ -138,6 +145,42 @@ static void check_limit(ShengBattmgr *b)
     b->limit_due = want;
 }
 
+static void queue_set(ShengBattmgr *b, uint32_t opcode, uint32_t property, uint32_t value)
+{
+    if (b->set_count >= 2) return;
+    b->set_queue[b->set_count].opcode = opcode;
+    b->set_queue[b->set_count].property = property;
+    b->set_queue[b->set_count].value = value;
+    b->set_count++;
+}
+
+/* After a cycle, on a PD supply only (as stock and the Linux port): the charge current vote, then the end of verification. */
+static void check_charge(ShengBattmgr *b)
+{
+#define HAS(f) ((b->valid >> (f)) & 1u)
+#define V(f) (b->value[(f)])
+    if (!(HAS(BmUsbOnline) && V(BmUsbOnline))) {b->fcc_tries = b->verify_tries = 0; b->fcc_target = 0; return;}
+    const int port = HAS(BmUsbAdapter) ? V(BmUsbAdapter) : 0;
+    if (!b->fcc_ua || port < 6 || port > 8 || b->set_count || b->set_in_flight) return;
+    const int temperate = HAS(BmTemperature) && V(BmTemperature) >= 1000 && V(BmTemperature) <= 4000;
+    const uint32_t fcc = temperate || b->fcc_ua < 500000 ? b->fcc_ua : 500000;
+    if (fcc != b->fcc_target) {b->fcc_target = fcc; b->fcc_tries = 0;}
+    if (HAS(BmChargeCurrent) && (uint32_t)V(BmChargeCurrent) != fcc && b->fcc_tries < 3) {
+        queue_set(b, SHENG_BATTMGR_OP_BATTERY_SET, 12, fcc);
+        b->fcc_tries++;
+        b->fcc_sent++;
+    }
+    if (HAS(BmVerifyProcess) && !V(BmVerifyProcess) && HAS(BmPdVerified) && !V(BmPdVerified) && HAS(BmUsbLimit) &&
+        V(BmUsbLimit) <= 100000 && b->verify_tries < 3 && b->cycles_done >= b->verify_next_cycle) {
+        queue_set(b, SHENG_BATTMGR_OP_BOARD_SET, 20, 0);
+        b->verify_tries++;
+        b->verify_sent++;
+        b->verify_next_cycle = b->cycles_done + 4;
+    }
+#undef HAS
+#undef V
+}
+
 /* Ends the cycle when the cursor ran past the last field; starts the remembered one. Returns 1 when a cycle ended. */
 static int finish(ShengBattmgr *b)
 {
@@ -145,6 +188,7 @@ static int finish(ShengBattmgr *b)
     b->cursor = NO_CYCLE;
     b->cycles_done++;
     check_limit(b);
+    check_charge(b);
     if (b->refresh_wanted) {
         const int slow = b->refresh_wanted == 2;
         b->refresh_wanted = 0;
@@ -156,6 +200,7 @@ static int finish(ShengBattmgr *b)
 void sheng_battmgr_timeout(ShengBattmgr *b)
 {
     if (b->limit_in_flight) {b->limit_in_flight = 0; b->limit_result = -60; b->timeouts++; return;}
+    if (b->set_in_flight) {b->set_in_flight = 0; b->set_result = -60; b->timeouts++; return;}
     if (b->cursor == NO_CYCLE || !b->in_flight) return;
     b->timeouts++;
     b->last_timeout = b->cursor;
@@ -181,6 +226,14 @@ int sheng_battmgr_receive(ShengBattmgr *b, const uint8_t *data, uint32_t length)
         if (!b->limit_result) b->limit_sets++;
         b->limit_in_flight = 0;
         sheng_battmgr_refresh(b, 0);  /* read the limit back */
+        return BmAnswer;
+    }
+    if (opcode == SHENG_BATTMGR_OP_BATTERY_SET || opcode == SHENG_BATTMGR_OP_BOARD_SET) {
+        if (b->set_in_flight != opcode || length < 24) {b->ignored++; return BmIgnored;}
+        b->set_result = (int32_t)le32(data + 20);
+        if (!b->set_result) b->sets_done++;
+        b->set_in_flight = 0;
+        sheng_battmgr_refresh(b, 0);
         return BmAnswer;
     }
     if (b->cursor == NO_CYCLE || b->cursor >= BmFields || !b->in_flight || length < 24) {b->ignored++; return BmIgnored;}

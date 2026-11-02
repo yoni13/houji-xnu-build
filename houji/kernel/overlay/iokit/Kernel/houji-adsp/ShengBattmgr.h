@@ -19,9 +19,11 @@ extern "C" {
 #define SHENG_BATTMGR_OP_REQUEST_NOTIFICATION 0x04u
 #define SHENG_BATTMGR_OP_NOTIFICATION 0x07u
 #define SHENG_BATTMGR_OP_BATTERY_GET 0x30u
+#define SHENG_BATTMGR_OP_BATTERY_SET 0x31u
 #define SHENG_BATTMGR_OP_USB_GET 0x32u
 #define SHENG_BATTMGR_OP_USB_SET 0x33u
 #define SHENG_BATTMGR_OP_BOARD_GET 0x50u  /* the board's own properties, same request and answer shape: fuel gauges, charger state */
+#define SHENG_BATTMGR_OP_BOARD_SET 0x51u
 #define SHENG_BATTMGR_REQUEST_BYTES 24u
 #define SHENG_BATTMGR_ENABLE_BYTES 28u
 
@@ -34,7 +36,7 @@ enum {
      * thermal level, the charge current the charger runs, the board's view of the adapter (type, watts, PD authenticated), battery
      * authentication of both cells, input suspended */
     BmUsbAdapter, BmUsbLimit, BmUsbMax, BmChargeType, BmThermalLevel, BmChargeCurrent, BmRealType, BmPowerMax, BmPdVerified,
-    BmAuthentic, BmSlaveAuthentic, BmInputSuspend, BmFields
+    BmAuthentic, BmVerifyProcess, BmInputSuspend, BmFields
 };
 
 typedef struct {
@@ -51,6 +53,13 @@ typedef struct {
     int32_t limit_port;
     uint32_t limit_due, limit_in_flight, limit_tries, limit_sets;
     int32_t limit_result;
+    /* houji: the stock charger's end of adapter verification. Until the host sends VERIFY_PROCESS=0 (board set 20) the firmware keeps a
+     * PD supply's input at 100 mA. Before it, a battery charge current vote (battery set 12) caps what the lifted input can push into
+     * the cell: fcc_ua, 500 mA outside 10-40 C, 0 leaves both alone. Sets go out in order, one at a time, a few tries per attachment. */
+    uint32_t fcc_ua, fcc_target, fcc_tries, fcc_sent, verify_tries, verify_sent, verify_next_cycle, sets_done;
+    struct {uint32_t opcode, property, value;} set_queue[2];
+    uint32_t set_count, set_in_flight;
+    int32_t set_result;
 } ShengBattmgr;
 
 /* What a power source shows. Temperatures are hundredths of a degree Celsius, as the firmware reports them. The charge comes from the

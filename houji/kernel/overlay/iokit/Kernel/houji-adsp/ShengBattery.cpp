@@ -59,7 +59,7 @@ class ShengBattery : public IOPMPowerSource {
     bool wasUp = false, published = false;
     uint32_t refreshes = 0;
     ShengBattmgr bm;
-    uint32_t sdpLimit = 0;
+    uint32_t sdpLimit = 0, fccUa = 0;
     ShengAdspChannel *channel = nullptr;
 
     static void dspState(void *context, int up) {
@@ -111,13 +111,14 @@ class ShengBattery : public IOPMPowerSource {
         static const int milli[13] = {0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0};
         for (unsigned i = 0; i < 13; ++i)
             native_charger_stats[i] = (bm.valid >> charger[i]) & 1 ? (milli[i] ? bm.value[charger[i]] / 1000 : bm.value[charger[i]]) : -1;
-        static const int bits[4] = {BmAuthentic, BmSlaveAuthentic, BmPdVerified, BmInputSuspend};
+        static const int bits[4] = {BmAuthentic, BmVerifyProcess, BmPdVerified, BmInputSuspend};
         int32_t flags = 0;
         for (unsigned i = 0; i < 4; ++i)
             if ((bm.valid >> bits[i]) & 1) flags |= (bm.value[bits[i]] != 0) << i | 1 << (i + 8);
         native_charger_stats[13] = flags;
-        native_charger_stats[14] = (int32_t)(bm.limit_sets | bm.limit_tries << 8 | (uint32_t)(bm.limit_port & 0xff) << 16);
-        native_charger_stats[15] = bm.limit_result;
+        native_charger_stats[14] = (int32_t)((bm.sets_done & 0xff) | (bm.fcc_sent & 0xff) << 8 | (bm.verify_sent & 0xff) << 16 |
+                                             (bm.limit_sets & 0xff) << 24);
+        native_charger_stats[15] = bm.set_result;
     }
     void publish() {
         ShengBatterySnapshot s;
@@ -197,7 +198,7 @@ class ShengBattery : public IOPMPowerSource {
                 self->pump();
                 self->refresh->setTimeoutMS(kRefreshMs);
             }
-            if (!up && self->wasUp) {self->request->cancelTimeout(); sheng_battmgr_init(&self->bm); self->bm.sdp_limit_ua = self->sdpLimit;}
+            if (!up && self->wasUp) {self->request->cancelTimeout(); sheng_battmgr_init(&self->bm); self->bm.sdp_limit_ua = self->sdpLimit; self->bm.fcc_ua = self->fccUa;}
             self->wasUp = up;
         }
         for (;;) {
@@ -239,6 +240,9 @@ public:
         uint32_t ma = 0;
         if (PE_parse_boot_argn("houji_usb_sdp_ma", &ma, sizeof ma)) bm.sdp_limit_ua = ma > 3000 ? 3000000u : ma * 1000u;
         sdpLimit = bm.sdp_limit_ua;
+        unsigned fcc = 1000;
+        PE_parse_boot_argn("houji_fcc_ma", &fcc, sizeof fcc);
+        bm.fcc_ua = fccUa = fcc > 3000 ? 3000000u : fcc * 1000u;
         loop = IOWorkLoop::workLoop();
         ringLock = IOSimpleLockAlloc();
         inbox = IOInterruptEventSource::interruptEventSource(this, &ShengBattery::inboxAction);
