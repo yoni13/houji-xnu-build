@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Wi-Fi bring-up on houji (Xiaomi 14, SM8650): the WCN7850 ("Kiwi v2") on PCIe0. Adapted from UniXNU-sheng's WifiProbe.cpp (SM8550, the same
 // chip on the same controller). Boot argument houji_wifi: 0 off (default), 1 a read-only survey, 2 power and link training, 3 also the
-// endpoint's configuration read, 4 also its BAR and MHI registers, 5 the Wi-Fi module (firmware, scan; USB console "wifi ..." commands).
+// endpoint's configuration read, 4 also its BAR and MHI registers, 5 (default) the Wi-Fi module (firmware, scan, en0; USB console "wifi ..." commands).
 // What differs from sheng, from Linux gcc-sm8650.c, tcsrcc-sm8650.c, icc sm8650.c and the board's devicetree:
 // - GDSC collapse votes at 0x5214c (0x52020 on SM8550); the NoC branches report at 0x10058 / 0x10064 / 0x10074;
 // - the PCIe0 reference clock gate is TCSR 0x1fc0000 + 0x31100; the PCIe memory NoC bus clock manager is SN4 (SN7 on SM8550);
@@ -813,8 +813,9 @@ static void publishWlanNode(void) {
 }
 
 extern "C" void houji_wifi_start(void) {
-    unsigned stage = 0;
-    if (!PE_parse_boot_argn("houji_wifi", &stage, sizeof stage) || !stage || native_wifi_stats[0]) return;
+    unsigned stage = 5;   // Wi-Fi on unless houji_wifi=0 (or a lower stage for bring-up work)
+    PE_parse_boot_argn("houji_wifi", &stage, sizeof stage);
+    if (!stage || native_wifi_stats[0]) return;
     if (stage >= 5) publishWlanNode();
     thread_t thread = nullptr;
     if (kernel_thread_start(wifiThread, reinterpret_cast<void *>(uintptr_t(stage)), &thread) == KERN_SUCCESS) thread_deallocate(thread);
