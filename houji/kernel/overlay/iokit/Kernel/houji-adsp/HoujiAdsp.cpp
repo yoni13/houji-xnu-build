@@ -897,6 +897,15 @@ bool modemStart() {
         const QcomRpmhResource lcx = gLcx, lmx = gLmx;
         gLcx = cx; gLmx = mss;
         rc = vote(cxl, mssl);
+        // The crypto engine's bus clock manager (the node's crypto_ddr path): the secure world authenticates the image with it. A BCM
+        // vote is valid | commit | x << 14 | y; the largest value both fields hold.
+        QcomRpmhResource ce;
+        if (!rc && !qcom_cmd_db_find(copy.bytes, kCmdDbSize, "CE0", &ce)) {
+            gLcx = ce; gLmx = ce;
+            const uint32_t v = 1u << 30 | 1u << 29 | 0x3fffu << 14 | 0x3fffu;
+            rc = vote(v, v);
+            ms[11] = (int32_t)ce.address;
+        } else if (!rc) ms[11] = -1;
         gLcx = lcx; gLmx = lmx;
         if (rc) {mfail(MsRails, rc); return false;}
     }
