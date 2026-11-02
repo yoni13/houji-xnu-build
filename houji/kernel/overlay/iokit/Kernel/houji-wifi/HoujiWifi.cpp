@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Wi-Fi bring-up on houji (Xiaomi 14, SM8650): the WCN7850 ("Kiwi v2") on PCIe0. Adapted from UniXNU-sheng's WifiProbe.cpp (SM8550, the same
 // chip on the same controller). Boot argument houji_wifi: 0 off (default), 1 a read-only survey, 2 power and link training, 3 also the
-// endpoint's configuration read, 4 also its BAR and MHI registers.
+// endpoint's configuration read, 4 also its BAR and MHI registers, 5 the Wi-Fi module (firmware, scan; USB console "wifi ..." commands).
 // What differs from sheng, from Linux gcc-sm8650.c, tcsrcc-sm8650.c, icc sm8650.c and the board's devicetree:
 // - GDSC collapse votes at 0x5214c (0x52020 on SM8550); the NoC branches report at 0x10058 / 0x10064 / 0x10074;
 // - the PCIe0 reference clock gate is TCSR 0x1fc0000 + 0x31100; the PCIe memory NoC bus clock manager is SN4 (SN7 on SM8550);
@@ -18,6 +18,17 @@
 #include <stdint.h>
 #include "WifiPcieTables.h"
 #include "../houji-adsp/QcomRpmh.h"
+#include "nw_abi.h"
+#include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IODeviceTreeSupport.h>
+#include <libkern/c++/OSData.h>
+#include <stdarg.h>
+#include <libkern/libkern.h>
+#include <kern/task.h>
+
+extern "C" int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *);   // HoujiAdsp.cpp: the 2 ms poller
+extern "C" const char *houji_smmu_route_stream(uint16_t stream, uint64_t dma, uint64_t bytes, uint32_t report[3]);   // HoujiUfsRead.cpp
+extern "C" int houji_modem_file(const char *path, uint8_t **data, size_t *size, size_t max);   // AdspFirmware.c
 
 // [0] stage (negative: the step that failed), [1] vote 0x52008, [2] vote 0x52000, [3] GDSC, [4] halt bits (bit i: branch i of kBranches off),
 // [5] pins (WLAN_EN | PERST# << 8 | CLKREQ# << 16, bit 0 input level, bit 1 output), [6] PARF LTSSM, [7] root port vendor/device,
@@ -149,8 +160,341 @@ int powerRails() {
     return (found & 0x7fu) == 0x7fu ? 0 : -3;   // the seven PMU supplies; the antenna rail is best effort
 }
 
+// ---- stage 5: the Wi-Fi module (UniXNU Ath12kWifi) on this board ----
+// It does its own chip power-up, MHI boot, QRTR/QMI and driver start; the board gives it register access, configuration space, DMA memory,
+// firmware files, a clock and a log. DMA: one physically contiguous buffer below 4 GiB (the endpoint addresses 32 bits), seen by the
+// endpoint at its physical address through a pass-through SMMU context of its own (stream 0x1401, houji_smmu_route_stream), and reached by
+// the CPU through an uncached mapping, so neither side needs cache maintenance.
+constexpr unsigned kArenaBlocks = 16384;
+struct Arena {uint8_t *va; uint64_t iova; size_t bytes; struct Block {uint32_t off, size; bool used;} *blocks; unsigned count;} gArena;
+IOBufferMemoryDescriptor *gArenaBuffer;
+IOMemoryMap *gArenaMap;
+void pLog(int level, const char *line);
+void wlog(int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+void wlog(int level, const char *fmt, ...) {
+    char line[160]; va_list ap; va_start(ap, fmt); vsnprintf(line, sizeof line, fmt, ap); va_end(ap);
+    pLog(level, line);
+}
+bool arenaInit() {
+    static const uint32_t sizes[] = {48u << 20, 32u << 20, 24u << 20};
+    for (uint32_t bytes : sizes) {
+        gArenaBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+            kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryMapperNone, bytes, 0x00000000fffff000ull);
+        if (!gArenaBuffer) continue;
+        IOByteCount contiguous = 0;
+        const uint64_t pa = gArenaBuffer->getPhysicalSegment(0, &contiguous, kIOMemoryMapperNone);
+        if (!pa || contiguous < bytes || pa + bytes > 0x100000000ull) {gArenaBuffer->release(); gArenaBuffer = nullptr; continue;}
+        uint8_t *cached = static_cast<uint8_t *>(gArenaBuffer->getBytesNoCopy());
+        bzero(cached, bytes);
+        for (uint64_t off = 0; off < bytes; off += 64) __asm__ volatile("dc civac, %0" :: "r"(cached + off) : "memory");
+        __asm__ volatile("dsb sy" ::: "memory");
+        gArenaMap = gArenaBuffer->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
+        if (!gArenaMap) {gArenaBuffer->release(); gArenaBuffer = nullptr; continue;}
+        gArena.va = reinterpret_cast<uint8_t *>(gArenaMap->getVirtualAddress());
+        gArena.iova = pa;
+        gArena.bytes = bytes;
+        break;
+    }
+    if (!gArenaBuffer) return false;
+    if (!gArena.blocks) gArena.blocks = static_cast<Arena::Block *>(IOMallocData(kArenaBlocks * sizeof(Arena::Block)));
+    if (!gArena.blocks) return false;
+    gArena.blocks[0] = {4096, (uint32_t)(gArena.bytes - 4096), false}; gArena.count = 1;   // the first page is the MSI target
+    return true;
+}
+// Buffers the endpoint uses sit at addresses aligned to their size rounded up to a power of two (the boot loader refuses an image address
+// that is only page aligned).
+void *arenaAlloc(size_t n, uint64_t *bus) {
+    n = (n + 63) & ~(size_t)63;
+    if (n >= 4096) n = (n + 4095) & ~(size_t)4095;
+    uint32_t align = 64;
+    if (n >= 4096) {align = 4096; while (align < n) align <<= 1;}
+    for (unsigned i = 0; i < gArena.count; ++i) {
+        Arena::Block &b = gArena.blocks[i];
+        if (b.used) continue;
+        // alignment is of the bus address
+        const uint64_t busStart = (gArena.iova + b.off + align - 1) & ~(uint64_t)(align - 1);
+        const uint32_t start = (uint32_t)(busStart - gArena.iova), pad = start - b.off;
+        if (b.size < pad + n) continue;
+        const bool tail = b.size > pad + n;
+        const unsigned extra = (pad ? 1u : 0u) + (tail ? 1u : 0u);
+        if (gArena.count + extra > kArenaBlocks) continue;
+        const Arena::Block whole = b;
+        memmove(&gArena.blocks[i + extra], &gArena.blocks[i], (gArena.count - i) * sizeof(Arena::Block));
+        gArena.count += extra;
+        unsigned at = i;
+        if (pad) {gArena.blocks[at] = {whole.off, pad, false}; ++at;}
+        gArena.blocks[at] = {start, (uint32_t)n, true};
+        if (tail) gArena.blocks[at + 1] = {start + (uint32_t)n, whole.size - pad - (uint32_t)n, false};
+        uint8_t *p = gArena.va + start;
+        bzero(p, n);
+        if (bus) *bus = gArena.iova + start;
+        return p;
+    }
+    uint32_t freeTotal = 0, freeMax = 0;
+    for (unsigned i = 0; i < gArena.count; ++i) if (!gArena.blocks[i].used) {freeTotal += gArena.blocks[i].size; if (gArena.blocks[i].size > freeMax) freeMax = gArena.blocks[i].size;}
+    wlog(3, "dma window full: want %zu free %u largest %u blocks %u", n, freeTotal, freeMax, gArena.count);
+    return nullptr;
+}
+void arenaFree(void *p) {
+    if (!p || (uint8_t *)p < gArena.va || (uint8_t *)p >= gArena.va + gArena.bytes) return;
+    const uint32_t off = (uint32_t)((uint8_t *)p - gArena.va);
+    for (unsigned i = 0; i < gArena.count; ++i) {
+        if (gArena.blocks[i].off != off || !gArena.blocks[i].used) continue;
+        gArena.blocks[i].used = false;
+        if (i + 1 < gArena.count && !gArena.blocks[i + 1].used) {gArena.blocks[i].size += gArena.blocks[i + 1].size; memmove(&gArena.blocks[i + 1], &gArena.blocks[i + 2], (gArena.count - i - 2) * sizeof(Arena::Block)); --gArena.count;}
+        if (i > 0 && !gArena.blocks[i - 1].used) {gArena.blocks[i - 1].size += gArena.blocks[i].size; memmove(&gArena.blocks[i], &gArena.blocks[i + 1], (gArena.count - i - 1) * sizeof(Arena::Block)); --gArena.count;}
+        return;
+    }
+}
+
+uint64_t pNow() {uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000000;}
+void pSleep(unsigned ms) {IOSleep(ms);}
+void pPoll() {}
+// The module's log goes to the kernel log (and so to the USB console): levels up to 6 always, debug lines (7) with houji_wifi_debug=1 and
+// only the first 2000. A line equal to one of the last sixteen is only counted, as are the per-channel and per-frame lines.
+uint32_t gLogRepeats, gDebugLines, gDebug;
+bool has(const char *s, const char *w) {for (; *s; ++s) {size_t k = 0; while (w[k] && s[k] == w[k]) ++k; if (!w[k]) return true;} return false;}
+void pLog(int level, const char *line) {
+    if (has(line, "chan scan list") || has(line, "mac channel [")) {++gLogRepeats; return;}
+    if (level >= 7 && (!gDebug || gDebugLines >= 2000 || has(line, "htc rx completion") || has(line, "rx ce pipe") || has(line, "ext irq:") ||
+                       has(line, "event mgmt rx") || has(line, "mgmt rx event") || has(line, "chan info vdev_id") ||
+                       has(line, "scan event foreign channel"))) {++gLogRepeats; return;}
+    static uint32_t recent[16];
+    uint32_t h = 2166136261u;
+    for (const char *c = line; *c; ++c) h = (h ^ static_cast<uint8_t>(*c)) * 16777619u;
+    h ^= static_cast<uint32_t>(level);
+    for (uint32_t r : recent) if (r == h) {++gLogRepeats; return;}
+    memmove(&recent[1], &recent[0], sizeof recent - sizeof recent[0]);
+    recent[0] = h;
+    if (level >= 7) ++gDebugLines;
+    static uint64_t first;
+    const uint64_t now = pNow();
+    if (!first) first = now;
+    IOLog("HOUJI WIFI LOG %u %d %.120s\n", static_cast<uint32_t>(now - first), level, line);
+}
+void pHalt() {for (;;) IOSleep(1000);}
+void *hAlloc(size_t n) {
+    uint8_t *p = static_cast<uint8_t *>(IOMallocData(n + 16));
+    if (!p) return nullptr;
+    *reinterpret_cast<size_t *>(p) = n + 16;
+    return p + 16;
+}
+void hFree(void *q) {
+    if (!q) return;
+    uint8_t *p = static_cast<uint8_t *>(q) - 16;
+    IOFreeData(p, *reinterpret_cast<size_t *>(p));
+}
+void *pDmaAlloc(size_t n, uint64_t *bus) {return arenaAlloc(n, bus);}
+void pDmaFree(size_t, void *p, uint64_t) {arenaFree(p);}
+uint64_t pDmaMap(void *p, size_t, int) {
+    if ((uint8_t *)p < gArena.va || (uint8_t *)p >= gArena.va + gArena.bytes) return 0;
+    return gArena.iova + ((uint8_t *)p - gArena.va);
+}
+void pDmaSync(uint64_t, size_t, int) {}
+
+// Firmware: the stock files in the firmware partition's image/kiwi (Kiwi v2: amss20.bin, phy_ucode20.elf as m3.bin, the global N3 board
+// data bd_n3gl.elf as board.bin, Xiaomi's regdb), read once and kept. The radio's address (wlan_mac.bin) is made from the chip ID.
+struct FwCache {const char *want, *path; uint8_t *data; size_t size; int rc;};
+FwCache gFw[] = {{"amss.bin", "image/kiwi/amss20.bin"}, {"m3.bin", "image/kiwi/phy_ucode20.elf"}, {"board.bin", "image/kiwi/bd_n3gl.elf"},
+                 {"regdb.bin", "image/kiwi/regdb_xiaomi.bin"}};
+bool boardMac(uint8_t m[6]) {
+    IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
+    OSData *id = chosen ? OSDynamicCast(OSData, chosen->getProperty("unique-chip-id")) : nullptr;
+    uint64_t seed = 0;
+    if (id && id->getLength() >= sizeof seed) memcpy(&seed, id->getBytesNoCopy(), sizeof seed);
+    OSSafeReleaseNULL(chosen);
+    if (!seed) seed = 0x686f756a69ull;   // no chip ID published: a fixed seed ("houji")
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (unsigned i = 0; i < 8; ++i) h = (h ^ ((seed >> (8 * i)) & 0xff)) * 0x100000001b3ull;
+    for (unsigned i = 0; i < 6; ++i) m[i] = (uint8_t)(h >> (8 * i));
+    m[0] = (uint8_t)((m[0] & 0xfe) | 0x02);   // locally administered, unicast
+    return true;
+}
+int pFwGet(const char *path, const uint8_t **data, size_t *size) {
+    const char *base = path;
+    for (const char *c = path; *c; ++c) if (*c == '/') base = c + 1;
+    if (!strcmp(base, "wlan_mac.bin")) {
+        static char text[40]; static size_t len;
+        if (!len) {
+            uint8_t m[6];
+            boardMac(m);
+            len = (size_t)snprintf(text, sizeof text, "address=%02x%02x%02x%02x%02x%02x\n", m[0], m[1], m[2], m[3], m[4], m[5]);
+        }
+        *data = (const uint8_t *)text; *size = len;
+        return 0;
+    }
+    for (FwCache &f : gFw) {
+        if (strcmp(base, f.want)) continue;
+        if (!f.data && !f.rc) {
+            uint8_t *bytes = nullptr; size_t n = 0;
+            f.rc = houji_modem_file(f.path, &bytes, &n, 16u << 20);
+            if (!f.rc) {f.data = bytes; f.size = n;}
+            wlog(6, "wifi: firmware %s from %s: %d, %zu bytes", f.want, f.path, f.rc, n);
+        }
+        if (f.rc) return -1;
+        *data = f.data; *size = f.size;
+        return 0;
+    }
+    return -1;
+}
+
+// Configuration space of the endpoint: 32-bit accesses through the iATU window; offsets with bit 31 set are relative to the PCIe capability.
+volatile uint32_t *gCfg;
+uint32_t gPcieCap, gMsiCap;
+bool findCaps() {
+    uint8_t cap = (uint8_t)(gCfg[0x34 / 4] & 0xff);
+    for (unsigned guard = 0; cap >= 0x40 && guard < 48; ++guard) {
+        const uint32_t w = gCfg[cap / 4];
+        if ((uint8_t)w == 0x10) gPcieCap = cap;
+        if ((uint8_t)w == 0x05) gMsiCap = cap;
+        cap = (uint8_t)(w >> 8);
+    }
+    return gPcieCap && gMsiCap;
+}
+int pCfgRead(int off, int size, uint32_t *v) {
+    uint32_t o = (uint32_t)off;
+    if (o & 0x80000000u) o = gPcieCap + (o & 0x7fffffffu);
+    const uint32_t w = gCfg[(o & ~3u) / 4];
+    *v = size == 4 ? w : size == 2 ? (w >> ((o & 2) * 8)) & 0xffff : (w >> ((o & 3) * 8)) & 0xff;
+    return 0;
+}
+int pCfgWrite(int off, int size, uint32_t v) {
+    uint32_t o = (uint32_t)off;
+    if (o & 0x80000000u) o = gPcieCap + (o & 0x7fffffffu);
+    if (size == 4) {gCfg[o / 4] = v; return 0;}
+    const unsigned shift = (size == 2 ? (o & 2) : (o & 3)) * 8;
+    const uint32_t mask = (size == 2 ? 0xffffu : 0xffu) << shift;
+    gCfg[(o & ~3u) / 4] = (gCfg[(o & ~3u) / 4] & ~mask) | ((v << shift) & mask);
+    return 0;
+}
+int pMsiTarget(uint32_t *lo, uint32_t *hi, uint32_t *data) {*lo = (uint32_t)gArena.iova; *hi = (uint32_t)(gArena.iova >> 32); *data = 0; return 0;}
+
+// The endpoint's MSIs: the root complex's own MSI receiver takes inbound writes to MSI_ADDR (the arena's first page), sets bit <data> of
+// controller 0's status and raises PCIe0's msi0 line (SPI 141). This kernel has no GIC attach, so the handler runs from the 2 ms poller
+// (armcpu_spi_attach in HoujiAdsp.cpp); it clears the status and wakes the Wi-Fi thread.
+constexpr uint32_t kMsiAddrLo = 0x820, kMsiAddrHi = 0x824, kMsiEnable0 = 0x828, kMsiMask0 = 0x82c, kMsiStatus0 = 0x830, kMsiSpi = 141;
+volatile uint32_t *gMsiDbi;
+volatile uint32_t gMsiCount, gMsiBits, gMsiWake;
+bool gMsiAttached;
+void msiIrq(void *) {
+    const uint32_t status = gMsiDbi[kMsiStatus0 / 4];
+    if (!status) return;
+    gMsiDbi[kMsiStatus0 / 4] = status;
+    gMsiCount = gMsiCount + 1;
+    gMsiBits = gMsiBits | status;
+    gMsiWake = 1;
+    thread_wakeup(event_t(&gMsiWake));
+}
+int msiAttach(volatile uint32_t *dbi) {
+    gMsiDbi = dbi;
+    dbi[kMsiAddrLo / 4] = uint32_t(gArena.iova);
+    dbi[kMsiAddrHi / 4] = uint32_t(gArena.iova >> 32);
+    dbi[kMsiMask0 / 4] = 0;
+    dbi[kMsiEnable0 / 4] = 0xffffffffu;
+    const int rc = armcpu_spi_attach(32 + kMsiSpi, false, msiIrq, nullptr, nullptr, nullptr);
+    gMsiAttached = rc == 0;
+    return rc;
+}
+void msiWait(unsigned ms) {
+    if (__atomic_exchange_n(&gMsiWake, 0u, __ATOMIC_ACQ_REL)) return;
+    assert_wait_timeout(event_t(&gMsiWake), THREAD_UNINT, ms, NSEC_PER_MSEC);
+    if (__atomic_exchange_n(&gMsiWake, 0u, __ATOMIC_ACQ_REL)) {clear_wait(current_thread(), THREAD_AWAKENED); return;}
+    thread_block(THREAD_CONTINUE_NULL);
+    gMsiWake = 0;
+}
+
+// Requests from the USB console (houji_wifi_command), taken by the Wi-Fi thread between steps.
+struct Command {char text[128]; volatile uint32_t pending;} gCommand;
+volatile uint32_t gScanDone;
+void onScanDone() {gScanDone = 1;}
+void onConnectDone(int result) {wlog(5, "wifi: connect done: result %d", result);}
+void onLinkLost(int reason) {wlog(5, "wifi: link lost: reason %d", reason);}
+void onRx(const uint8_t *, size_t) {}
+void listScan() {
+    const int n = nw_wifi_bss_count();
+    wlog(5, "wifi: scan found %d networks", n);
+    nw_bss_info *b = static_cast<nw_bss_info *>(IOMallocData(sizeof(nw_bss_info)));
+    if (!b) return;
+    for (int i = 0; i < n && i < 40; ++i) {
+        if (nw_wifi_bss_get(i, b)) continue;
+        char ssid[33];
+        memcpy(ssid, b->ssid, b->ssid_len > 32 ? 32 : b->ssid_len); ssid[b->ssid_len > 32 ? 32 : b->ssid_len] = 0;
+        wlog(5, "wifi: bss %02x:%02x:%02x:%02x:%02x:%02x %u MHz %d dBm '%s'", b->bssid[0], b->bssid[1], b->bssid[2], b->bssid[3], b->bssid[4],
+             b->bssid[5], b->freq_mhz, b->signal_dbm, ssid);
+    }
+    IOFreeData(b, sizeof(nw_bss_info));
+}
+void runCommand(char *t) {
+    // "scan", "join SSID PASSWORD" (no password: an open network), "leave", "status"
+    char *argv[3] = {}; unsigned argc = 0;
+    for (char *p = t; *p && argc < 3;) {
+        while (*p == ' ') *p++ = 0;
+        if (!*p) break;
+        argv[argc++] = p;
+        if (argc == 3) break;
+        while (*p && *p != ' ') ++p;
+    }
+    if (!argc) return;
+    if (!strcmp(argv[0], "scan")) wlog(5, "wifi: scan requested: %d", nw_wifi_scan(nullptr, 0));
+    else if (!strcmp(argv[0], "join") && argc >= 2) {
+        const int r = nw_wifi_connect((const uint8_t *)argv[1], strlen(argv[1]), nullptr, argc == 3 ? argv[2] : nullptr, argc == 3 ? strlen(argv[2]) : 0);
+        wlog(5, "wifi: join '%s' (%s) requested: %d", argv[1], argc == 3 ? "WPA2" : "open", r);
+    } else if (!strcmp(argv[0], "leave")) {nw_wifi_disconnect(); wlog(5, "wifi: leave requested");}
+    else if (!strcmp(argv[0], "status")) {
+        nw_wifi_status st; nw_wifi_status_get(&st);
+        char ssid[33];
+        memcpy(ssid, st.ssid, st.ssid_len > 32 ? 32 : st.ssid_len); ssid[st.ssid_len > 32 ? 32 : st.ssid_len] = 0;
+        wlog(5, "wifi: state %u result %d '%s' %u MHz %d dBm mac %02x:%02x:%02x:%02x:%02x:%02x channels %u", st.state, st.result, ssid,
+             st.freq_mhz, st.signal_dbm, st.mac[0], st.mac[1], st.mac[2], st.mac[3], st.mac[4], st.mac[5], st.channels);
+    } else wlog(4, "wifi: unknown command '%s'", argv[0]);
+    bzero(t, sizeof gCommand.text);   // a password does not stay in memory
+}
+
+void wifiStack(volatile uint32_t *m, uint64_t barBytes, volatile uint32_t *cfg, volatile uint32_t *dbi) {
+    gCfg = cfg;
+    PE_parse_boot_argn("houji_wifi_debug", &gDebug, sizeof gDebug);
+    if (!arenaInit()) {native_wifi_stats[0] = (uint32_t)-20; return;}
+    uint32_t route[3] = {};
+    const char *why = houji_smmu_route_stream(0x1401, gArena.iova, gArena.bytes, route);
+    wlog(6, "wifi: DMA window %llx + %zu MiB, stream 0x1401 route %s slot %u bank %u", (unsigned long long)gArena.iova, gArena.bytes >> 20,
+         why ? why : "ok", route[0] & 0xffff, route[0] >> 16);
+    if (why) {native_wifi_stats[0] = (uint32_t)-21; return;}
+    if (!findCaps()) {native_wifi_stats[0] = (uint32_t)-22; return;}
+    static const struct lx_platform plat = {pNow, pSleep, pPoll, pLog, pHalt, hAlloc, hFree, pDmaAlloc, pDmaFree, pDmaMap, pDmaSync, pFwGet};
+    static struct nw_board board;
+    board.bar = const_cast<uint32_t *>(m); board.bar_len = barBytes; board.device_id = (uint16_t)(gCfg[0] >> 16); board.msi_cap = (uint16_t)gMsiCap;
+    board.irq_base = 1000;
+    board.cfg_read = pCfgRead; board.cfg_write = pCfgWrite; board.msi_target = pMsiTarget; board.map_phys = nullptr;
+    static const struct nw_wifi_events events = {onScanDone, onConnectDone, onLinkLost, onRx};
+    nw_wifi_set_events(&events);
+    native_wifi_stats[0] = 20;
+    const int r = nw_wifi_start(&plat, &board);
+    native_wifi_stats[0] = r ? (uint32_t)(0x80000000u | (uint32_t)(-r & 0xffff)) : 21;
+    wlog(5, "wifi: module start %d", r);
+    if (r) return;
+    const int msi = msiAttach(dbi);
+    wlog(6, "wifi: MSI receiver %s", msi ? "not attached, polling" : "attached (SPI 141 through the 2 ms poller)");
+    bool scanned = false;
+    uint64_t nextReport = 0;
+    for (uint64_t n = 0;; ++n) {
+        const int busy = nw_wifi_step();
+        if (!scanned && nw_wifi_stats.stage >= 4) {scanned = true; wlog(5, "wifi: driver up, first scan: %d", nw_wifi_scan(nullptr, 0));}
+        if (__atomic_exchange_n(&gScanDone, 0u, __ATOMIC_ACQ_REL)) listScan();
+        if (__atomic_load_n(&gCommand.pending, __ATOMIC_ACQUIRE)) {runCommand(gCommand.text); __atomic_store_n(&gCommand.pending, 0u, __ATOMIC_RELEASE);}
+        if (!busy) {if (gMsiAttached) msiWait(10); else IOSleep(1);}
+        const uint64_t now = pNow();
+        if (now >= nextReport) {
+            nextReport = now + 30000;
+            wlog(6, "wifi: stage %u scans %u frames %u beacons %u bss %u err %d; %u MSIs, vectors %08x, %u repeats",
+                 nw_wifi_stats.stage, nw_wifi_stats.scans, nw_wifi_stats.frames, nw_wifi_stats.beacons, nw_wifi_stats.bss_seen,
+                 nw_wifi_stats.last_err, gMsiCount, gMsiBits, gLogRepeats);
+        }
+        if ((n & 63) == 0) native_wifi_stats[1] = nw_wifi_stats.stage | nw_wifi_stats.scans << 8 | nw_wifi_stats.bss_seen << 16;
+    }
+}
+
 // Stage 4: forward the memory window to bus 1, give BAR0 an address in it, memory decoding and bus mastering on, read the MHI registers.
-void endpointProbe(volatile uint32_t *a, volatile uint32_t *c, volatile uint32_t *d) {
+void endpointProbe(volatile uint32_t *a, volatile uint32_t *c, volatile uint32_t *d, unsigned stage) {
     volatile uint32_t *r1 = a + 0x200 / 4;   // outbound iATU region 1: memory, the same PCI addresses
     r1[0x08 / 4] = uint32_t(kMemBase);
     r1[0x0c / 4] = uint32_t(kMemBase >> 32);
@@ -180,6 +524,7 @@ void endpointProbe(volatile uint32_t *a, volatile uint32_t *c, volatile uint32_t
     static const uint32_t regs[7] = {0x00, 0x08, 0x10, 0x28, 0x2c, 0x38, 0x48};
     for (unsigned i = 0; i < 7; ++i) native_wifi_stats[25 + i] = bar.va[regs[i] / 4];
     native_wifi_stats[0] = 19;
+    if (stage >= 5) {wifiStack(bar.va, size < 0x200000 ? size : 0x200000, c, d); return;}   // runs for good: the windows stay mapped
     release(bar);
 }
 
@@ -326,7 +671,7 @@ void bringUp(Window &gcc, Window &tlmm, unsigned stage) {
         for (unsigned i = 0; i < 5 && !(a[0x04 / 4] & (1u << 31)); ++i) IODelay(10);
         native_wifi_stats[15] = config.va[0];
         native_wifi_stats[0] = 17;
-        if (stage >= 4 && (config.va[0] & 0xffff) == 0x17cb) endpointProbe(a, config.va, d);
+        if (stage >= 4 && (config.va[0] & 0xffff) == 0x17cb) endpointProbe(a, config.va, d, stage);
     } else native_wifi_stats[0] = (uint32_t)-17;
     release(config); release(atu); release(dbi); release(parf);
 }
@@ -370,4 +715,13 @@ extern "C" void houji_wifi_report(void) {
           (int)s[0], s[1], s[2], s[3], s[4], s[5], s[10], s[11], s[12], s[13], s[14], s[16], s[7], s[15]);
     IOLog("HOUJI WIFI RAILS: found=%x clk=%x rsc=%x sid=%x pipe=%x lnk=%x parf=%x/%x bar=%x/%x cmd=%x mhi=%x %x %x %x %x %x %x\n",
           s[17], s[18], s[19], s[20], s[21], s[8], s[6], s[9], s[22], s[23], s[24], s[25], s[26], s[27], s[28], s[29], s[30], s[31]);
+}
+
+// A request from the USB console ("wifi scan", "wifi join SSID PASSWORD", "wifi leave", "wifi status"): handed to the Wi-Fi thread.
+extern "C" void houji_wifi_command(const char *text) {
+    if (__atomic_load_n(&gCommand.pending, __ATOMIC_ACQUIRE) || native_wifi_stats[0] != 21) {IOLog("HOUJI WIFI: not ready for a command\n"); return;}
+    strlcpy(gCommand.text, text, sizeof gCommand.text);
+    __atomic_store_n(&gCommand.pending, 1u, __ATOMIC_RELEASE);
+    gMsiWake = 1;
+    thread_wakeup(event_t(&gMsiWake));
 }

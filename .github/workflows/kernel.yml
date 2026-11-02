@@ -16,6 +16,7 @@ permissions:
 env:
   XNU_REV: 1b191cb58250d0705d8a51287127505aa4bc0789
   DXB_REV: 663906528d1cd5ea8fde7de6f16de73db9511549
+  ATH12K_WIFI_REV: f6bf561f92cc42761bdd417fce1d53fe1db9477c
   MACOS_VERSION: '13.5'
   KERNEL_CONFIG: DEVELOPMENT
   ARCH_CONFIG: ARM64
@@ -57,6 +58,14 @@ jobs:
           git -C dxb/xnu init -q && git -C dxb/xnu add -A >/dev/null && git -C dxb/xnu -c user.email=ci@local -c user.name=ci commit -qm houji
           openssl enc -d -aes-256-cbc -pbkdf2 -pass env:FW_KEY -in fwheaders.tar.gz.enc | tar -xzf - -C dxb/xnu/iokit/Kernel/houji-ufs-root/
           ls -la dxb/xnu/iokit/Kernel/houji-ufs-root/Houji*Firmware*.h
+          # prebuilt objects (the Wi-Fi module) join the iokit component's link list
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('dxb/xnu/iokit/conf/Makefile.template'); s = p.read_text()
+          old = '\tdone > $(COMPONENT).filelist\n'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, old + '\t$(_v)for obj in $(HOUJI_EXTRA_OBJS); do $(ECHO) $${obj}; done >> $(COMPONENT).filelist\n'))
+          PY
           grep -n kHoujiRootFirst dxb/xnu/iokit/Kernel/houji-ufs-root/HoujiRootPolicy.h
         env:
           FW_KEY: ${{ secrets.FW_KEY }}
@@ -78,6 +87,16 @@ jobs:
           bash build.sh 2>&1 | tee ../deps-build.log
           ls fakeroot/usr/local/bin fakeroot/usr/local/lib/kernel
           ls -d /Library/Developer/KDKs/*
+      - name: Build Wi-Fi module (UniXNU Ath12kWifi)
+        run: |
+          set -euo pipefail
+          brew --prefix llvm >/dev/null 2>&1 || brew install llvm
+          git init -q ath12k-wifi
+          git -C ath12k-wifi fetch -q --depth 1 https://github.com/UniXNU/Ath12kWifi.git "$ATH12K_WIFI_REV"
+          git -C ath12k-wifi checkout -q FETCH_HEAD
+          python3 houji/tools/build-ath12k.py ath12k-wifi out/ath12k | tee ath12k-build.log
+          test -f out/ath12k/houji_ath12k.o
+          echo "HOUJI_EXTRA_OBJS=$PWD/out/ath12k/houji_ath12k.o" >> "$GITHUB_ENV"
       - name: Build houji kernel
         run: |
           set -o pipefail
@@ -97,7 +116,7 @@ jobs:
           k=out/kernel/fakeroot/System/Library/Kernels/kernel.development.sweet
           [ -f "$k" ] || k=out/kernel/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet
           if [ -f "$k" ]; then cp "$k" artifact/kernel.development.sweet; file artifact/kernel.development.sweet; shasum -a 256 artifact/kernel.development.sweet > artifact/SHA256SUMS; fi
-          cp deps-build.log kernel-build.log artifact/ 2>/dev/null || true
+          cp deps-build.log kernel-build.log ath12k-build.log artifact/ 2>/dev/null || true
           tail -c 200000 kernel-build.log > artifact/kernel-build-tail.log 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         if: always()

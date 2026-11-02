@@ -21,4 +21,4 @@ make -C "$HOUJI_XNU" install -j"${HOUJI_JOBS:-8}" \
   SYSCTL_HW_LOGICALCPU="$(sysctl -n hw.logicalcpu)" KERNEL_BUILDS_IN_PARALLEL=1 \
   CTFCONVERT="$HOUJI_FAKEROOT/usr/local/bin/ctfconvert" \
   CTFMERGE="$HOUJI_FAKEROOT/usr/local/bin/ctfmerge" CTFDUMP="$HOUJI_FAKEROOT/usr/local/bin/ctfdump" \
-  IIG="$port_root/tools/iig-darwin22.py"
+  IIG="$port_root/tools/iig-darwin22.py" HOUJI_EXTRA_OBJS="${HOUJI_EXTRA_OBJS:-}"

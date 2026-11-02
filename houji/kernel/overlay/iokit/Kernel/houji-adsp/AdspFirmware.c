@@ -8,6 +8,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <IOKit/IOLib.h>
+#include <kern/locks.h>
 #include "FatVolume.h"
 #include "QcomMdt.h"
 
@@ -27,6 +28,22 @@ struct partition {
 };
 static struct partition *gPart;
 static FatVolume *gVolume;
+// The ADSP and Wi-Fi threads share the volume and its one-block cache.
+static lck_grp_t *gFwLockGroup;
+static lck_mtx_t *gFwLock;
+static void fwLock(void)
+{
+    if (!__atomic_load_n(&gFwLock, __ATOMIC_ACQUIRE)) {
+        static int once;
+        if (!__atomic_exchange_n(&once, 1, __ATOMIC_ACQ_REL)) {
+            gFwLockGroup = lck_grp_alloc_init("houji-fw", LCK_GRP_ATTR_NULL);
+            __atomic_store_n(&gFwLock, lck_mtx_alloc_init(gFwLockGroup, LCK_ATTR_NULL), __ATOMIC_RELEASE);
+        }
+        while (!__atomic_load_n(&gFwLock, __ATOMIC_ACQUIRE)) IODelay(100);
+    }
+    lck_mtx_lock(gFwLock);
+}
+static void fwUnlock(void) {lck_mtx_unlock(gFwLock);}
 
 // Bytes of the partition: whole blocks straight into to, the ends of a range through the one-block cache.
 static int partitionRead(void *context, uint64_t offset, void *to, size_t length)
@@ -122,7 +139,9 @@ int sheng_fw_open(const char *path, void **handle, uint64_t *size)
 {
     if (strncmp(path, "modem:", 6)) return ENOENT;
     struct sheng_fw *fw = IOMallocType(struct sheng_fw);
+    fwLock();
     const int error = openModem(path + 6, &fw->modem, size);
+    fwUnlock();
     if (error) {IOFreeType(fw, struct sheng_fw); return error;}
     *handle = fw;
     return 0;
@@ -131,7 +150,10 @@ int sheng_fw_open(const char *path, void **handle, uint64_t *size)
 int sheng_fw_read(void *handle, uint64_t offset, void *to, size_t length)
 {
     struct sheng_fw *fw = handle;
-    return qcom_mdt_split_read(&fw->modem->split, pieceRead, fw->modem, offset, to, length) ? EIO : 0;
+    fwLock();
+    const int rc = qcom_mdt_split_read(&fw->modem->split, pieceRead, fw->modem, offset, to, length) ? EIO : 0;
+    fwUnlock();
+    return rc;
 }
 
 void sheng_fw_close(void *handle)
@@ -140,4 +162,26 @@ void sheng_fw_close(void *handle)
     if (!fw) return;
     if (fw->modem) IOFreeType(fw->modem, struct modem_image);
     IOFreeType(fw, struct sheng_fw);
+}
+
+// A whole file of the firmware partition (such as "image/kiwi/amss20.bin"), read into memory from IOMallocData; the caller frees it with
+// IOFreeData(*data, *size). Returns 0, ENXIO while the storage driver is not up yet, ENOENT, EFBIG (over max bytes), ENOMEM or EIO.
+int houji_modem_file(const char *path, uint8_t **data, size_t *size, size_t max)
+{
+    fwLock();
+    int rc = mountPartition();
+    FatFile file;
+    if (!rc) {
+        const int found = fat_open(gVolume, path, &file);
+        rc = found == FatNotFound ? ENOENT : found ? EIO : 0;
+    }
+    uint8_t *bytes = NULL;
+    if (!rc && (!file.size || file.size > max)) rc = EFBIG;
+    if (!rc && !(bytes = IOMallocData(file.size))) rc = ENOMEM;
+    if (!rc && fat_read(gVolume, &file, 0, bytes, file.size)) {IOFreeData(bytes, file.size); rc = EIO;}
+    fwUnlock();
+    if (rc) return rc;
+    *data = bytes;
+    *size = file.size;
+    return 0;
 }
