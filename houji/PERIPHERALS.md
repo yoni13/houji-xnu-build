@@ -31,19 +31,19 @@ reads released. `houji_buttons=0` turns it off.
 ## GPS — started
 GNSS runs in the modem (MPSS). Done: the stock modem image is read from `modemfirmware_a` and placed against the devicetree
 carveouts without starting anything (`HOUJI MODEM: stage=3`, 162 MB, 36 segments, relocatable, span = the 0xf400000 mpss region).
-Modem start (`houji_modem=2`, opt-in; `HoujiAdsp.cpp` "the modem (MPSS)") is written and runs up to the secure world's image check:
-SMP2P 435/428 and the MPSS doorbells, AOSS `load_state modem`, CX and MSS rail votes plus a CE0 (crypto engine) bus vote, SCM MP assign
-of the DSM and qlink regions to MSS_MSA (accepted), the rmtfs buffer at 0xd7c00000 shared HLOS + MSA (accepted), the four EFS
-partitions read into RAM, QRTR with the locator and an rmtfs QMI server ready. Blocked at `PAS_INIT_IMAGE` for both the modem dtb
-(PAS 0x26) and the modem (PAS 4); the ADSP's identical call succeeds. Results so far:
-- metadata in cached memory, any address: x0 0xffcfffbb (−69);
-- with an SHM bridge we create (SCM 0x0c/0x1e accepted): x0 0xffcffff6 (−10) — mainline says the hypervisor bridges PIL buffers
-  itself and refuses an already bridged one, which matches;
-- normal non-cacheable below 4 GiB, no bridge (mainline's own allocation): −69 again;
-- a device-memory (kIOMapInhibitCache) buffer panics on the unaligned metadata copy; probing PAS_IS_SUPPORTED/SHUTDOWN (both
-  supported) once preceded a reset, so it is no longer done.
-Still to try: what differs for the modem in the hypervisor's view (mainline's `qcom_pas_context`/tzmem handling on Gunyah targets,
-the stock downstream pas driver's MPSS path and its extra votes), then the steps below.
+The modem runs (`houji_modem=2`, opt-in; `HoujiAdsp.cpp` "the modem (MPSS)" and "GNSS"):
+- start: SMP2P 435/428 and the MPSS doorbells, AOSS `load_state modem`, CX/MSS votes and a CE0 bus vote, SCM MP assign of the DSM and
+  qlink regions to MSS_MSA and of the rmtfs buffer (0xd7c00000) to HLOS + MSA, the dtb (PAS 0x26) then the modem (PAS 4). Verified:
+  ready about 1.05 s after the start, GLINK and QRTR up, 52 services announced (LOC 0x10 among them).
+- The PAS metadata must lie below 4 GiB (Xiaomi's driver: dma_phys_below_32b) in normal non-cacheable memory and must not be in an SHM
+  bridge of our own. This kernel's RAM is above 4 GiB, so the metadata goes to fixed pages at 0xd7a00000 / 0xd7a10000 (unused RAM
+  outside the UEFI map). Above 4 GiB the secure world answered 0xffcfffbb; with our own bridge 0xffcffff6.
+- rmtfs (QMI service 14): `/boot/modem_fs1`, `fs2`, `fsg`, `fsc` served from RAM copies of modemst1/2, fsg, fsc; iovec buffer
+  fields are physical addresses. Verified: 4 MiB read, 8 MiB written (kept in RAM, never written to UFS); no modem crash.
+- LOC client: register (stock fields HAL/1/0), 0x3b (the engine answers lock ALL), 0xbf, 0x36, SET_ENGINE_LOCK none (0x3a), START
+  (0x22) — all accepted. No position or satellite reports follow yet.
+Next: the QRTR TFTP file service for the modem's MCFG requests before MPSS starts (SteamOS: needed before satellites were reported),
+then time injection once the iOS clock is network-synced, then the iOS side.
 Remaining steps once the modem starts (the SteamOS port shows each is required):
 1. rmtfs: a QMI server (QRTR) giving the modem its EFS partitions `modemst1`, `modemst2`, `fsg`, `fsc`; writes kept in RAM first.
 2. A QRTR file server for the modem's MCFG requests (SteamOS: `tqftpserv-mbnconfig.patch`).
