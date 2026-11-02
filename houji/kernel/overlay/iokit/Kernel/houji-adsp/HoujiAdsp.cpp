@@ -820,9 +820,10 @@ void rmtfsReceive(void *, QcomQrtr *q, uint32_t port, uint32_t node, uint32_t fr
         if (ok) {count = v[0]; if (1 + 12 * count != vsize && vsize >= 4) {memcpy(&count, v, 4); skip = 4;} ok = skip + 12 * count == vsize;}
         for (uint32_t i = 0; ok && i < count; ++i) {
             uint32_t e[3]; memcpy(e, v + skip + 12 * i, 12);
+            // the second word is the buffer's physical address (rmtfs: phys_address - the region's base), not an offset
             const uint64_t off = (uint64_t)e[0] * 512, bytes = (uint64_t)e[2] * 512;
-            if (off + bytes > gRmtfs[caller].size || (uint64_t)e[1] + bytes > kRmtfsSize) {ok = false; break;}
-            volatile uint8_t *shared = gRmtfsMem.va + e[1];
+            if (e[1] < kRmtfsBase || off + bytes > gRmtfs[caller].size || (uint64_t)e[1] - kRmtfsBase + bytes > kRmtfsSize) {ok = false; break;}
+            volatile uint8_t *shared = gRmtfsMem.va + (e[1] - kRmtfsBase);
             if (dir[0] == 0) {for (uint64_t k = 0; k < bytes; ++k) shared[k] = gRmtfs[caller].data[off + k]; ms[9] = ms[9] + (int32_t)(bytes >> 10);}
             else {for (uint64_t k = 0; k < bytes; ++k) gRmtfs[caller].data[off + k] = shared[k]; ms[10] = ms[10] + (int32_t)(bytes >> 10);}
         }
