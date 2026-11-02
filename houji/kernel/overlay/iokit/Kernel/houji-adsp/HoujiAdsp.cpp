@@ -903,8 +903,21 @@ bool modemStart() {
     qcom_qrtr_add_service(&gMQrtr, QCOM_SERVLOC_SERVICE, QCOM_SERVLOC_INSTANCE, 1, mlocator, nullptr);
     qcom_qrtr_add_service(&gMQrtr, 14, 1, 2, rmtfsReceive, nullptr);
     ms[0] = MsRmtfs;
+    {   // what the secure world says about the two PAS ids, then a shutdown of each in case an earlier stage left one initialised
+        char text[96];
+        const ScmResult a = scm(QCOM_SCM_PAS_IS_SUPPORTED, qcom_scm_args(1, 0, 0, 0), kMPasDtb, 0, 0);
+        const ScmResult b = scm(QCOM_SCM_PAS_IS_SUPPORTED, qcom_scm_args(1, 0, 0, 0), kMPas, 0, 0);
+        const ScmResult c = scm(QCOM_SCM_PAS_SHUTDOWN, qcom_scm_args(1, 0, 0, 0), kMPasDtb, 0, 0);
+        const ScmResult d = scm(QCOM_SCM_PAS_SHUTDOWN, qcom_scm_args(1, 0, 0, 0), kMPas, 0, 0);
+        snprintf(text, sizeof text, "supp %llx/%llx %llx/%llx shut %llx %llx", (unsigned long long)a.x0, a.x1, (unsigned long long)b.x0, b.x1,
+                 (unsigned long long)c.x0, (unsigned long long)d.x0);
+        mnote("pas ", text);
+    }
     if ((rc = authenticateHeader(gMDtbImage, kMPasDtb, kMDtbBase)) || (rc = loadSegments(gMDtbImage, kMDtbBase, kMDtbSize)) ||
-        (rc = scmOk(scm(QCOM_SCM_PAS_AUTH_AND_RESET, qcom_scm_args(1, 0, 0, 0), kMPasDtb, 0, 0)) ? 0 : -3)) {mfail(MsDtb, rc); return false;}
+        (rc = scmOk(scm(QCOM_SCM_PAS_AUTH_AND_RESET, qcom_scm_args(1, 0, 0, 0), kMPasDtb, 0, 0)) ? 0 : -3)) {
+        char text[40]; snprintf(text, sizeof text, " | x0 %x x1 %x", (unsigned)native_adsp_stats[13], (unsigned)native_adsp_stats[14]);
+        strlcat(native_mpss_text, text, sizeof native_mpss_text);
+        mfail(MsDtb, rc); return false;}
     ms[0] = MsDtb;
     if ((rc = authenticateHeader(gMImage, kMPas, kMBase)) || (rc = loadSegments(gMImage, kMBase, kMSize))) {mfail(MsLoaded, rc); return false;}
     ms[0] = MsLoaded;
