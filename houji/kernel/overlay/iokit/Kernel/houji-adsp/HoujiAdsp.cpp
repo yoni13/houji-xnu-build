@@ -922,7 +922,9 @@ void locStep() {
     case 2: {const uint32_t lock = 3; n += tlv(b, 0x10, &lock, 4); locSend(0x3b, b, n); break;}
     case 3: locSend(0xbf, nullptr, 0); break;
     case 4: locSend(0x36, nullptr, 0); break;
-    case 5: {
+    case 5: {   // the engine answered status 7 (engine locked): lock none (1) for the subscription the stock query names (3)
+        const uint32_t none = 1, sub = 3; n += tlv(b + n, 0x01, &none, 4); n += tlv(b + n, 0x10, &sub, 4); locSend(0x3a, b, n); break; }
+    case 6: {
         const uint8_t session = 1; const uint32_t periodic = 1, accuracy = 3, intermediate = 1, interval = 1000, altitude = 2;
         n += tlv(b + n, 0x01, &session, 1); n += tlv(b + n, 0x10, &periodic, 4); n += tlv(b + n, 0x11, &accuracy, 4);
         n += tlv(b + n, 0x12, &intermediate, 4); n += tlv(b + n, 0x13, &interval, 4); n += tlv(b + n, 0x15, &altitude, 4);
@@ -942,13 +944,13 @@ void locReceive(void *, QcomQrtr *, uint32_t, uint32_t, uint32_t, const uint8_t 
         // setup answers are informational (SteamOS goes on whatever they say); registration and start must succeed
         if (result && (m.message == 0x21 || m.message == 0x22)) {gs[8] = error; gs[0] = -(int32_t)m.message; return;}
         if (m.message == 0x22) {
-            gs[0] = 6;
+            gs[0] = 7;
             unsigned seconds = 300; PE_parse_boot_argn("houji_gps_seconds", &seconds, sizeof seconds);
             clock_interval_to_deadline(seconds, kSecondScale, &gLocStopAt);
             return;
         }
-        if (m.message == 0x23) {gs[0] = 7; return;}
-        if (gs[0] >= 1 && gs[0] < 5) {gs[0] = gs[0] + 1; locStep();}
+        if (m.message == 0x23) {gs[0] = 8; return;}
+        if (gs[0] >= 1 && gs[0] < 6) {gs[0] = gs[0] + 1; locStep();}
         return;
     }
     if (m.type != QCOM_QMI_INDICATION) return;
@@ -956,7 +958,10 @@ void locReceive(void *, QcomQrtr *, uint32_t, uint32_t, uint32_t, const uint8_t 
     static uint8_t seen[512 / 8];
     if (m.message < 512 && !(seen[m.message / 8] & (1u << (m.message % 8)))) {
         seen[m.message / 8] |= 1u << (m.message % 8);
-        IOLog("HOUJI GPS: first indication 0x%x (%u bytes)\n", m.message, m.length);
+        char hex[100]; unsigned at = 0;
+        if (m.message != 0x24) for (uint32_t i = 0; i < m.length && at + 3 < sizeof hex; ++i) at += (unsigned)snprintf(hex + at, sizeof hex - at, "%02x", m.tlvs[i]);
+        hex[at] = 0;
+        IOLog("HOUJI GPS: first indication 0x%x (%u bytes) %s\n", m.message, m.length, hex);
     }
     if (m.message == 0x24) {   // position report
         gs[1] = gs[1] + 1;
@@ -989,7 +994,7 @@ void locService() {
         gs[0] = 1;
         locStep();
     }
-    if (gs[0] == 6 && gLocStopAt && mach_absolute_time() > gLocStopAt) {
+    if (gs[0] == 7 && gLocStopAt && mach_absolute_time() > gLocStopAt) {
         const uint8_t session = 1; uint8_t b[8]; const uint16_t n = tlv(b, 0x01, &session, 1);
         locSend(0x23, b, n);
         gLocStopAt = 0;
