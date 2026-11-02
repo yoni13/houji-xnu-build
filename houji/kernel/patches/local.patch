@@ -31,7 +31,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 index 4427401..06abb0f 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -103,7 +103,13 @@ bsd/dev/dtrace/fasttrap.c		optional config_dtrace
+@@ -103,7 +103,14 @@ bsd/dev/dtrace/fasttrap.c		optional config_dtrace
  
  bsd/dev/random/randomdev.c		standard
  
@@ -39,6 +39,7 @@ index 4427401..06abb0f 100644
 +bsd/dev/houji_usb_debug.c			standard
 +bsd/dev/houji_ram_upload.c		standard
 +bsd/dev/houji_upload_test_target.c	standard
++bsd/dev/houji_route_probe.c		standard
  bsd/dev/memdev.c			standard
 +bsd/dev/houji_ram_root.c		standard
 +bsd/dev/houji_ram_root_xnu.c	standard

@@ -42,6 +42,7 @@ extern "C" {
 extern "C" void native_wifi_logf(int level, const char *fmt, ...);   // HoujiWifi.cpp
 extern "C" void sheng_wifi_wake(void);   // HoujiWifi.cpp: the Wi-Fi thread sends the queued frame now
 extern "C" void houji_wifi_on_scan_done(void);
+extern "C" void houji_route_describe(uint32_t addr_be, unsigned int ifscope, char *out, size_t size);   // houji_route_probe.c
 extern "C" void houji_wifi_on_connect_done(int result);
 extern "C" void houji_wifi_on_link_lost(int reason);
 
@@ -507,6 +508,10 @@ void log_traffic() {
   log(6, "wifi-net: out arp %u ip4 %u dhcp %u ip6 %u other %u", gKindsOut.arp, gKindsOut.ip4, gKindsOut.dhcp, gKindsOut.ip6, gKindsOut.other);
   log(6, "wifi-net: input stalls %u, kicks %u, cleared after a kick %u, longest %u s", gStall.count, gStall.kicks, gStall.cleared, gStall.longest);
   log(6, "wifi-net: rx no buffer %u, chained %u, longest frame %u", gRxNoBuffer, gRxChains, gRxLongest);
+  { char r1[96], r2[96], r3[96]; const unsigned scope = ifnet_index(gIf);
+    houji_route_describe(0x01010101u, 0, r1, sizeof r1); houji_route_describe(0x0101a8c0u, 0, r2, sizeof r2);
+    houji_route_describe(0x01010101u, scope, r3, sizeof r3);
+    log(6, "wifi-net: route 1.1.1.1: %s; 192.168.1.1: %s; 1.1.1.1 scoped to en0 (%u): %s", r1, r2, scope, r3); }
 }
 
 // The interface's input thread made runnable and then never run while frames kept coming (i468: from 231 s on, a priority 81 thread with no
