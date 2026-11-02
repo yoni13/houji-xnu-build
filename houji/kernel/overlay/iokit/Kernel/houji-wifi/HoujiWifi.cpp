@@ -236,7 +236,8 @@ const char *arenaMapStage1(uint32_t report) {
     __asm__ volatile("dsb sy; isb" ::: "memory");
     // check the first and last page through the bank's address translation (stage 1 privileged read)
     uint32_t faults = 0;
-    for (uint64_t iova : {kIova, kIova + gArena.bytes - 4096}) {
+    const uint64_t probes[2] = {kIova, kIova + gArena.bytes - 4096};
+    for (uint64_t iova : probes) {
         cb[0x800 / 4] = uint32_t(iova); cb[0x804 / 4] = 0;
         unsigned spin = 0;
         while ((cb[0x8f0 / 4] & 1) && ++spin < 100000) {}
