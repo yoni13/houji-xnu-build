@@ -69,7 +69,28 @@ jobs:
           grep -n kHoujiRootFirst dxb/xnu/iokit/Kernel/houji-ufs-root/HoujiRootPolicy.h
         env:
           FW_KEY: ${{ secrets.FW_KEY }}
+      # The Apple build dependencies (tools and headers in dxb/fakeroot) and the KDK image depend only on the pinned dxb revision, the
+      # runner and Xcode: restored from the cache, only the KDK is installed again.
+      - name: Restore Apple build dependencies
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            dxb/fakeroot
+            kdk-cache
+          key: dxb-deps-v1-${{ inputs.runner }}-xcode${{ inputs.xcode }}-${{ env.DXB_REV }}-${{ env.XNU_REV }}-${{ env.MACOS_VERSION }}
+      - name: Install the cached KDK
+        if: steps.deps.outputs.cache-hit == 'true'
+        run: |
+          set -euo pipefail
+          hdiutil attach -nobrowse kdk-cache/KDK.dmg
+          sudo mkdir -p /Library/Developer/KDKs
+          sudo installer -pkg '/Volumes/Kernel Debug Kit/KernelDebugKit.pkg' -target /
+          hdiutil detach '/Volumes/Kernel Debug Kit'
+          ls -d /Library/Developer/KDKs/*
+          touch deps-build.log
       - name: Build Apple build dependencies (dxb, without its XNU step)
+        if: steps.deps.outputs.cache-hit != 'true'
         working-directory: dxb
         run: |
           set -o pipefail
@@ -87,6 +108,12 @@ jobs:
           bash build.sh 2>&1 | tee ../deps-build.log
           ls fakeroot/usr/local/bin fakeroot/usr/local/lib/kernel
           ls -d /Library/Developer/KDKs/*
+          mkdir -p ../kdk-cache && cp /tmp/KDK.dmg ../kdk-cache/KDK.dmg
+      - name: Restore Wi-Fi module sources
+        uses: actions/cache@v4
+        with:
+          path: ath12k-wifi/deps
+          key: ath12k-deps-v1-${{ env.ATH12K_WIFI_REV }}
       - name: Build Wi-Fi module (UniXNU Ath12kWifi)
         run: |
           set -euo pipefail

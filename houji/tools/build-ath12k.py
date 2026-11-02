@@ -18,9 +18,12 @@ darwin = sys.platform == 'darwin'
 
 subprocess.run(['bash', str(module / 'tools/fetch-sources.sh')], check=True, stdout=subprocess.DEVNULL)
 # houji patches to the module's own sources (houji/kernel/ath12k-module/*.patch, -p1 in the module directory; already applied ones are kept)
+# (applied forward, then required to reverse cleanly: BSD and GNU patch differ in how they report an already applied patch)
 for patch in sorted((port / 'kernel/ath12k-module').glob('*.patch')):
-    if subprocess.run(['patch', '-p1', '-R', '--dry-run', '-s', '-d', str(module), '-i', str(patch)], capture_output=True).returncode:
-        subprocess.run(['patch', '-p1', '--forward', '-d', str(module), '-i', str(patch)], check=True)
+    r = subprocess.run(['patch', '-p1', '--forward', '-d', str(module), '-i', str(patch)], capture_output=True, text=True)
+    print(f'module patch {patch.name}: {r.returncode} {r.stdout.strip()} {r.stderr.strip()}'.replace('\n', ' '))
+    if subprocess.run(['patch', '-p1', '-R', '--dry-run', '-d', str(module), '-i', str(patch)], capture_output=True).returncode:
+        raise SystemExit(f'module patch not in place: {patch.name}')
 subprocess.run(['bash', str(module / 'tools/prepare.sh')], check=True, stdout=subprocess.DEVNULL)
 # houji patches: applied to private copies of the files they touch (the prepared tree holds links into deps/linux)
 for patch in sorted((port / 'kernel/ath12k').glob('*.patch')):
