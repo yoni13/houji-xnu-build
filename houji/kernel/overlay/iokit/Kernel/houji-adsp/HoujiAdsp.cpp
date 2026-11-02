@@ -331,13 +331,13 @@ int64_t shmBridge(uint64_t pa, uint64_t size) {
 int authenticateHeader(Image &image, uint32_t pas, uint64_t base, bool bridge = false) {
     const uint64_t bytes = (qcom_mdt_metadata_size(&image.mdt) + 4095) & ~4095ull;
     image.meta = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, (IOOptionBits)kIODirectionInOut | (IOOptionBits)kIOMemoryPhysicallyContiguous, bytes,
-                                                                 0xfffffffffffff000ull);
+                                                                 bridge ? 0x00000000fffff000ull : 0xfffffffffffff000ull);
     if (!image.meta || image.meta->prepare() != kIOReturnSuccess) return -12;
     uint8_t *va = static_cast<uint8_t *>(image.meta->getBytesNoCopy());
     if (qcom_mdt_metadata(&image.mdt, fileRead, image.file, va, bytes)) return -5;
     cleanToPoc(va, bytes);
     const uint64_t phys = image.meta->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
-    if (bridge) shmBridge(phys, bytes);
+    if (bridge) {shmBridge(phys, bytes); native_adsp_stats[14] = (int32_t)(phys >> 12);}
     if (!scmOk(scm(QCOM_SCM_PAS_INIT_IMAGE, qcom_scm_args(2, QCOM_SCM_VAL, QCOM_SCM_RW, 0), pas, phys, 0))) return -1;
     if (image.mdt.relocatable &&
         !scmOk(scm(QCOM_SCM_PAS_MEM_SETUP, qcom_scm_args(3, 0, 0, 0), pas, base, qcom_mdt_span(&image.mdt))))
