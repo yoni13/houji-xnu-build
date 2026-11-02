@@ -328,23 +328,37 @@ int64_t shmBridge(uint64_t pa, uint64_t size) {
     gBridge = (int64_t)x0; gBridgeHandle = x2;
     return (int64_t)x0 ? (int64_t)x0 : (int64_t)x1;
 }
-int authenticateHeader(Image &image, uint32_t pas, uint64_t base, bool bridge = false) {
+// (houji) The modem's metadata must lie below 4 GiB (the stock driver's dma_phys_below_32b; above it the secure world answers
+// 0xffcfffbb) and in normal non-cacheable memory, never in an SHM bridge of our own (the hypervisor makes one for a PIL call; a buffer
+// already bridged is refused). Almost all of this kernel's RAM is above 4 GiB, so the modem's metadata goes to fixed pages of the
+// unused RAM below the rmtfs buffer (0xd3a00000-0xd8000000 is outside this UEFI's memory map and plain HLOS RAM in the stock layout):
+// 0xd7a00000 for the dtb's, 0xd7a10000 for the modem's. The window stays mapped until the secure world is done with it.
+Window gLowMeta[2];
+int authenticateHeader(Image &image, uint32_t pas, uint64_t base, bool low = false) {
     const uint64_t bytes = (qcom_mdt_metadata_size(&image.mdt) + 4095) & ~4095ull;
-    // (houji) for the modem: below 4 GiB and mapped normal non-cacheable (write combine: device memory faults on the unaligned stores
-    // of the metadata copy), as qcom_scm_pas_init_image requires ("non-cachable to avoid XPU
-    // violations"); never an SHM bridge of our own: the hypervisor makes one for a PIL call and a buffer already bridged is refused.
-    image.meta = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, (IOOptionBits)kIODirectionInOut | (IOOptionBits)kIOMemoryPhysicallyContiguous |
-                                                                 (bridge ? (IOOptionBits)kIOMapWriteCombineCache : 0), bytes,
-                                                                 bridge ? 0x00000000fffff000ull : 0xfffffffffffff000ull);
-    if (!image.meta || image.meta->prepare() != kIOReturnSuccess) return -12;
-    uint8_t *va = static_cast<uint8_t *>(image.meta->getBytesNoCopy());
+    uint8_t *va = nullptr;
+    uint64_t phys = 0;
+    if (low) {
+        const unsigned slot = pas == 4 ? 1 : 0;
+        phys = 0xd7a00000ull + slot * 0x10000ull;
+        if (bytes > 0x10000) return -7;
+        if (!gLowMeta[slot].va && !mapWindow(gLowMeta[slot], phys, 0x10000, kIOMapWriteCombineCache)) return -12;
+        va = const_cast<uint8_t *>(gLowMeta[slot].va);
+        bzero(va, 0x10000);
+    } else {
+        image.meta = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, (IOOptionBits)kIODirectionInOut |
+                                                                     (IOOptionBits)kIOMemoryPhysicallyContiguous, bytes, 0xfffffffffffff000ull);
+        if (!image.meta || image.meta->prepare() != kIOReturnSuccess) return -12;
+        va = static_cast<uint8_t *>(image.meta->getBytesNoCopy());
+        phys = image.meta->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+    }
     if (qcom_mdt_metadata(&image.mdt, fileRead, image.file, va, bytes)) return -5;
     cleanToPoc(va, bytes);
-    const uint64_t phys = image.meta->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+    __asm__ volatile("dsb sy" ::: "memory");
     (void)shmBridge;
-    if (bridge) {IOLog("HOUJI MPSS STEP: init pas %u metadata %llx + %llu\n", pas, (unsigned long long)phys, (unsigned long long)bytes); IOSleep(300);}
+    if (low) {IOLog("HOUJI MPSS STEP: init pas %u metadata %llx + %llu\n", pas, (unsigned long long)phys, (unsigned long long)bytes); IOSleep(300);}
     if (!scmOk(scm(QCOM_SCM_PAS_INIT_IMAGE, qcom_scm_args(2, QCOM_SCM_VAL, QCOM_SCM_RW, 0), pas, phys, 0))) return -1;
-    if (bridge) {IOLog("HOUJI MPSS STEP: init pas %u accepted; memory setup %llx + %llx\n", pas, (unsigned long long)base,
+    if (low) {IOLog("HOUJI MPSS STEP: init pas %u accepted; memory setup %llx + %llx\n", pas, (unsigned long long)base,
                        (unsigned long long)qcom_mdt_span(&image.mdt)); IOSleep(300);}
     if (image.mdt.relocatable &&
         !scmOk(scm(QCOM_SCM_PAS_MEM_SETUP, qcom_scm_args(3, 0, 0, 0), pas, base, qcom_mdt_span(&image.mdt))))
