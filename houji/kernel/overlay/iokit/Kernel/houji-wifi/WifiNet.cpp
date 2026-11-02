@@ -235,6 +235,9 @@ void on_rx(const uint8_t *eth, size_t length) {
   if (done != length) { gRxNoBuffer++; mbuf_freem(m); return; }
   mbuf_pkthdr_setlen(m, length); mbuf_pkthdr_setrcvif(m, gIf);
   mbuf_pkthdr_setheader(m, mbuf_data(m)); mbuf_adj(m, 14);   // the stack wants the Ethernet header apart from the payload
+  // (houji) the interface's packet filter sees received frames only when the driver taps them: IPConfiguration's ARP check of the
+  // router reads its answers there, and without them the network is never made primary (no default route, no DNS)
+  bpf_tap_in(gIf, DLT_EN10MB, m, const_cast<uint8_t *>(eth), 14);
   struct ifnet_stat_increment_param inc; memset(&inc, 0, sizeof inc); inc.packets_in = 1; inc.bytes_in = static_cast<uint32_t>(length);
   const errno_t e = ifnet_input(gIf, m, &inc);
   if (e) { gRxErrors++; gRxLastError = e; } else gRxFrames++;
@@ -243,6 +246,7 @@ const struct nw_wifi_events gEvents = { on_scan_done, on_connect_done, on_link_l
 
 // ---- the interface ----
 errno_t if_output(ifnet_t, mbuf_t m) {
+  bpf_tap_out(gIf, DLT_EN10MB, m, nullptr, 0);   // (houji) as for input
   size_t length = mbuf_pkthdr_len(m);
   if (length >= 14 && length <= 2000) {
     uint8_t frame[2000]; mbuf_copydata(m, 0, length, frame);
