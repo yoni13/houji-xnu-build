@@ -317,8 +317,19 @@ int openImage(Image &image, const char *path) {
     return rc ? 1000 - rc : 0;
 }
 // init_image with the metadata in physically contiguous memory, then the memory setup of a relocatable image.
-int authenticateHeader(Image &image, uint32_t pas, uint64_t base) {
-    const uint64_t bytes = qcom_mdt_metadata_size(&image.mdt);
+int64_t gBridge;   // houji: the last SHM bridge create result (x0), and its handle
+uint64_t gBridgeHandle;
+// SCM MP SHM_BRIDGE_CREATE (0x1e): newer secure worlds take buffers only from registered shared-memory bridges (qcom_tzmem.c).
+int64_t shmBridge(uint64_t pa, uint64_t size) {
+    register uint64_t x0 __asm__("x0") = qcom_scm_fn(0x0c, 0x1e), x1 __asm__("x1") = 4, x2 __asm__("x2") = pa | 6, x3 __asm__("x3") = pa | 6,
+                      x4 __asm__("x4") = size | (1ull << 9), x5 __asm__("x5") = 3, x6 __asm__("x6") = 0, x7 __asm__("x7") = 0;
+    __asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
+                     :: "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+    gBridge = (int64_t)x0; gBridgeHandle = x2;
+    return (int64_t)x0 ? (int64_t)x0 : (int64_t)x1;
+}
+int authenticateHeader(Image &image, uint32_t pas, uint64_t base, bool bridge = false) {
+    const uint64_t bytes = (qcom_mdt_metadata_size(&image.mdt) + 4095) & ~4095ull;
     image.meta = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, (IOOptionBits)kIODirectionInOut | (IOOptionBits)kIOMemoryPhysicallyContiguous, bytes,
                                                                  0xfffffffffffff000ull);
     if (!image.meta || image.meta->prepare() != kIOReturnSuccess) return -12;
@@ -326,6 +337,7 @@ int authenticateHeader(Image &image, uint32_t pas, uint64_t base) {
     if (qcom_mdt_metadata(&image.mdt, fileRead, image.file, va, bytes)) return -5;
     cleanToPoc(va, bytes);
     const uint64_t phys = image.meta->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+    if (bridge) shmBridge(phys, bytes);
     if (!scmOk(scm(QCOM_SCM_PAS_INIT_IMAGE, qcom_scm_args(2, QCOM_SCM_VAL, QCOM_SCM_RW, 0), pas, phys, 0))) return -1;
     if (image.mdt.relocatable &&
         !scmOk(scm(QCOM_SCM_PAS_MEM_SETUP, qcom_scm_args(3, 0, 0, 0), pas, base, qcom_mdt_span(&image.mdt))))
@@ -899,9 +911,10 @@ bool modemStart() {
                  (unsigned long long)c.x0, (unsigned long long)d.x0);
         mnote("pas ", text);
     }
-    if ((rc = authenticateHeader(gMDtbImage, kMPasDtb, kMDtbBase)) || (rc = loadSegments(gMDtbImage, kMDtbBase, kMDtbSize)) ||
+    if ((rc = authenticateHeader(gMDtbImage, kMPasDtb, kMDtbBase, true)) || (rc = loadSegments(gMDtbImage, kMDtbBase, kMDtbSize)) ||
         (rc = scmOk(scm(QCOM_SCM_PAS_AUTH_AND_RESET, qcom_scm_args(1, 0, 0, 0), kMPasDtb, 0, 0)) ? 0 : -3)) {
-        char text[40]; snprintf(text, sizeof text, " | x0 %x x1 %x", (unsigned)native_adsp_stats[13], (unsigned)native_adsp_stats[14]);
+        char text[64]; snprintf(text, sizeof text, " | x0 %x x1 %x br %llx/%llx", (unsigned)native_adsp_stats[13], (unsigned)native_adsp_stats[14],
+                                (unsigned long long)gBridge, (unsigned long long)gBridgeHandle);
         strlcat(native_mpss_text, text, sizeof native_mpss_text);
         mfail(MsDtb, rc); return false;}
     ms[0] = MsDtb;
@@ -919,7 +932,7 @@ bool modemStart() {
     qcom_qrtr_add_service(&gMQrtr, QCOM_SERVLOC_SERVICE, QCOM_SERVLOC_INSTANCE, 1, mlocator, nullptr);
     qcom_qrtr_add_service(&gMQrtr, 14, 1, 2, rmtfsReceive, nullptr);
     ms[0] = MsRmtfs;
-    if ((rc = authenticateHeader(gMImage, kMPas, kMBase)) || (rc = loadSegments(gMImage, kMBase, kMSize))) {mfail(MsLoaded, rc); return false;}
+    if ((rc = authenticateHeader(gMImage, kMPas, kMBase, true)) || (rc = loadSegments(gMImage, kMBase, kMSize))) {mfail(MsLoaded, rc); return false;}
     ms[0] = MsLoaded;
     // GLINK items before the start: the modem looks for the descriptor when it comes up
     if ((rc = mallocItem(kItemGlinkDesc, 32)) || (rc = mallocItem(kItemGlinkTx, 0x4000))) {mfail(MsLoaded, 100 + rc); return false;}
