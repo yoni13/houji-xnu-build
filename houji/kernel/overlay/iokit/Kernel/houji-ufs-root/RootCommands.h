@@ -33,7 +33,7 @@ static uint32_t loadBe32 (const uint8_t *at)
 // Firmware reads (the ADSP image in modem_a, LUN 4): READ(10) only, on LUNs 1-5, of each GPT's header and entry blocks (LBA 1-9) and
 // of partition ranges native_ufs_part_find granted by name. Never a write or any other command.
 struct HoujiPartGrant {uint32_t lun; uint64_t first, blocks;};
-static HoujiPartGrant gHoujiPartGrants[4];
+static HoujiPartGrant gHoujiPartGrants[8];
 static unsigned gHoujiPartGrantCount;
 static bool houjiUfsFirmwareCommandAllowed(const uint8_t *u,unsigned n,unsigned dir,uint32_t bytes) {
   if(!u || n!=32 || u[0]!=1 || u[2]<1 || u[2]>5 || u[3] || u[1]!=0x40 || dir!=2 || !bytes || bytes>131072 || (bytes&4095))return false;

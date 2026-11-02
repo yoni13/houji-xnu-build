@@ -57,7 +57,7 @@ constexpr uint32_t kPasAdsp = 1, kPasDtb = 36, kRemotePid = 2, kItemIn = 443, kI
 constexpr uint32_t kItemGlinkDesc = 478, kItemGlinkTx = 479, kItemGlinkRx = 480, kGlinkFifo = 0x4000;
 constexpr uint32_t kSpiIpcc = 229, kSpiRsc = 5;
 constexpr uint32_t kFatal = 1u << 0, kReady = 1u << 1, kHandover = 1u << 2;
-constexpr uint32_t kEvSmp2p = 1, kEvGlink = 2, kEvAop = 4, kEvRsc = 8, kEvSend = 16;
+constexpr uint32_t kEvSmp2p = 1, kEvGlink = 2, kEvAop = 4, kEvRsc = 8, kEvSend = 16, kEvMSmp2p = 32, kEvMGlink = 64;
 constexpr unsigned kClients = 4, kQueue = 8;
 
 struct Window {IOMemoryMap *map; volatile uint8_t *va;};
@@ -127,6 +127,8 @@ void ipccIrq(void *) {
         if (id == qcom_ipcc_id(QCOM_IPCC_CLIENT_LPASS, QCOM_IPCC_SIGNAL_SMP2P)) bits |= kEvSmp2p;
         else if (id == qcom_ipcc_id(QCOM_IPCC_CLIENT_LPASS, QCOM_IPCC_SIGNAL_GLINK_QMP)) bits |= kEvGlink;
         else if (id == qcom_ipcc_id(QCOM_IPCC_CLIENT_AOP, QCOM_IPCC_SIGNAL_GLINK_QMP)) bits |= kEvAop;
+        else if (id == qcom_ipcc_id(2, QCOM_IPCC_SIGNAL_SMP2P)) bits |= kEvMSmp2p;     // MPSS
+        else if (id == qcom_ipcc_id(2, QCOM_IPCC_SIGNAL_GLINK_QMP)) bits |= kEvMGlink;
     }
     native_adsp_stats[2] = native_adsp_stats[2] + 1;
     if (bits) wake(bits);
@@ -394,7 +396,9 @@ void serviceGlink() {
     if (gGlink.version_agreed && native_adsp_stats[0] >= StReady && native_adsp_stats[0] < StGlink) stage(StGlink);
     if (up && native_adsp_stats[0] >= StGlink) stage(StChannel);
 }
+void serviceModem(uint32_t bits);
 void service(uint32_t bits) {
+    serviceModem(bits);
     if (bits & kEvAop) qcom_qmp_step(&gQmp);
     if (bits & (kEvSmp2p | kEvGlink)) serviceSmp2p();
     if (bits & (kEvGlink | kEvSend)) {applyClients(); serviceGlink();}
@@ -616,6 +620,318 @@ bool startGlink() {
     return true;
 }
 
+}  // namespace
+
+// ==== the modem (MPSS), for GNSS: houji_modem=2 starts it (1, the default, only surveys its image) ====
+// Facts (handset devicetree, mainline sm8650.dtsi and qcom_q6v5_pas.c sm8650_mpss_resource): PAS 4 for modem.mdt in mpss 0x8bc00000 +
+// 0xf400000, PAS 0x26 for modem_dtb.mdt in q6_mpss_dtb 0x9b000000 + 0x80000; proxy rails cx and mss; AOSS load_state "modem"; crash reason
+// SMEM item 421; SMP2P items 435 (in) and 428 (out), remote pid 1; IPCC client 2 (MPSS) signal 0 GLINK, 2 SMP2P; GLINK items 478-480 in
+// the apps/modem partition. Before the start the DSM regions (0x86b00000 + 0x4900000, 0x8b400000 + 0x800000) and qlink logging
+// (0x84800000 + 0x200000) go to the modem's MSA VM (SCM MP assign, HLOS 3 -> MSS_MSA 15). rmtfs: the modem's EFS partitions (modemst1,
+// modemst2, fsg, fsc) are read once into RAM and served over QMI (service 14) through a buffer at 0xd7c00000 + 0x400000 (mainline's
+// rmtfs_mem; outside both the stock reservations' users and this UEFI's memory map) shared HLOS + MSS_MSA. Writes stay in RAM.
+// [0] stage, [1] error, [2] slave bits, [3] ready ms, [4] GLINK in, [5] out, [6] QRTR services the modem announced, [7] rmtfs requests,
+// [8] rmtfs opens, [9] rmtfs bytes read KiB, [10] written KiB, [11] last SCM x0 of an assign, [12] locator requests, [13] QRTR hello,
+// [14] LOC (service 0x10) announced, [15] packets dropped
+extern "C" {volatile int32_t native_mpss_stats[16]; char native_mpss_text[96];}
+extern "C" int native_ufs_part_find(const char *name, uint32_t *lun, uint64_t *first, uint64_t *blocks);
+extern "C" int native_ufs_part_read(uint32_t lun, uint64_t lba, uint32_t blocks, void *dst);
+namespace {
+enum MStage {MsImages = 1, MsSmp2p = 2, MsLoadState = 3, MsRails = 4, MsAssign = 5, MsRmtfs = 6, MsDtb = 7, MsLoaded = 8, MsStarted = 9,
+             MsReady = 10, MsGlink = 11, MsQrtr = 12};
+constexpr uint32_t kIpccMpss = 2, kMPid = 1, kMItemIn = 435, kMItemOut = 428, kMItemCrash = 421, kMPas = 4, kMPasDtb = 0x26;
+constexpr uint64_t kMBase = 0x8bc00000, kMSize = 0xf400000, kMDtbBase = 0x9b000000, kMDtbSize = 0x80000;
+constexpr uint64_t kRmtfsBase = 0xd7c00000, kRmtfsSize = 0x400000;
+constexpr uint32_t kVmHlos = 3, kVmMssMsa = 15, kPermRw = 6;
+volatile int32_t *const ms = native_mpss_stats;
+void mfail(int step, int error) {ms[1] = error; ms[0] = -step;}
+void mnote(const char *prefix, const char *text) {
+    size_t at = 0;
+    for (; prefix[at] && at < sizeof native_mpss_text - 1; ++at) native_mpss_text[at] = prefix[at];
+    for (size_t i = 0; text[i] && at < sizeof native_mpss_text - 1; ++i) native_mpss_text[at++] = text[i];
+    native_mpss_text[at] = 0;
+}
+QcomSmemPartition gMPart;
+QcomSmp2p gMP2p;
+QcomGlink gMGlink;
+bool gMGlinkStarted, gMOn;
+uint32_t gMSlave;
+Image gMDtbImage, gMImage;
+void kickMGlink(void *) {ring(kIpccMpss, QCOM_IPCC_SIGNAL_GLINK_QMP);}
+void kickMSmp2p() {ring(kIpccMpss, QCOM_IPCC_SIGNAL_SMP2P);}
+volatile uint8_t *mitem(uint16_t id, uint32_t *size) {
+    uint32_t at = 0, bytes = 0;
+    if (qcom_smem_find(&gSmem, &gMPart, id, &at, &bytes)) return nullptr;
+    if (size) *size = bytes;
+    return gSmemW.va + at;
+}
+int mallocItem(uint16_t item, uint32_t size) {
+    if (!lockSmem()) return -16;
+    const int rc = qcom_smem_alloc(&gSmem, &gMPart, item, size);
+    unlockSmem();
+    return rc == QcomSmemExists ? 0 : rc;
+}
+void readModemCrash() {
+    QcomSmemPartition global;
+    uint32_t at = 0, size = 0;
+    if (qcom_smem_partition(&gSmem, QCOM_SMEM_HOST_GLOBAL, QCOM_SMEM_HOST_GLOBAL, &global) || qcom_smem_find(&gSmem, &global, kMItemCrash, &at, &size) || !size)
+        return;
+    char text[80];
+    size_t n = 0;
+    for (; n < sizeof text - 1 && n < size; ++n) {const char c = (char)gSmemW.va[at + n]; if (!c) break; text[n] = c >= 32 && c < 127 ? c : '.';}
+    text[n] = 0;
+    if (n) mnote("crash: ", text);
+}
+
+// SCM MP assign (svc 0x0c, cmd 0x16): seven arguments, the last four in a buffer whose address goes in x5 (SMCCC extended arguments).
+int64_t scmAssign(uint64_t base, uint64_t size, const uint32_t *vmids, unsigned count) {
+    IOBufferMemoryDescriptor *b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+        (IOOptionBits)kIODirectionInOut | (IOOptionBits)kIOMemoryPhysicallyContiguous, 4096, 0xfffffffffffff000ull);
+    if (!b || b->prepare() != kIOReturnSuccess) {OSSafeReleaseNULL(b); return -12;}
+    uint8_t *va = static_cast<uint8_t *>(b->getBytesNoCopy());
+    bzero(va, 4096);
+    const uint64_t pa = b->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+    const uint32_t src = kVmHlos;
+    memcpy(va, &src, 4);                                         // source VMs at +0
+    memcpy(va + 64, &base, 8); memcpy(va + 72, &size, 8);        // the region at +64
+    for (unsigned i = 0; i < count; ++i) {                       // destinations at +128: vmid, perm, ctx, ctx_size, unused
+        const uint32_t vp[2] = {vmids[i], kPermRw};
+        memcpy(va + 128 + 24 * i, vp, 8);
+    }
+    const uint64_t ext[4] = {4, pa + 128, 24ull * count, 0};      // args 3..6
+    memcpy(va + 512, ext, sizeof ext);
+    cleanToPoc(va, 4096);
+    const uint32_t arginfo = 7u | 1u << 4 | 1u << 8 | 1u << 12;  // RO, VAL, RO, VAL, RO, VAL, VAL
+    ScmResult r = {-1, 0};
+    for (unsigned busy = 0; busy < 20; ++busy) {
+        register uint64_t x0 __asm__("x0") = qcom_scm_fn(0x0c, 0x16), x1 __asm__("x1") = arginfo, x2 __asm__("x2") = pa + 64,
+                          x3 __asm__("x3") = 16, x4 __asm__("x4") = pa, x5 __asm__("x5") = pa + 512, x6 __asm__("x6") = 0, x7 __asm__("x7") = 0;
+        __asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
+                         :: "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+        r = {(int64_t)x0, x1};
+        if (r.x0 != QCOM_SCM_V2_EBUSY) break;
+        IOSleep(30);
+    }
+    b->complete(); b->release();
+    ms[11] = (int32_t)r.x0;
+    return r.x0 ? r.x0 : (int64_t)r.x1;
+}
+
+// ---- rmtfs ----
+struct RmtfsFile {const char *path, *part; uint8_t *data; uint32_t size; bool open;};
+RmtfsFile gRmtfs[4] = {{"/boot/modem_fs1", "modemst1"}, {"/boot/modem_fs2", "modemst2"}, {"/boot/modem_fsg", "fsg"}, {"/boot/modem_fsc", "fsc"}};
+Window gRmtfsMem;
+QcomQrtr gMQrtr;
+QcomGlinkChannel *gMChannel;
+uint8_t *gMChannelStorage;
+struct MPacket {uint32_t length; uint8_t data[1536];};
+MPacket *gMQueue; uint32_t gMHead, gMCount;
+bool loadRmtfs() {
+    for (RmtfsFile &f : gRmtfs) {
+        uint32_t lun = 0; uint64_t first = 0, blocks = 0;
+        if (!native_ufs_part_find(f.part, &lun, &first, &blocks) || !blocks || blocks > 4096) return false;
+        f.size = (uint32_t)(blocks * 4096);
+        f.data = static_cast<uint8_t *>(IOMallocData(f.size));
+        if (!f.data) return false;
+        for (uint64_t done = 0; done < blocks;) {
+            const uint32_t n = blocks - done > 32 ? 32 : (uint32_t)(blocks - done);
+            if (!native_ufs_part_read(lun, first + done, n, f.data + done * 4096)) return false;
+            done += n;
+        }
+    }
+    return true;
+}
+uint32_t qmiResponse(uint8_t *out, const QcomQmiMessage &m, uint16_t result, uint16_t error) {
+    out[0] = QCOM_QMI_RESPONSE;
+    memcpy(out + 1, &m.transaction, 2); memcpy(out + 3, &m.message, 2);
+    out[7] = 0x02; const uint16_t four = 4; memcpy(out + 8, &four, 2); memcpy(out + 10, &result, 2); memcpy(out + 12, &error, 2);
+    const uint16_t len = 7; memcpy(out + 5, &len, 2);
+    return 14;
+}
+uint32_t qmiAdd(uint8_t *out, uint32_t at, uint8_t type, const void *value, uint16_t size) {
+    out[at] = type; memcpy(out + at + 1, &size, 2); memcpy(out + at + 3, value, size);
+    uint16_t len; memcpy(&len, out + 5, 2); len = (uint16_t)(len + 3 + size); memcpy(out + 5, &len, 2);
+    return at + 3 + size;
+}
+void rmtfsReceive(void *, QcomQrtr *q, uint32_t port, uint32_t node, uint32_t from, const uint8_t *data, uint32_t length) {
+    QcomQmiMessage m;
+    if (qcom_qmi_parse(data, length, &m) || m.type != QCOM_QMI_REQUEST) return;
+    ms[7] = ms[7] + 1;
+    uint8_t out[64];
+    uint32_t n = 0, size = 0, caller = 0;
+    const uint8_t *id = qcom_qmi_tlv(&m, 0x01, &size);
+    if (m.message != 1 && id && size == 4) memcpy(&caller, id, 4);
+    const bool known = caller < 4 && gRmtfs[caller].open;
+    switch (m.message) {
+    case 1: {   // open
+        int found = -1;
+        for (unsigned i = 0; id && i < 4; ++i)
+            if (strlen(gRmtfs[i].path) == size && !memcmp(gRmtfs[i].path, id, size)) found = (int)i;
+        char path[40] = {}; if (id) memcpy(path, id, size < 39 ? size : 39);
+        mnote("rmtfs open ", path);
+        if (found < 0) {n = qmiResponse(out, m, 1, 0x30); break;}
+        gRmtfs[found].open = true; ms[8] = ms[8] + 1;
+        n = qmiResponse(out, m, 0, 0);
+        const uint32_t cid = (uint32_t)found; n = qmiAdd(out, n, 0x10, &cid, 4);
+        break; }
+    case 2: if (known) gRmtfs[caller].open = false; n = qmiResponse(out, m, known ? 0 : 1, known ? 0 : 0x30); break;
+    case 3: {   // read or write: caller, direction, iovec[] {sector, buffer offset, sectors}, force sync
+        uint32_t dsize = 0, vsize = 0;
+        const uint8_t *dir = qcom_qmi_tlv(&m, 0x02, &dsize), *v = qcom_qmi_tlv(&m, 0x03, &vsize);
+        bool ok = known && dir && dsize == 1 && v && vsize >= 1;
+        uint32_t count = 0, skip = 1;
+        if (ok) {count = v[0]; if (1 + 12 * count != vsize && vsize >= 4) {memcpy(&count, v, 4); skip = 4;} ok = skip + 12 * count == vsize;}
+        for (uint32_t i = 0; ok && i < count; ++i) {
+            uint32_t e[3]; memcpy(e, v + skip + 12 * i, 12);
+            const uint64_t off = (uint64_t)e[0] * 512, bytes = (uint64_t)e[2] * 512;
+            if (off + bytes > gRmtfs[caller].size || (uint64_t)e[1] + bytes > kRmtfsSize) {ok = false; break;}
+            volatile uint8_t *shared = gRmtfsMem.va + e[1];
+            if (dir[0] == 0) {for (uint64_t k = 0; k < bytes; ++k) shared[k] = gRmtfs[caller].data[off + k]; ms[9] = ms[9] + (int32_t)(bytes >> 10);}
+            else {for (uint64_t k = 0; k < bytes; ++k) gRmtfs[caller].data[off + k] = shared[k]; ms[10] = ms[10] + (int32_t)(bytes >> 10);}
+        }
+        __asm__ volatile("dsb sy" ::: "memory");
+        n = qmiResponse(out, m, ok ? 0 : 1, ok ? 0 : 0x30);
+        break; }
+    case 4: {   // the shared buffer
+        n = qmiResponse(out, m, 0, 0);
+        const uint64_t at = kRmtfsBase; n = qmiAdd(out, n, 0x10, &at, 8);
+        break; }
+    case 5: {n = qmiResponse(out, m, 0, 0); const uint8_t none = 0; n = qmiAdd(out, n, 0x10, &none, 1); break;}
+    default: n = qmiResponse(out, m, 1, 0x47); break;   // invalid message
+    }
+    if (n) qcom_qrtr_send_data(q, port, node, from, out, n);
+}
+const char *const kMGps[] = {"gps/gps_service", nullptr};
+const QcomPdDomain kMDomains[] = {{"msm/adsp/audio_pd", 74, nullptr}, {"msm/adsp/root_pd", 74, nullptr}, {"msm/adsp/charger_pd", 74, nullptr},
+                                  {"msm/modem/root_pd", 180, kMGps}};
+void mlocator(void *, QcomQrtr *q, uint32_t port, uint32_t node, uint32_t from, const uint8_t *data, uint32_t length) {
+    uint8_t answer[480];
+    ms[12] = ms[12] + 1;
+    const uint32_t n = qcom_servloc_answer(kMDomains, sizeof kMDomains / sizeof kMDomains[0], data, length, answer, sizeof answer);
+    if (n) qcom_qrtr_send_data(q, port, node, from, answer, n);
+}
+int mqrtrSend(void *, const uint8_t *packet, uint32_t length) {
+    if (gMCount == 16 || length > sizeof gMQueue[0].data) {ms[15] = ms[15] + 1; return -1;}
+    MPacket &p = gMQueue[(gMHead + gMCount) % 16];
+    memcpy(p.data, packet, length); p.length = length; gMCount++;
+    return 0;
+}
+void mpump() {
+    while (gMCount && gMChannel && gMChannel->up) {
+        MPacket &p = gMQueue[gMHead];
+        if (qcom_glink_send(&gMGlink, gMChannel, p.data, p.length) != QcomGlinkOk) break;
+        gMHead = (gMHead + 1) % 16; gMCount--;
+    }
+}
+void mcounters() {
+    ms[13] = gMQrtr.hello_received;
+    ms[6] = (int32_t)gMQrtr.remote_count;
+    ms[14] = qcom_qrtr_find_remote(&gMQrtr, 0x10) >= 0;
+    unsigned at = 0;
+    for (uint32_t i = 0; i < gMQrtr.remote_count && at + 12 < sizeof native_mpss_text; ++i)
+        at += (unsigned)snprintf(native_mpss_text + at, sizeof native_mpss_text - at, "%s%x:%x", at ? " " : "", gMQrtr.remote[i].service,
+                                 gMQrtr.remote[i].instance);
+}
+void mlinkState(void *, QcomGlinkChannel *, int up) {
+    if (up) {gMQrtr.hello_sent = gMQrtr.hello_received = 0; gMQrtr.remote_count = 0; gMQrtr.remote_node = QCOM_QRTR_NODE_BROADCAST;
+             qcom_qrtr_start(&gMQrtr); if (ms[0] >= MsGlink) ms[0] = MsQrtr;}
+    mcounters();
+}
+void mlinkReceive(void *, QcomGlinkChannel *, const uint8_t *data, uint32_t length) {qcom_qrtr_receive(&gMQrtr, data, length); mcounters();}
+
+void serviceModem(uint32_t bits) {
+    if (!gMOn) return;
+    if (bits & (kEvMSmp2p | kEvMGlink)) {
+        if (!gMP2p.in) if (volatile uint8_t *in = mitem(kMItemIn, nullptr)) gMP2p.in = reinterpret_cast<volatile uint32_t *>(in);
+        if (gMP2p.in) {
+            uint32_t value = 0, changed = 0;
+            if (qcom_smp2p_service(&gMP2p, "slave-kernel", &value, &changed)) kickMSmp2p();
+            gMSlave = value; ms[2] = (int32_t)value;
+            if (changed & value & kFatal) readModemCrash();
+        }
+    }
+    if (gMGlinkStarted && (bits & (kEvMGlink | kEvSend))) {
+        if (!gMGlink.rx.data) {uint32_t size = 0; if (volatile uint8_t *rx = mitem(kItemGlinkRx, &size)) qcom_glink_set_rx(&gMGlink, rx, size);}
+        qcom_glink_poll(&gMGlink);
+        mpump();
+        qcom_glink_poll(&gMGlink);
+        ms[4] = (int32_t)gMGlink.rx_messages; ms[5] = (int32_t)gMGlink.tx_messages;
+    }
+}
+
+bool modemStart() {
+    int rc;
+    if ((rc = openImage(gMDtbImage, "modemfw:modem_dtb")) || (rc = openImage(gMImage, "modemfw:modem"))) {mfail(MsImages, rc); return false;}
+    ms[0] = MsImages;
+    if (qcom_smem_partition(&gSmem, QCOM_SMEM_HOST_APPS, kMPid, &gMPart)) {mfail(MsSmp2p, -2); return false;}
+    if ((rc = mallocItem(kMItemOut, QCOM_SMP2P_ITEM_BYTES))) {mfail(MsSmp2p, rc); return false;}
+    qcom_smp2p_init_out(&gMP2p, reinterpret_cast<volatile uint32_t *>(mitem(kMItemOut, nullptr)), 0, kMPid);
+    qcom_smp2p_add_entry(&gMP2p, "master-kernel");
+    const uint32_t enable[2] = {qcom_ipcc_id(kIpccMpss, QCOM_IPCC_SIGNAL_SMP2P), qcom_ipcc_id(kIpccMpss, QCOM_IPCC_SIGNAL_GLINK_QMP)};
+    for (uint32_t id : enable) wr(gIpcc, QCOM_IPCC_RECV_ENABLE, id);
+    gMOn = true;
+    kickMSmp2p();
+    ms[0] = MsSmp2p;
+    qcom_qmp_send(&gQmp, "{class: image, res: load_state, name: modem, val: on}");
+    if (!waitUntil(1000, [] {return qcom_qmp_step(&gQmp) == QcomQmpOpen;})) {mfail(MsLoadState, -60); return false;}
+    ms[0] = MsLoadState;
+    {
+        struct CmdDbCopy {uint8_t *bytes = static_cast<uint8_t *>(IOMallocData(kCmdDbSize)); ~CmdDbCopy() {if (bytes) IOFreeData(bytes, kCmdDbSize);}} copy;
+        QcomRpmhResource cx, mss; uint32_t cxl = 0, mssl = 0;
+        if (!copy.bytes || !readCmdDb(copy.bytes) || qcom_cmd_db_find(copy.bytes, kCmdDbSize, "cx.lvl", &cx) ||
+            qcom_cmd_db_find(copy.bytes, kCmdDbSize, "mss.lvl", &mss) || qcom_rpmh_level_index(&cx, 0xffffffffu, &cxl) ||
+            qcom_rpmh_level_index(&mss, 0xffffffffu, &mssl)) {mfail(MsRails, -2); return false;}
+        const QcomRpmhResource lcx = gLcx, lmx = gLmx;
+        gLcx = cx; gLmx = mss;
+        rc = vote(cxl, mssl);
+        gLcx = lcx; gLmx = lmx;
+        if (rc) {mfail(MsRails, rc); return false;}
+    }
+    ms[0] = MsRails;
+    static const uint64_t regions[3][2] = {{0x86b00000, 0x4900000}, {0x8b400000, 0x800000}, {0x84800000, 0x200000}};
+    const uint32_t msa = kVmMssMsa, both[2] = {kVmHlos, kVmMssMsa};
+    for (auto &r : regions) if (scmAssign(r[0], r[1], &msa, 1)) {mfail(MsAssign, (int)ms[11]); return false;}
+    ms[0] = MsAssign;
+    if (scmAssign(kRmtfsBase, kRmtfsSize, both, 2)) {mfail(MsRmtfs, -1); return false;}
+    if (!mapWindow(gRmtfsMem, kRmtfsBase, kRmtfsSize) || !loadRmtfs()) {mfail(MsRmtfs, -2); return false;}
+    for (uint64_t i = 0; i < kRmtfsSize; i += 4) *reinterpret_cast<volatile uint32_t *>(gRmtfsMem.va + i) = 0;
+    gMQueue = static_cast<MPacket *>(IOMallocData(sizeof(MPacket) * 16));
+    gMChannelStorage = static_cast<uint8_t *>(IOMallocData(4096 * 8));
+    if (!gMQueue || !gMChannelStorage) {mfail(MsRmtfs, -12); return false;}
+    qcom_qrtr_init(&gMQrtr, 1, mqrtrSend, nullptr);
+    qcom_qrtr_add_service(&gMQrtr, QCOM_SERVLOC_SERVICE, QCOM_SERVLOC_INSTANCE, 1, mlocator, nullptr);
+    qcom_qrtr_add_service(&gMQrtr, 14, 1, 2, rmtfsReceive, nullptr);
+    ms[0] = MsRmtfs;
+    if ((rc = authenticateHeader(gMDtbImage, kMPasDtb, kMDtbBase)) || (rc = loadSegments(gMDtbImage, kMDtbBase, kMDtbSize)) ||
+        (rc = scmOk(scm(QCOM_SCM_PAS_AUTH_AND_RESET, qcom_scm_args(1, 0, 0, 0), kMPasDtb, 0, 0)) ? 0 : -3)) {mfail(MsDtb, rc); return false;}
+    ms[0] = MsDtb;
+    if ((rc = authenticateHeader(gMImage, kMPas, kMBase)) || (rc = loadSegments(gMImage, kMBase, kMSize))) {mfail(MsLoaded, rc); return false;}
+    ms[0] = MsLoaded;
+    // GLINK items before the start: the modem looks for the descriptor when it comes up
+    if ((rc = mallocItem(kItemGlinkDesc, 32)) || (rc = mallocItem(kItemGlinkTx, 0x4000))) {mfail(MsLoaded, 100 + rc); return false;}
+    const uint64_t began = mach_absolute_time();
+    if (!scmOk(scm(QCOM_SCM_PAS_AUTH_AND_RESET, qcom_scm_args(1, 0, 0, 0), kMPas, 0, 0))) {mfail(MsStarted, -3); return false;}
+    ms[0] = MsStarted;
+    const bool ready = waitUntil(20000, [] {return (gMSlave & (kReady | kFatal)) != 0;});
+    uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns); ms[3] = (int32_t)(ns / 1000000);
+    release(gMDtbImage); release(gMImage);
+    if (!ready || (gMSlave & kFatal)) {readModemCrash(); mfail(MsReady, ready ? -5 : -60); return false;}
+    ms[0] = MsReady;
+    uint32_t size = 0;
+    volatile uint8_t *desc = mitem(kItemGlinkDesc, nullptr), *txf = mitem(kItemGlinkTx, &size);
+    if (!desc || !txf) {mfail(MsGlink, -2); return false;}
+    volatile uint32_t *d = reinterpret_cast<volatile uint32_t *>(desc);
+    const QcomGlinkFifo tx = {&d[1], &d[0], txf, size}, rx = {&d[3], &d[2], nullptr, 0};
+    qcom_glink_init(&gMGlink, tx, rx, kickMGlink, nullptr);
+    static const QcomGlinkClient glue = {mlinkState, mlinkReceive};
+    gMChannel = qcom_glink_channel(&gMGlink, "IPCRTR", 4096, 8, gMChannelStorage, &glue, nullptr, 0);
+    gMGlinkStarted = true;
+    ms[0] = MsGlink;
+    serviceModem(kEvMGlink);
+    return true;
+}
+}  // namespace
+namespace {
 void adspThread(void *, wait_result_t) {
     thread_set_thread_name(current_thread(), "houji-adsp");
     unsigned mode = 2;
@@ -631,11 +947,16 @@ void adspThread(void *, wait_result_t) {
     survey();
     stage(StSurveyed);
     if (mode < 2 || !start() || !startGlink()) return;
+    unsigned modem = 1;
+    PE_parse_boot_argn("houji_modem", &modem, sizeof modem);
+    if (modem >= 2) {unsigned delay = 30; PE_parse_boot_argn("houji_modem_delay", &delay, sizeof delay);
+                     waitUntil(delay * 1000, [] {return false;}); modemStart();}
     // From here on the thread only answers doorbells and client sends; with nothing pending it sleeps without a deadline, except while
     // a send waits for an intent or FIFO room (then it looks again every second).
     for (;;) {
         bool pending = false;
         for (unsigned i = 0; i < gClientCount; ++i) pending |= gClients[i].count != 0;
+        pending |= gMCount != 0;
         service(waitEvents(pending ? 1000 : 3600u * 1000u) | (pending ? kEvSend : 0));
     }
 }
@@ -796,6 +1117,12 @@ extern "C" void houji_power_report(void) {
     houji_wifi_report();
     houji_buttons_report();
     {const volatile int32_t *m = native_modem_stats;
+     const volatile int32_t *q = native_mpss_stats;
+     if (q[0]) {
+         IOLog("HOUJI MPSS: stage=%d err=%d slave=%x ready-ms=%d glink=%d/%d services=%d rmtfs=%d/%d rd=%dK wr=%dK scm=%d servloc=%d hello=%d loc=%d drop=%d\n",
+               q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11], q[12], q[13], q[14], q[15]);
+         IOLog("HOUJI MPSS TEXT: %.90s\n", native_mpss_text);
+     }
      if (m[0]) IOLog("HOUJI MODEM: stage=%d bytes=%d span=%x segments=%d relocatable=%d dtb-span=%x min=%x err=%d\n", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);}
     const volatile int32_t *a = native_adsp_stats;
     IOLog("HOUJI ADSP: stage=%d err=%d irq=%d slave=%x items=%x qmp=%x fw-KiB=%d ready-ms=%d glink=%d/%d chan=%x scm=%x/%x\n",

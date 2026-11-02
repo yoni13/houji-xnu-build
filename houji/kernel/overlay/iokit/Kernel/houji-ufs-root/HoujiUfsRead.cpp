@@ -715,7 +715,10 @@ extern "C" int native_ufs_part_find(const char *name, uint32_t *lun, uint64_t *f
       const uint64_t a = partLe64(e + 32), b = partLe64(e + 40);
       if (!a || b < a) continue;
       *lun = l; *first = a; *blocks = b - a + 1;
-      if (gHoujiPartGrantCount < 4) gHoujiPartGrants[gHoujiPartGrantCount++] = {l, a, b - a + 1};
+      bool granted = false;
+      for (unsigned g = 0; g < gHoujiPartGrantCount; g++)
+        if (gHoujiPartGrants[g].lun == l && gHoujiPartGrants[g].first == a) granted = true;
+      if (!granted && gHoujiPartGrantCount < 8) gHoujiPartGrants[gHoujiPartGrantCount++] = {l, a, b - a + 1};
       found = 1;
     }
   }
