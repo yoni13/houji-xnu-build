@@ -341,7 +341,10 @@ int authenticateHeader(Image &image, uint32_t pas, uint64_t base, bool bridge = 
     cleanToPoc(va, bytes);
     const uint64_t phys = image.meta->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
     (void)shmBridge;
+    if (bridge) {IOLog("HOUJI MPSS STEP: init pas %u metadata %llx + %llu\n", pas, (unsigned long long)phys, (unsigned long long)bytes); IOSleep(300);}
     if (!scmOk(scm(QCOM_SCM_PAS_INIT_IMAGE, qcom_scm_args(2, QCOM_SCM_VAL, QCOM_SCM_RW, 0), pas, phys, 0))) return -1;
+    if (bridge) {IOLog("HOUJI MPSS STEP: init pas %u accepted; memory setup %llx + %llx\n", pas, (unsigned long long)base,
+                       (unsigned long long)qcom_mdt_span(&image.mdt)); IOSleep(300);}
     if (image.mdt.relocatable &&
         !scmOk(scm(QCOM_SCM_PAS_MEM_SETUP, qcom_scm_args(3, 0, 0, 0), pas, base, qcom_mdt_span(&image.mdt))))
         return -2;
@@ -660,7 +663,9 @@ constexpr uint64_t kMBase = 0x8bc00000, kMSize = 0xf400000, kMDtbBase = 0x9b0000
 constexpr uint64_t kRmtfsBase = 0xd7c00000, kRmtfsSize = 0x400000;
 constexpr uint32_t kVmHlos = 3, kVmMssMsa = 15, kPermRw = 6;
 volatile int32_t *const ms = native_mpss_stats;
-void mfail(int step, int error) {ms[1] = error; ms[0] = -step;}
+void mfail(int step, int error) {ms[1] = error; ms[0] = -step; IOLog("HOUJI MPSS STEP: failed %d error %d\n", step, error);}
+void mstep(int value) {ms[0] = value; IOLog("HOUJI MPSS STEP: %d\n", value); IOSleep(200);}
+void mpoint(const char *what) {IOLog("HOUJI MPSS STEP: %s\n", what); IOSleep(300);}
 void mnote(const char *prefix, const char *text) {
     size_t at = 0;
     for (; prefix[at] && at < sizeof native_mpss_text - 1; ++at) native_mpss_text[at] = prefix[at];
@@ -878,7 +883,7 @@ void serviceModem(uint32_t bits) {
 bool modemStart() {
     int rc;
     if ((rc = openImage(gMDtbImage, "modemfw:modem_dtb")) || (rc = openImage(gMImage, "modemfw:modem"))) {mfail(MsImages, rc); return false;}
-    ms[0] = MsImages;
+    mstep(MsImages);
     if (qcom_smem_partition(&gSmem, QCOM_SMEM_HOST_APPS, kMPid, &gMPart)) {mfail(MsSmp2p, -2); return false;}
     if ((rc = mallocItem(kMItemOut, QCOM_SMP2P_ITEM_BYTES))) {mfail(MsSmp2p, rc); return false;}
     qcom_smp2p_init_out(&gMP2p, reinterpret_cast<volatile uint32_t *>(mitem(kMItemOut, nullptr)), 0, kMPid);
@@ -890,7 +895,7 @@ bool modemStart() {
     ms[0] = MsSmp2p;
     qcom_qmp_send(&gQmp, "{class: image, res: load_state, name: modem, val: on}");
     if (!waitUntil(1000, [] {return qcom_qmp_step(&gQmp) == QcomQmpOpen;})) {mfail(MsLoadState, -60); return false;}
-    ms[0] = MsLoadState;
+    mstep(MsLoadState);
     {
         struct CmdDbCopy {uint8_t *bytes = static_cast<uint8_t *>(IOMallocData(kCmdDbSize)); ~CmdDbCopy() {if (bytes) IOFreeData(bytes, kCmdDbSize);}} copy;
         QcomRpmhResource cx, mss; uint32_t cxl = 0, mssl = 0;
@@ -912,11 +917,11 @@ bool modemStart() {
         gLcx = lcx; gLmx = lmx;
         if (rc) {mfail(MsRails, rc); return false;}
     }
-    ms[0] = MsRails;
+    mstep(MsRails);
     static const uint64_t regions[3][2] = {{0x86b00000, 0x4900000}, {0x8b400000, 0x800000}, {0x84800000, 0x200000}};
     const uint32_t msa = kVmMssMsa, both[2] = {kVmHlos, kVmMssMsa};
     for (auto &r : regions) if (scmAssign(r[0], r[1], &msa, 1)) {mfail(MsAssign, (int)ms[11]); return false;}
-    ms[0] = MsAssign;
+    mstep(MsAssign);
     if (scmAssign(kRmtfsBase, kRmtfsSize, both, 2)) {mfail(MsRmtfs, -1); return false;}
     if (!mapWindow(gRmtfsMem, kRmtfsBase, kRmtfsSize) || !loadRmtfs()) {mfail(MsRmtfs, -2); return false;}
     for (uint64_t i = 0; i < kRmtfsSize; i += 4) *reinterpret_cast<volatile uint32_t *>(gRmtfsMem.va + i) = 0;
@@ -926,7 +931,7 @@ bool modemStart() {
     qcom_qrtr_init(&gMQrtr, 1, mqrtrSend, nullptr);
     qcom_qrtr_add_service(&gMQrtr, QCOM_SERVLOC_SERVICE, QCOM_SERVLOC_INSTANCE, 1, mlocator, nullptr);
     qcom_qrtr_add_service(&gMQrtr, 14, 1, 2, rmtfsReceive, nullptr);
-    ms[0] = MsRmtfs;
+    mstep(MsRmtfs);
     {   // what the secure world says about the two PAS ids, then a shutdown of each in case an earlier stage left one initialised
         char text[96];
         const ScmResult a = scm(QCOM_SCM_PAS_IS_SUPPORTED, qcom_scm_args(1, 0, 0, 0), kMPasDtb, 0, 0);
@@ -947,25 +952,27 @@ bool modemStart() {
             mfail(MsDtb, 3); return false;
         }
     }
+    mpoint("dtb init, load, auth");
     if ((rc = authenticateHeader(gMDtbImage, kMPasDtb, kMDtbBase, true)) || (rc = loadSegments(gMDtbImage, kMDtbBase, kMDtbSize)) ||
         (rc = scmOk(scm(QCOM_SCM_PAS_AUTH_AND_RESET, qcom_scm_args(1, 0, 0, 0), kMPasDtb, 0, 0)) ? 0 : -3)) {
         char text[64]; snprintf(text, sizeof text, " | x0 %x x1 %x br %llx/%llx", (unsigned)native_adsp_stats[13], (unsigned)native_adsp_stats[14],
                                 (unsigned long long)gBridge, (unsigned long long)gBridgeHandle);
         strlcat(native_mpss_text, text, sizeof native_mpss_text);
         mfail(MsDtb, rc); return false;}
-    ms[0] = MsDtb;
+    mstep(MsDtb);
+    mpoint("modem init and load");
     if ((rc = authenticateHeader(gMImage, kMPas, kMBase, true)) || (rc = loadSegments(gMImage, kMBase, kMSize))) {mfail(MsLoaded, rc); return false;}
-    ms[0] = MsLoaded;
+    mstep(MsLoaded);
     // GLINK items before the start: the modem looks for the descriptor when it comes up
     if ((rc = mallocItem(kItemGlinkDesc, 32)) || (rc = mallocItem(kItemGlinkTx, 0x4000))) {mfail(MsLoaded, 100 + rc); return false;}
     const uint64_t began = mach_absolute_time();
     if (!scmOk(scm(QCOM_SCM_PAS_AUTH_AND_RESET, qcom_scm_args(1, 0, 0, 0), kMPas, 0, 0))) {mfail(MsStarted, -3); return false;}
-    ms[0] = MsStarted;
+    mstep(MsStarted);
     const bool ready = waitUntil(20000, [] {return (gMSlave & (kReady | kFatal)) != 0;});
     uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns); ms[3] = (int32_t)(ns / 1000000);
     release(gMDtbImage); release(gMImage);
     if (!ready || (gMSlave & kFatal)) {readModemCrash(); mfail(MsReady, ready ? -5 : -60); return false;}
-    ms[0] = MsReady;
+    mstep(MsReady);
     uint32_t size = 0;
     volatile uint8_t *desc = mitem(kItemGlinkDesc, nullptr), *txf = mitem(kItemGlinkTx, &size);
     if (!desc || !txf) {mfail(MsGlink, -2); return false;}
@@ -975,7 +982,7 @@ bool modemStart() {
     static const QcomGlinkClient glue = {mlinkState, mlinkReceive};
     gMChannel = qcom_glink_channel(&gMGlink, "IPCRTR", 4096, 8, gMChannelStorage, &glue, nullptr, 0);
     gMGlinkStarted = true;
-    ms[0] = MsGlink;
+    mstep(MsGlink);
     serviceModem(kEvMGlink);
     return true;
 }
