@@ -23,6 +23,7 @@
 #include <pexpert/pexpert.h>
 extern "C" {
 #include "QcomGlink.h"
+#include "QcomQrtr.h"
 #include "QcomMdt.h"
 #include "QcomQmp.h"
 #include "QcomRpmh.h"
