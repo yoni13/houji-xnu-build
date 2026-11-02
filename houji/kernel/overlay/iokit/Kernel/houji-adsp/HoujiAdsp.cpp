@@ -885,6 +885,118 @@ void mlinkState(void *, QcomGlinkChannel *, int up) {
 }
 void mlinkReceive(void *, QcomGlinkChannel *, const uint8_t *data, uint32_t length) {qcom_qrtr_receive(&gMQrtr, data, length); mcounters();}
 
+}  // namespace
+// ---- GNSS: a QMI LOC client (service 0x10) on the modem, in the order the SteamOS port found the stock firmware takes ----
+// register with the stock client's fields, the engine lock query (0x3b), 0xbf, 0x36, then a periodic 1 s session (0x22), stopped
+// after houji_gps_seconds (default 300). No time or orbit injection. Positions are kept for the iOS side (houji_gps_last) and
+// never logged; the log has fix status, uncertainty and satellite counts only.
+// [0] state (1 registering, 2..4 setup, 5 starting, 6 running, 7 stopped; negative: the request that failed), [1] position reports,
+// [2] valid fixes, [3] last horizontal uncertainty (cm), [4] satellite reports, [5] most satellites in one report, [6] last session status,
+// [7] indications seen, [8] last result error
+extern "C" {volatile int32_t native_gps_stats[10]; volatile double houji_gps_last[4]; volatile uint64_t houji_gps_last_time;}
+namespace {
+constexpr uint32_t kLocPort = 3;
+volatile int32_t *const gs = native_gps_stats;
+uint16_t gLocTxn;
+uint64_t gLocStopAt;
+uint32_t gLocNode, gLocPort;
+void locSend(uint16_t id, const uint8_t *tlvs, uint16_t tlvBytes) {
+    uint8_t m[96];
+    if (tlvBytes > sizeof m - 7) return;
+    m[0] = QCOM_QMI_REQUEST;
+    const uint16_t txn = ++gLocTxn;
+    memcpy(m + 1, &txn, 2); memcpy(m + 3, &id, 2); memcpy(m + 5, &tlvBytes, 2);
+    if (tlvBytes) memcpy(m + 7, tlvs, tlvBytes);
+    qcom_qrtr_send_data(&gMQrtr, kLocPort, gLocNode, gLocPort, m, (uint32_t)(7 + tlvBytes));
+}
+uint16_t tlv(uint8_t *at, uint8_t type, const void *v, uint16_t size) {at[0] = type; memcpy(at + 1, &size, 2); memcpy(at + 3, v, size); return (uint16_t)(3 + size);}
+void locStep() {
+    uint8_t b[80]; uint16_t n = 0;
+    switch (gs[0]) {
+    case 1: {
+        // libqmi's bits: position report 0, satellite info 1, inject time request 4, inject orbits request 5, engine state 7, fix session 8
+        const uint64_t mask = 1ull << 0 | 1ull << 1 | 1ull << 4 | 1ull << 5 | 1ull << 7 | 1ull << 8;
+        const uint8_t name[3] = {'H', 'A', 'L'}; const uint32_t type = 1; const uint8_t flag = 0;
+        n += tlv(b + n, 0x01, &mask, 8); n += tlv(b + n, 0x10, name, 3); n += tlv(b + n, 0x11, &type, 4); n += tlv(b + n, 0x12, &flag, 1);
+        locSend(0x21, b, n); break; }
+    case 2: {const uint32_t lock = 3; n += tlv(b, 0x10, &lock, 4); locSend(0x3b, b, n); break;}
+    case 3: locSend(0xbf, nullptr, 0); break;
+    case 4: locSend(0x36, nullptr, 0); break;
+    case 5: {
+        const uint8_t session = 1; const uint32_t periodic = 1, accuracy = 3, intermediate = 1, interval = 1000, altitude = 2;
+        n += tlv(b + n, 0x01, &session, 1); n += tlv(b + n, 0x10, &periodic, 4); n += tlv(b + n, 0x11, &accuracy, 4);
+        n += tlv(b + n, 0x12, &intermediate, 4); n += tlv(b + n, 0x13, &interval, 4); n += tlv(b + n, 0x15, &altitude, 4);
+        n += tlv(b + n, 0x16, &interval, 4);
+        locSend(0x22, b, n); break; }
+    }
+}
+void locReceive(void *, QcomQrtr *, uint32_t, uint32_t, uint32_t, const uint8_t *data, uint32_t length) {
+    QcomQmiMessage m;
+    if (qcom_qmi_parse(data, length, &m)) return;
+    uint32_t size = 0;
+    if (m.type == QCOM_QMI_RESPONSE) {
+        const uint8_t *r = qcom_qmi_tlv(&m, 0x02, &size);
+        uint16_t result = 1, error = 0xffff;
+        if (r && size >= 4) {memcpy(&result, r, 2); memcpy(&error, r + 2, 2);}
+        IOLog("HOUJI GPS: response 0x%x result %u error %u\n", m.message, result, error);
+        // setup answers are informational (SteamOS goes on whatever they say); registration and start must succeed
+        if (result && (m.message == 0x21 || m.message == 0x22)) {gs[8] = error; gs[0] = -(int32_t)m.message; return;}
+        if (m.message == 0x22) {
+            gs[0] = 6;
+            unsigned seconds = 300; PE_parse_boot_argn("houji_gps_seconds", &seconds, sizeof seconds);
+            clock_interval_to_deadline(seconds, kSecondScale, &gLocStopAt);
+            return;
+        }
+        if (m.message == 0x23) {gs[0] = 7; return;}
+        if (gs[0] >= 1 && gs[0] < 5) {gs[0] = gs[0] + 1; locStep();}
+        return;
+    }
+    if (m.type != QCOM_QMI_INDICATION) return;
+    gs[7] = gs[7] + 1;
+    static uint8_t seen[512 / 8];
+    if (m.message < 512 && !(seen[m.message / 8] & (1u << (m.message % 8)))) {
+        seen[m.message / 8] |= 1u << (m.message % 8);
+        IOLog("HOUJI GPS: first indication 0x%x (%u bytes)\n", m.message, m.length);
+    }
+    if (m.message == 0x24) {   // position report
+        gs[1] = gs[1] + 1;
+        uint32_t status = 0xff; const uint8_t *st = qcom_qmi_tlv(&m, 0x01, &size); if (st && size == 4) memcpy(&status, st, 4);
+        gs[6] = (int32_t)status;
+        const uint8_t *lat = qcom_qmi_tlv(&m, 0x10, &size), *lon = qcom_qmi_tlv(&m, 0x11, &size);
+        const uint8_t *unc = qcom_qmi_tlv(&m, 0x12, &size);
+        float u = -1; if (unc && size == 4) memcpy(&u, unc, 4);
+        if (status == 0 && lat && lon) {
+            double a, o; memcpy(&a, lat, 8); memcpy(&o, lon, 8);
+            houji_gps_last[0] = a; houji_gps_last[1] = o; houji_gps_last[2] = u;
+            houji_gps_last_time = mach_absolute_time();
+            gs[2] = gs[2] + 1;
+            gs[3] = (int32_t)(u * 100);
+            if (gs[2] == 1 || gs[2] % 30 == 0) IOLog("HOUJI GPS: fix %d, uncertainty %d m (position kept, not logged)\n", gs[2], (int)u);
+        }
+    } else if (m.message == 0x25) {   // satellites: the list's count byte
+        gs[4] = gs[4] + 1;
+        const uint8_t *list = qcom_qmi_tlv(&m, 0x10, &size);
+        if (list && size >= 1 && list[0] > gs[5]) gs[5] = list[0];
+    }
+}
+void locService() {
+    if (gs[0] == 0 && gMQrtr.hello_received) {
+        const int i = qcom_qrtr_find_remote(&gMQrtr, 0x10);
+        if (i < 0) return;
+        unsigned mode = 1; PE_parse_boot_argn("houji_gps", &mode, sizeof mode);
+        if (!mode) return;
+        gLocNode = gMQrtr.remote[i].node; gLocPort = gMQrtr.remote[i].port;
+        gs[0] = 1;
+        locStep();
+    }
+    if (gs[0] == 6 && gLocStopAt && mach_absolute_time() > gLocStopAt) {
+        const uint8_t session = 1; uint8_t b[8]; const uint16_t n = tlv(b, 0x01, &session, 1);
+        locSend(0x23, b, n);
+        gLocStopAt = 0;
+    }
+}
+}  // namespace
+namespace {
 void serviceModem(uint32_t bits) {
     if (!gMOn) return;
     if (bits & (kEvMSmp2p | kEvMGlink)) {
@@ -902,6 +1014,8 @@ void serviceModem(uint32_t bits) {
         mpump();
         qcom_glink_poll(&gMGlink);
         ms[4] = (int32_t)gMGlink.rx_messages; ms[5] = (int32_t)gMGlink.tx_messages;
+        locService();
+        mpump();
     }
 }
 
@@ -956,6 +1070,7 @@ bool modemStart() {
     qcom_qrtr_init(&gMQrtr, 1, mqrtrSend, nullptr);
     qcom_qrtr_add_service(&gMQrtr, QCOM_SERVLOC_SERVICE, QCOM_SERVLOC_INSTANCE, 1, mlocator, nullptr);
     qcom_qrtr_add_service(&gMQrtr, 14, 1, 2, rmtfsReceive, nullptr);
+    qcom_qrtr_add_service(&gMQrtr, 0, 0, kLocPort, locReceive, nullptr);   // the LOC client's port
     mstep(MsRmtfs);
     {   // houji_modem=3: the main image's init alone, for comparison with the dtb's
         unsigned mode = 0; PE_parse_boot_argn("houji_modem", &mode, sizeof mode);
@@ -1193,6 +1308,9 @@ extern "C" void houji_power_report(void) {
          IOLog("HOUJI MPSS: stage=%d err=%d slave=%x ready-ms=%d glink=%d/%d services=%d rmtfs=%d/%d rd=%dK wr=%dK scm=%d servloc=%d hello=%d loc=%d drop=%d\n",
                q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11], q[12], q[13], q[14], q[15]);
          IOLog("HOUJI MPSS TEXT: %.90s\n", native_mpss_text);
+         const volatile int32_t *g = native_gps_stats;
+         if (g[0]) IOLog("HOUJI GPS STATE: state=%d reports=%d fixes=%d unc-cm=%d sv-reports=%d max-sv=%d status=%d indications=%d err=%d\n",
+                         g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8]);
      }
      if (m[0]) IOLog("HOUJI MODEM: stage=%d bytes=%d span=%x segments=%d relocatable=%d dtb-span=%x min=%x err=%d\n", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);}
     const volatile int32_t *a = native_adsp_stats;

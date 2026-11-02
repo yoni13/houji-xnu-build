@@ -43,7 +43,7 @@ struct QcomQrtr {
 };
 
 void qcom_qrtr_init(QcomQrtr *q, uint32_t local_node, QcomQrtrSend send, void *send_context);
-/* Adds one of our services (instance as announced: version | instance << 8) on port; announced to the remote after its hello, or at
+/* Adds one of our services (instance as announced: version | instance << 8) on port (service 0: a client port, never announced); announced to the remote after its hello, or at
  * once when that has been. Returns 0, or -1 when full. */
 int qcom_qrtr_add_service(QcomQrtr *q, uint32_t service, uint32_t instance, uint32_t port, QcomQrtrReceive receive, void *context);
 /* The link is up: says hello. */

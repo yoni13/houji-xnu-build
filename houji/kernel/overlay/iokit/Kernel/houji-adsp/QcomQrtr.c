@@ -47,6 +47,7 @@ static int control(QcomQrtr *q, uint32_t command, const uint32_t words[4])
 
 static void announce(QcomQrtr *q, unsigned i)
 {
+    if (!q->local[i].service) return;  /* service 0: a client port, receives data but is not announced */
     const uint32_t words[4] = {q->local[i].service, q->local[i].instance, q->local_node, q->local[i].port};
     control(q, QCOM_QRTR_NEW_SERVER, words);
 }
