@@ -4,6 +4,9 @@
 // and, with houji_panel_sleep=1, sleep in (0x10). On: sleep out (0x11, 120 ms) when it slept, display on (0x29), then the brightness
 // read back from the panel at start (DCS 0x52). Nothing else changes the panel's state: a touch on a dark screen does not light it,
 // matching iOS, which ignores touches while its display is off.
+// iOS's own idle timer never fires on this port (Auto-Lock set, no dim or sleep request ever arrives), so with the display on and no
+// touch for houji_autolock seconds (default 60, 0 never) this presses the power key for it: iOS then locks and turns the display off
+// exactly as for a real press.
 // Commands go through DSI0's command DMA FIFO (0x0ae94000) with lonzzi/UniXNU-houji's HoujiBacklightProtocol.h; short DCS writes use the
 // MDSS header (last packet bit 31, data type 0x05, the command in bits 7:0).
 // Brightness: HoujiBacklight below answers iOS's AppleARMBacklight queries (lonzzi/UniXNU-houji's approach: the registry object stays
@@ -18,12 +21,15 @@
 #include <libkern/c++/OSDictionary.h>
 #include <sys/proc.h>
 #include <kern/thread.h>
+#include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include "HoujiBacklightProtocol.h"
 
 // [0] stage (1 running; negative: failed), [1] panel on, [2] level, [3] commands sent, [4] failed, [5] last change cause (1 iOS,
 // 4 console), [6] iOS power requests, [7] level read from the panel (0: not read), [8] iOS brightness requests, [9] last iOS level
 extern "C" {volatile int32_t native_screen_stats[10];}
+extern "C" uint64_t houji_dvfs_touch_time(void);   // arm/HoujiCpuDvfs.inc: the last touch down
+extern "C" void sweet_hid_key(int key, int down);   // arm/hid/SweetHID.cpp: key 0 is the power key
 
 namespace {
 IOMemoryMap *gMap;
@@ -115,11 +121,28 @@ void screenThread(void *, wait_result_t) {
     else if (readLevel(&level) && level >= HBL_MIN && level <= HBL_MAX) {gLevel = level; st[7] = (int32_t)level;}
     st[0] = 1; st[1] = 1; st[2] = (int32_t)gLevel;
     IOLog("HOUJI SCREEN: ready, level %u (%s), panel sleep %s\n", gLevel, st[7] ? "read from the panel" : "default", gSleepIn ? "on" : "off");
+    unsigned autolock = 60; PE_parse_boot_argn("houji_autolock", &autolock, sizeof autolock);
+    uint64_t activeSince = mach_absolute_time(), lockPressed = 0;
     for (;;) {
         IOLockLock(gLock);
-        while (!gPowerReq && !gLevelReq) IOLockSleep(gLock, (void *)&gPowerReq, THREAD_UNINT);
+        if (!gPowerReq && !gLevelReq) {
+            uint64_t deadline = 0; clock_interval_to_deadline(1, kSecondScale, &deadline);
+            IOLockSleepDeadline(gLock, (void *)&gPowerReq, deadline, THREAD_UNINT);
+        }
         const uint32_t power = gPowerReq, level = gLevelReq; gPowerReq = gLevelReq = 0;
         IOLockUnlock(gLock);
+        if (autolock && gOn) {
+            const uint64_t touch = houji_dvfs_touch_time(), since = touch > activeSince ? touch : activeSince;
+            uint64_t idleNs = 0; absolutetime_to_nanoseconds(mach_absolute_time() - since, &idleNs);
+            uint64_t sincePress = UINT64_MAX;
+            if (lockPressed) absolutetime_to_nanoseconds(mach_absolute_time() - lockPressed, &sincePress);
+            // one press per idle period; again only if iOS did not act on it within 10 s
+            if (idleNs > (uint64_t)autolock * 1000000000ull && sincePress > 10000000000ull) {
+                IOLog("HOUJI SCREEN: %u s without a touch, pressing power for iOS's lock\n", autolock);
+                sweet_hid_key(0, 1); IOSleep(120); sweet_hid_key(0, 0);
+                lockPressed = mach_absolute_time();
+            }
+        }
         // a level that arrives with "off" is kept for the wake; one with "on" is applied by it
         if (level) {
             const unsigned v = level & 0xffff;
@@ -127,7 +150,7 @@ void screenThread(void *, wait_result_t) {
             if (gOn && !(power & 3)) sendLevel(v);   // 0 from iOS: dark but on, as it asked
         }
         if ((power & 3) == 1) panelOff((power & 0x100) ? 1 : 4);
-        else if ((power & 3) == 2) panelOn((power & 0x100) ? 1 : 4);
+        else if ((power & 3) == 2) {panelOn((power & 0x100) ? 1 : 4); activeSince = mach_absolute_time(); lockPressed = 0;}
     }
 }
 void postPower(uint32_t req) {IOLockLock(gLock); gPowerReq = req; IOLockWakeup(gLock, (void *)&gPowerReq, false); IOLockUnlock(gLock);}
