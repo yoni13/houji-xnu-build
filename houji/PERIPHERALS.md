@@ -56,6 +56,21 @@ Measured as USB input minus battery charge power (charger readings), screen off,
 The remaining floor includes charger conversion loss. Not yet done: CPU power collapse in idle (PSCI CPU_SUSPEND; only WFI now),
 GPU power collapse, DDR/CX votes left by the boot firmware, copying only the changed area of a frame, and system sleep.
 
+## GPU cache coherence and interrupts (ported from lonzzi/UniXNU-houji 99beb10, 2026-11-03)
+- **Coherence.** Each boot (runtime mode 4, `houji_gpu_coherent=1` default) runs upstream's two-way CPU/GPU coherence proofs (two
+  copies, 8 write-back renders, CRC e843b26a) and then enables `coherent=2`: write-back inner-shareable GPU mappings skip CPU cache
+  maintenance; NC imports are still maintained. A failed proof with an idle GPU continues with coherent=0 (upstream panics).
+  Measured: per-submit cache publish 10 us average / 36 us max (before 200-600 us / 2-5 ms). Desktop, Settings and scrolling render
+  correctly; no SMMU/GPU faults. Also taken: guarded dispatch (GPU waits outside the issuer lock, replacing our pipelined gate,
+  which upstream considers unsafe with non-coherent maintenance), completion wakeups, buffer pool, 128-entry internal submit and
+  the batch ABI (our root's userland keeps the 32-buffer submit), no per-submit TLBIALL, 4 GiB GPU address layout.
+  Kept ours: GPU frequency governor and TSENS caps, the frame copy worker, IOSurface dirty tracking.
+- **Interrupts.** `pexpert/arm/HoujiSpi` (GIC SPI routing) with a dispatch hook in `sleh_irq`. IPCC (INTID 261, ADSP/modem
+  doorbells) and PCIe0 MSI (INTID 173, Wi-Fi) are real level interrupts: about 60 and 70 per second while Wi-Fi scans, battery and
+  Wi-Fi work, and the old 2 ms poller thread no longer starts. The RSC line (INTID 37) froze the boot as a GIC interrupt, so vote()
+  polls its TCS status itself. `houji_spi=0` restores polling; `houji_spi_mask` (bit 0 IPCC, 1 RSC, 2 MSI; default 5) selects lines.
+- Idle with the screen off after both: 2.4-2.5 W, CPU about 47.5 C (wfi=1 alone: 2.5-2.8 W, about 52 C).
+
 ## Buttons — implemented, not yet pressed on hardware
 `iokit/Kernel/houji-buttons/HoujiButtons.cpp`: power (PMK8550 PON pwrkey), volume down (resin), volume up (PM8550 GPIO 6) read
 every 20 ms through the SPMI observer (read only) and sent to SweetHID. Verified: both peripherals found, no read errors, idle state
