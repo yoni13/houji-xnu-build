@@ -1076,7 +1076,7 @@ bool tftpMap(const char *path, char *out, size_t size) {
         {"/readonly/firmware/image/", "image/"}, {"/readonly/firmware/modem_pr", "image/modem_pr"},
         {"/readonly/vendor/firmware_mnt/image/", "image/"}, {"/readonly/vendor/firmware/", "image/"},
         {"/readonly/mbnconfig/image/", "image/"}};
-    if (strstr(path, "..")) return false;
+    for (const char *c = path; *c; ++c) if (c[0] == '.' && c[1] == '.') return false;
     for (auto &m : map) {
         const size_t l = strlen(m.prefix);
         if (!strncmp(path, m.prefix, l)) {snprintf(out, size, "%s%s", m.to, path + l); return true;}
