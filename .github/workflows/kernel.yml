@@ -43,7 +43,7 @@ jobs:
           python-version: '3.12'
       - name: Select Xcode and tools
         run: |
-          brew install jq gum cmake ninja bash || true
+          brew install jq gum cmake ninja bash ccache || true
           printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
           sudo chmod +x /usr/local/bin/xcodes
           if [ -n "${{ inputs.xcode }}" ]; then sudo xcode-select -s "/Applications/Xcode_${{ inputs.xcode }}.app"; fi
@@ -80,7 +80,7 @@ jobs:
         env:
           FW_KEY: ${{ secrets.FW_KEY }}
       # The Apple build dependencies (tools and headers in dxb/fakeroot) and the KDK image depend only on the pinned dxb revision, the
-      # runner and Xcode: restored from the cache, only the KDK is installed again.
+      # runner and Xcode. The SWEET kernel links nothing from the KDK, so a cache hit does not install it.
       - name: Restore Apple build dependencies
         id: deps
         uses: actions/cache@v4
@@ -89,16 +89,6 @@ jobs:
             dxb/fakeroot
             kdk-cache
           key: dxb-deps-v1-${{ inputs.runner }}-xcode${{ inputs.xcode }}-${{ env.DXB_REV }}-${{ env.XNU_REV }}-${{ env.MACOS_VERSION }}
-      - name: Install the cached KDK
-        if: steps.deps.outputs.cache-hit == 'true'
-        run: |
-          set -euo pipefail
-          hdiutil attach -nobrowse kdk-cache/KDK.dmg
-          sudo mkdir -p /Library/Developer/KDKs
-          sudo installer -pkg '/Volumes/Kernel Debug Kit/KernelDebugKit.pkg' -target /
-          hdiutil detach '/Volumes/Kernel Debug Kit'
-          ls -d /Library/Developer/KDKs/*
-          touch deps-build.log
       - name: Build Apple build dependencies (dxb, without its XNU step)
         if: steps.deps.outputs.cache-hit != 'true'
         working-directory: dxb
@@ -119,12 +109,21 @@ jobs:
           ls fakeroot/usr/local/bin fakeroot/usr/local/lib/kernel
           ls -d /Library/Developer/KDKs/*
           mkdir -p ../kdk-cache && cp /tmp/KDK.dmg ../kdk-cache/KDK.dmg
+      # The built module depends only on the pinned Ath12kWifi revision, this fork's patches and its build script.
+      - name: Restore Wi-Fi module
+        id: wifi
+        uses: actions/cache@v4
+        with:
+          path: out/ath12k
+          key: ath12k-obj-v1-${{ env.ATH12K_WIFI_REV }}-${{ hashFiles('src/kernel/ath12k-module/**', 'src/tools/build-ath12k.py') }}
       - name: Restore Wi-Fi module sources
+        if: steps.wifi.outputs.cache-hit != 'true'
         uses: actions/cache@v4
         with:
           path: ath12k-wifi/deps
           key: ath12k-deps-v1-${{ env.ATH12K_WIFI_REV }}
       - name: Build Wi-Fi module (UniXNU Ath12kWifi)
+        if: steps.wifi.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           brew --prefix llvm >/dev/null 2>&1 || brew install llvm
@@ -133,18 +132,39 @@ jobs:
           git -C ath12k-wifi checkout -q FETCH_HEAD
           python3 src/tools/build-ath12k.py ath12k-wifi out/ath12k | tee ath12k-build.log
           test -f out/ath12k/houji_ath12k.o
+      - name: Use the Wi-Fi module
+        run: |
+          test -f out/ath12k/houji_ath12k.o
           echo "HOUJI_EXTRA_OBJS=$PWD/out/ath12k/houji_ath12k.o" >> "$GITHUB_ENV"
+      # Compiler cache through XNU's own $(CCACHE) hook (KCC = $(CCACHE) $(CC)). Paths are the same on every run, so no base
+      # directory is needed; include_file_* sloppiness because every checkout gives all headers a fresh mtime. Files that use
+      # __DATE__/__TIME__ (the USB console's build stamp) are never cached, so the boot log still shows this build's time.
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-v1-${{ inputs.runner }}-${{ github.run_id }}
+          restore-keys: ccache-v1-${{ inputs.runner }}-
       - name: Build houji kernel
         run: |
           set -o pipefail
           export HOUJI_XNU="$PWD/dxb/xnu"
-          export HOUJI_KDK="$(ls -d /Library/Developer/KDKs/KDK_13.5_*.kdk | head -1)"
+          export HOUJI_CCACHE=ccache CCACHE_DIR="$PWD/.ccache" CCACHE_MAXSIZE=2G
+          export CCACHE_SLOPPINESS=include_file_mtime,include_file_ctime
+          ccache -z
           export HOUJI_FAKEROOT="$PWD/dxb/fakeroot"
           export HOUJI_BUILD_ROOT="$PWD/out/kernel"
           export HOUJI_JOBS="$(sysctl -n hw.ncpu)"
           # The kernel build writes into DSTROOT=$HOUJI_BUILD_ROOT/fakeroot, but headers and
           # libfirehose_kernel come from FAKEROOT_DIR, which is the dxb fakeroot.
           bash src/tools/build-kernel.sh 2>&1 | tee kernel-build.log
+          ccache -s
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-v1-${{ inputs.runner }}-${{ github.run_id }}
       - name: Collect kernel
         if: always()
         run: |
