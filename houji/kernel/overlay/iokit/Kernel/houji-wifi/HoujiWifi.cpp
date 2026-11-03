@@ -28,7 +28,9 @@
 
 extern "C" int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *);   // HoujiAdsp.cpp: the 2 ms poller
 extern "C" const char *houji_smmu_route_stream(uint16_t stream, uint64_t dma, uint64_t bytes, uint32_t report[3]);   // HoujiUfsRead.cpp
-extern "C" void sheng_wifi_net_start(const uint8_t mac[6]);   // WifiNet.cpp: en0 and the registry entries the system looks for
+extern "C" void sheng_wifi_net_start(const uint8_t mac[6]);
+extern "C" void nw_wifi_ps_set(int on);          // the module (houji patch 0003)
+extern "C" uint64_t houji_dvfs_touch_time(void);  // HoujiCpuDvfs.inc: the last touch   // WifiNet.cpp: en0 and the registry entries the system looks for
 extern "C" int houji_modem_file(const char *path, uint8_t **data, size_t *size, size_t max);   // AdspFirmware.c
 
 // [0] stage (negative: the step that failed), [1] vote 0x52008, [2] vote 0x52000, [3] GDSC, [4] halt bits (bit i: branch i of kBranches off),
@@ -573,6 +575,19 @@ void wifiStack(volatile uint32_t *m, uint64_t barBytes, volatile uint32_t *cfg, 
                  nw_wifi_stats.last_err, gMsiCount, gMsiBits, gLogRepeats);
         }
         if ((n & 63) == 0) native_wifi_stats[1] = nw_wifi_stats.stage | nw_wifi_stats.scans << 8 | nw_wifi_stats.bss_seen << 16;
+        // Power save while the screen sits untouched for a minute (the radio dozes between beacons: about 100 ms more latency, much
+        // less heat); off at the next touch. Only on a connected link (stage 8); houji_wifi_ps=0 keeps it off.
+        static int psOn = 0; static uint64_t psCheck;
+        if (now >= psCheck) {
+            psCheck = now + 1000;
+            unsigned allow = 1; PE_parse_boot_argn("houji_wifi_ps", &allow, sizeof allow);
+            const uint64_t touch = houji_dvfs_touch_time();
+            uint64_t idleNs = UINT64_MAX;
+            if (touch) absolutetime_to_nanoseconds(mach_absolute_time() - touch, &idleNs);
+            const int want = allow && nw_wifi_stats.stage >= 8 && idleNs > 60ull * 1000000000ull;
+            if (nw_wifi_stats.stage < 8) psOn = 0;   // a new join starts with power save off (patch 0002)
+            else if (want != psOn) {nw_wifi_ps_set(want); psOn = want;}
+        }
     }
 }
 

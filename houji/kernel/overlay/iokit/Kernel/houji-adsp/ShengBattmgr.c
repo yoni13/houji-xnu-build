@@ -163,7 +163,13 @@ static void check_charge(ShengBattmgr *b)
     const int port = HAS(BmUsbAdapter) ? V(BmUsbAdapter) : 0;
     if (!b->fcc_ua || port < 6 || port > 8 || b->set_count || b->set_in_flight) return;
     const int temperate = HAS(BmTemperature) && V(BmTemperature) >= 1000 && V(BmTemperature) <= 4000;
-    const uint32_t fcc = temperate || b->fcc_ua < 500000 ? b->fcc_ua : 500000;
+    uint32_t fcc = temperate || b->fcc_ua < 500000 ? b->fcc_ua : 500000;
+    /* A full battery above 40 C takes no more charge (0: the supply still powers the phone) until it is below 38 C or under 95 %. */
+    if (HAS(BmTemperature) && HAS(BmCapacity)) {
+        if (!b->hot_hold && V(BmTemperature) > 4000 && V(BmCapacity) >= 10000) b->hot_hold = 1;
+        else if (b->hot_hold && (V(BmTemperature) < 3800 || V(BmCapacity) < 9500)) b->hot_hold = 0;
+    }
+    if (b->hot_hold) fcc = 0;
     if (fcc != b->fcc_target) {b->fcc_target = fcc; b->fcc_tries = 0;}
     if (HAS(BmChargeCurrent) && (uint32_t)V(BmChargeCurrent) != fcc && b->fcc_tries < 3) {
         queue_set(b, SHENG_BATTMGR_OP_BATTERY_SET, 12, fcc);

@@ -59,6 +59,7 @@ typedef struct {
     uint32_t fcc_ua, fcc_target, fcc_tries, fcc_sent, verify_tries, verify_sent, verify_next_cycle, sets_done;
     struct {uint32_t opcode, property, value;} set_queue[2];
     uint32_t set_count, set_in_flight;
+    uint8_t hot_hold;              /* houji: charging held, full and above 40 C */
     int32_t set_result;
 } ShengBattmgr;
 
