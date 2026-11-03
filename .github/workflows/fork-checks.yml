@@ -1,0 +1,42 @@
+name: Fork source checks
+
+# Runs yoni13/UniXNU-houji's own source and host checks (its .github/workflows/source-checks.yml matrix) for a branch of the fork,
+# whose own workflows are not enabled yet.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or commit of yoni13/UniXNU-houji
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Host checks (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            suite: portable
+          - os: macos-15
+            suite: all
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: yoni13/UniXNU-houji
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install host Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal --no-self-update
+      - name: Verify public source manifest
+        run: python3 tools/check-source-tree.py
+      - name: Run policy and BO regression checks
+        run: python3 tools/run-host-checks.py --suite ${{ matrix.suite }}
