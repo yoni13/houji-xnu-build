@@ -113,7 +113,7 @@ static unsigned contents(struct FhgState*s){
  const volatile uint8_t*code=s->rows[13].backing.cpu;
  for(size_t i=0;i<HCC_BYTES;i++){uint8_t expected=0;if(i>=HCC_SQE_OFFSET && i<HCC_SQE_OFFSET+FHG_SQE_BYTES-4)expected=s->assets[1][i-HCC_SQE_OFFSET+4];else if(i>=HCC_AQE_OFFSET && i<HCC_AQE_OFFSET+FHG_AQE_BYTES-4)expected=s->assets[2][i-HCC_AQE_OFFSET+4];if(code[i]!=expected)return FHG_CONTENTS;}
  /* Unused table pool pages and every owned CPU tail remain zero/unmapped. */
- if(!zeros((const volatile uint8_t*)s->rows[14].backing.cpu+FHG_LIVE_GPU_USED_PAGES*4096u,4096))return FHG_CONTENTS;
+ if(!zeros((const volatile uint8_t*)s->rows[14].backing.cpu+FHG_LIVE_GPU_USED_PAGES*4096u,(FHG_LIVE_GPU_TABLE_PAGES-FHG_LIVE_GPU_USED_PAGES)*4096u))return FHG_CONTENTS;
  if(!zeros((const volatile uint8_t*)s->rows[11].backing.cpu+9*4096,4096))return FHG_CONTENTS;
  for(unsigned i=0;i<FHG_ROWS;i++){if(!backing_valid(s,i) || !tail(s,i))return FHG_CONTENTS;s->tail_verified|=1u<<i;}
  return audit_graphs(s);

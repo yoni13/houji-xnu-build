@@ -228,12 +228,7 @@ static void houjiDvfsWorker(void*,wait_result_t){
  while(native_adreno_board_running()){(void)native_adreno_dvfs_poll();IOSleep(16);}
  thread_terminate(current_thread());
 }
-static void houjiDvfsStart(){
+static void houjiDvfsStart(){   /* this port's GPU governor (HoujiGpuDvfs.inc, our TSENS caps), not upstream's */
  unsigned flags=0;PE_parse_boot_argn("houji_dvfs",&flags,sizeof(flags));gHoujiDvfs.enabled=(flags&2)!=0;
- unsigned mhz=0;PE_parse_boot_argn("gpu_max_mhz",&mhz,sizeof(mhz));
- unsigned cap=hco_cap_mhz(mhz);
- if(!cap){IOLog("HOUJI GPU DVFS: invalid gpu_max_mhz=%u; using factory 903 MHz ceiling\n",mhz);cap=HCO_DEFAULT_CAP;}
- gHoujiDvfs.cap=cap;houji_thermal_start();
- if(gHoujiDvfs.enabled){thread_t t;if(kernel_thread_start(houjiDvfsWorker,nullptr,&t)==KERN_SUCCESS)thread_deallocate(t);
-  else {gHoujiDvfs.enabled=0;IOLog("HOUJI GPU DVFS: worker unavailable; fixed boot request remains 500 MHz\n");}}
+ if(gHoujiDvfs.enabled){thread_t t;if(kernel_thread_start(houjiDvfsWorker,nullptr,&t)==KERN_SUCCESS)thread_deallocate(t);}
 }

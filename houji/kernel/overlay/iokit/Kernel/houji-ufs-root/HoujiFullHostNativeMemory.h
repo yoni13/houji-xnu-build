@@ -2,7 +2,7 @@
  * Native descriptor binding for the CPU-only full r135 graph. This object does
  * not attach a domain, publish a root to hardware, hold device refs or execute.
  * A later execution owner needs its own retained lease; ready is not DMA proof.
- * Approximately 250KiB: static or explicitly retained heap storage only, NEVER
+ * Approximately 500KiB: static or explicitly retained heap storage only, NEVER
  * a kernel-stack local. FhgStorage is also never a kernel-stack local.
  */
 #ifndef HOUJI_FULL_HOST_NATIVE_MEMORY_H
@@ -31,7 +31,7 @@ static void houjiFullHostBarrier(void){__asm__ volatile("dsb sy":::"memory");}
 #endif
 class HoujiFullHostNativeMemory final {
 public:
- enum {Slots=15,MaxGpuRows=1028,MaxForeign=32};
+ enum {Slots=15,MaxGpuRows=FHG_LIVE_GPU_TABLE_PAGES,MaxForeign=32};
  struct Span {uint64_t va,pa,bytes;};
  struct Entry {
   FhgRequest request{};FhgBacking backing{};

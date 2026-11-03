@@ -3,6 +3,7 @@
 #define HOUJI_NATIVE_FULL_HOST_GRAPH_H
 #include <stddef.h>
 #include <stdint.h>
+#include "HoujiGpuAddressLayout.h"
 /* Independent fixed CPU-only graph. No old HHI/HSN storage is accepted. */
 #define FHG_ABI_VERSION 1u
 #define FHG_STORAGE_BYTES 32768u
@@ -10,9 +11,9 @@
 #define FHG_ROWS 15u
 #define FHG_GMU_RANGES 11u
 #define FHG_GPU_RANGES 12u
-#define FHG_LIVE_GPU_TABLE_PAGES 1028u
-#define FHG_LIVE_GPU_USED_PAGES 1027u
-#define FHG_LIVE_GPU_APERTURE UINT64_C(0x80000000)
+#define FHG_LIVE_GPU_TABLE_PAGES HOUJI_GPU_TABLE_OWNED_PAGES
+#define FHG_LIVE_GPU_USED_PAGES HOUJI_GPU_TABLE_USED_PAGES
+#define FHG_LIVE_GPU_APERTURE HOUJI_GPU_APERTURE
 #define FHG_GMU_BYTES 78588u
 #define FHG_SQE_BYTES 85300u
 #define FHG_AQE_BYTES 33176u
