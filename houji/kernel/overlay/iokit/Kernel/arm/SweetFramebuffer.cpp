@@ -30,6 +30,8 @@
  * first swap) switches the console to serial, which also hides panics.
  */
 #include "SweetSurface.h"
+class IOService;
+extern "C" void houji_backlight_start(IOService *provider);   /* houji-buttons/HoujiScreen.cpp */
 extern "C" void houji_surface_use_report(void);
 #include "HoujiSurfaceAcquire.h"
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -382,6 +384,7 @@ AppleCLCD::start(IOService *provider)
 	OSSafeReleaseNULL(horizontal);OSSafeReleaseNULL(vertical);OSSafeReleaseNULL(timing);OSSafeReleaseNULL(refresh);OSSafeReleaseNULL(timings);
 	if(!modeOK)return false;
 	registerService();
+	houji_backlight_start(this);
 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u\n",
 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id);
 	IOLog("HOUJI FB: native 1200x2670 canvas, owned render target, exact pixel copy; no resampling; touch stays normalized\n");

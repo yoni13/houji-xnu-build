@@ -6,17 +6,24 @@
 // matching iOS, which ignores touches while its display is off.
 // Commands go through DSI0's command DMA FIFO (0x0ae94000) with lonzzi/UniXNU-houji's HoujiBacklightProtocol.h; short DCS writes use the
 // MDSS header (last packet bit 31, data type 0x05, the command in bits 7:0).
+// Brightness: HoujiBacklight below answers iOS's AppleARMBacklight queries (lonzzi/UniXNU-houji's approach: the registry object stays
+// HoujiBacklight, only io_object_conforms_to and backboardd's property writes are extended, see patches/local.patch IOUserClient.cpp)
+// and hands CoreBrightness's levels (0..65536, FadePeriod) to the same thread, so one owner drives the command FIFO.
 // USB console: "screen off", "screen on" (the panel only; iOS keeps its own state), "screen LEVEL" (25..2866).
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IODeviceMemory.h>
+#include <IOKit/IOService.h>
+#include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSDictionary.h>
+#include <sys/proc.h>
 #include <kern/thread.h>
 #include <pexpert/pexpert.h>
 #include "HoujiBacklightProtocol.h"
 
 // [0] stage (1 running; negative: failed), [1] panel on, [2] level, [3] commands sent, [4] failed, [5] last change cause (1 iOS,
-// 4 console), [6] iOS power requests, [7] level read from the panel (0: not read)
-extern "C" {volatile int32_t native_screen_stats[8];}
+// 4 console), [6] iOS power requests, [7] level read from the panel (0: not read), [8] iOS brightness requests, [9] last iOS level
+extern "C" {volatile int32_t native_screen_stats[10];}
 
 namespace {
 IOMemoryMap *gMap;
@@ -35,7 +42,9 @@ uint64_t nowUs() {uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_tim
 HoujiDsiCommand gCmd;
 unsigned gLevel = 1600;
 bool gOn = true, gSlept = false, gSleepIn = false;
-volatile uint32_t gRequest;   // bit 31 set: a request; 1 off, 2 on (from iOS: | 0x100), 0x10000 | level
+// separate slots so a brightness change never replaces a pending power change; in each the latest request wins
+uint32_t gPowerReq;   // 0 none; 1 off, 2 on; | 0x100 from iOS
+uint32_t gLevelReq;   // 0 none; 0x80000000 | level (0..2866) | 0x40000000 from iOS
 IOLock *gLock;
 volatile int32_t *const st = native_screen_stats;
 
@@ -108,22 +117,92 @@ void screenThread(void *, wait_result_t) {
     IOLog("HOUJI SCREEN: ready, level %u (%s), panel sleep %s\n", gLevel, st[7] ? "read from the panel" : "default", gSleepIn ? "on" : "off");
     for (;;) {
         IOLockLock(gLock);
-        while (!gRequest) IOLockSleep(gLock, (void *)&gRequest, THREAD_UNINT);
-        const uint32_t req = gRequest; gRequest = 0;
+        while (!gPowerReq && !gLevelReq) IOLockSleep(gLock, (void *)&gPowerReq, THREAD_UNINT);
+        const uint32_t power = gPowerReq, level = gLevelReq; gPowerReq = gLevelReq = 0;
         IOLockUnlock(gLock);
-        if (!req) continue;
-        const int cause = (req & 0x100) ? 1 : 4;
-        if (req & 0x10000) {
-            gLevel = req & 0xffff; st[2] = (int32_t)gLevel;
-            if (gOn) sendLevel(gLevel);
-        } else if ((req & 3) == 1) panelOff(cause);
-        else if ((req & 3) == 2) panelOn(cause);
+        // a level that arrives with "off" is kept for the wake; one with "on" is applied by it
+        if (level) {
+            const unsigned v = level & 0xffff;
+            if (v) {gLevel = v; st[2] = (int32_t)v;}
+            if (gOn && !(power & 3)) sendLevel(v);   // 0 from iOS: dark but on, as it asked
+        }
+        if ((power & 3) == 1) panelOff((power & 0x100) ? 1 : 4);
+        else if ((power & 3) == 2) panelOn((power & 0x100) ? 1 : 4);
     }
 }
-void post(uint32_t req) {   // the latest request wins
-    IOLockLock(gLock); gRequest = req | 0x80000000u; IOLockWakeup(gLock, (void *)&gRequest, false); IOLockUnlock(gLock);
+void postPower(uint32_t req) {IOLockLock(gLock); gPowerReq = req; IOLockWakeup(gLock, (void *)&gPowerReq, false); IOLockUnlock(gLock);}
+void postLevel(uint32_t level, bool ios) {
+    IOLockLock(gLock); gLevelReq = 0x80000000u | (ios ? 0x40000000u : 0u) | level; IOLockWakeup(gLock, (void *)&gPowerReq, false);
+    IOLockUnlock(gLock);
 }
 }  // namespace
+
+// ---- the brightness service iOS looks for ----
+class HoujiBacklight : public IOService {
+    OSDeclareDefaultStructors(HoujiBacklight)
+public:
+    void publish(unsigned fraction) {
+        OSDictionary *b = OSDictionary::withCapacity(3), *p = OSDictionary::withCapacity(1);
+        OSNumber *min = OSNumber::withNumber(0ULL, 32), *max = OSNumber::withNumber((uint64_t)HBL_SCALE, 32), *v = OSNumber::withNumber(fraction, 32);
+        if (b && p && min && max && v) {
+            b->setObject("min", min); b->setObject("max", max); b->setObject("value", v); p->setObject("brightness", b);
+            setProperty("IODisplayParameters", p);
+        }
+        OSSafeReleaseNULL(b); OSSafeReleaseNULL(p); OSSafeReleaseNULL(min); OSSafeReleaseNULL(max); OSSafeReleaseNULL(v);
+    }
+    static OSNumber *number(OSObject *o) {
+        if (auto *n = OSDynamicCast(OSNumber, o)) return n;
+        if (auto *d = OSDynamicCast(OSDictionary, o)) return OSDynamicCast(OSNumber, d->getObject("value"));
+        return nullptr;
+    }
+    // CoreBrightness: {brightness: 0..65536 (a number or {value}), FadePeriod: 16.16 seconds, other display keys ignored}
+    static bool values(OSObject *object, unsigned *fraction) {
+        auto *d = OSDynamicCast(OSDictionary, object);
+        OSNumber *b = d ? number(d->getObject("brightness")) : nullptr;
+        if (!d || d->getCount() > 16 || !b || b->unsigned64BitValue() > HBL_SCALE) return false;
+        *fraction = b->unsigned32BitValue();
+        return true;
+    }
+    IOReturn setProperties(OSObject *object) APPLE_KEXT_OVERRIDE {
+        unsigned fraction = 0;
+        if (!values(object, &fraction)) return kIOReturnBadArgument;
+        const unsigned level = houjiBacklightLevel(fraction);
+        st[8] = st[8] + 1; st[9] = (int32_t)level;
+        if (st[0] == 1) postLevel(level, true);
+        publish(fraction);
+        return kIOReturnSuccess;
+    }
+};
+OSDefineMetaClassAndStructors(HoujiBacklight, IOService)
+static HoujiBacklight *gBacklight;
+// user space asks io_object_conforms_to(..., "AppleARMBacklight"); only this object answers yes, the kernel keeps its real class
+extern "C" bool houji_backlight_conforms(const OSObject *object, const char *name) {
+    return object && object == gBacklight && !strcmp(name, "AppleARMBacklight");
+}
+extern "C" bool houji_backlight_allows_properties(IORegistryEntry *entry, OSObject *object) {
+    if (!entry || entry != gBacklight) return false;
+    char process[32] = {}; proc_selfname(process, sizeof process);
+    unsigned fraction = 0;
+    return !strcmp(process, "backboardd") && HoujiBacklight::values(object, &fraction);
+}
+// from SweetFramebuffer's start, with the framebuffer as provider (houji_bl=0: none)
+extern "C" void houji_backlight_start(IOService *provider) {
+    unsigned enabled = 1; PE_parse_boot_argn("houji_bl", &enabled, sizeof enabled);
+    if (!enabled || gBacklight || !provider) return;
+    auto *s = new HoujiBacklight;
+    if (!s || !s->init() || !s->attach(provider) || !s->start(provider)) {
+        if (s) {s->detach(provider); s->release();}
+        IOLog("HOUJI BACKLIGHT: not registered\n");
+        return;
+    }
+    gBacklight = s;
+    const unsigned level = st[7] ? (unsigned)st[7] : 307;
+    s->publish(houjiBacklightFraction(level));
+    s->setProperty("backlight-control", true);
+    s->registerService();
+    s->release();
+    IOLog("HOUJI BACKLIGHT: registered for CoreBrightness, initial level %u\n", level);
+}
 
 extern "C" void houji_screen_start(void) {
     unsigned enabled = 1; PE_parse_boot_argn("houji_screen", &enabled, sizeof enabled);
@@ -134,18 +213,18 @@ extern "C" void houji_screen_start(void) {
 // iOS's display power (IOMobileFramebuffer selector 12)
 extern "C" void houji_screen_power(int on) {
     st[6] = st[6] + 1;
-    if (st[0] == 1) post((on ? 2u : 1u) | 0x100u);
+    if (st[0] == 1) postPower((on ? 2u : 1u) | 0x100u);
 }
 // "off", "on", or a level 25..2866
 extern "C" void houji_screen_command(const char *what) {
     if (st[0] != 1) return;
-    if (!strcmp(what, "off")) post(1);
-    else if (!strcmp(what, "on")) post(2);
+    if (!strcmp(what, "off")) postPower(1);
+    else if (!strcmp(what, "on")) postPower(2);
     else {unsigned v = 0; for (const char *c = what; *c >= '0' && *c <= '9'; ++c) v = v * 10 + (unsigned)(*c - '0');
-          if (v >= HBL_MIN && v <= HBL_MAX) post(0x10000 | v);}
+          if (v >= HBL_MIN && v <= HBL_MAX) postLevel(v, false);}
 }
 extern "C" void houji_screen_report(void) {
     const volatile int32_t *s = native_screen_stats;
-    IOLog("HOUJI SCREEN STATE: stage=%d on=%d level=%d sent=%d failed=%d cause=%d ios-requests=%d panel-level=%d\n", s[0], s[1], s[2], s[3],
-          s[4], s[5], s[6], s[7]);
+    IOLog("HOUJI SCREEN STATE: stage=%d on=%d level=%d sent=%d failed=%d cause=%d ios-requests=%d panel-level=%d brightness-requests=%d last=%d\n",
+          s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9]);
 }

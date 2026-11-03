@@ -1846,10 +1846,31 @@ index d74c063..c64e952 100644
  #if defined(__i386__) || defined(__x86_64__)
  	IOService::waitForService(
 diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
-index 2613ab5..163fce1 100644
 --- a/iokit/Kernel/IOUserClient.cpp
 +++ b/iokit/Kernel/IOUserClient.cpp
-@@ -2599,7 +2599,62 @@ is_io_service_match_property_table_bin(
+@@ -2431,6 +2431,11 @@
+ 	return ret;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern "C" bool houji_backlight_conforms(const OSObject *,const char *);
++extern "C" bool houji_backlight_allows_properties(IORegistryEntry *,OSObject *);
++#endif
++
+ /* Routine io_object_conforms_to */
+ kern_return_t
+ is_io_object_conforms_to(
+@@ -2443,6 +2448,9 @@
+ 	}
+ 
+ 	*conforms = (NULL != object->metaCast( className ));
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (!*conforms) *conforms = houji_backlight_conforms(object,className);
++#endif
+ 
+ 	return kIOReturnSuccess;
+ }
+@@ -2599,7 +2607,62 @@
  	return internal_io_service_match_property_table(service, matching, matchingCnt, matches);
  }
  
@@ -1913,7 +1934,7 @@ index 2613ab5..163fce1 100644
  internal_io_service_get_matching_services(
  	mach_port_t main_port,
  	const char * matching,
-@@ -2619,7 +2674,23 @@ internal_io_service_get_matching_services(
+@@ -2619,7 +2682,23 @@
  
  	if ((dict = OSDynamicCast( OSDictionary, obj))) {
  		IOTaskRegistryCompatibilityMatching(current_task(), dict);
@@ -1938,7 +1959,7 @@ index 2613ab5..163fce1 100644
  		kr = kIOReturnSuccess;
  	} else {
  		kr = kIOReturnBadArgument;
-@@ -2704,6 +2775,13 @@ internal_io_service_get_matching_service(
+@@ -2704,6 +2783,13 @@
  		IOTaskRegistryCompatibilityMatching(current_task(), dict);
  		*service = IOService::copyMatchingService( dict );
  		kr = *service ? kIOReturnSuccess : kIOReturnNotFound;
@@ -1952,7 +1973,7 @@ index 2613ab5..163fce1 100644
  	} else {
  		kr = kIOReturnBadArgument;
  	}
-@@ -2807,6 +2885,14 @@ internal_io_service_add_notification(
+@@ -2807,6 +2893,14 @@
  			continue;
  		}
  		IOTaskRegistryCompatibilityMatching(current_task(), dict);
@@ -1967,7 +1988,7 @@ index 2613ab5..163fce1 100644
  
  		if ((sym == gIOPublishNotification)
  		    || (sym == gIOFirstPublishNotification)) {
-@@ -3274,6 +3360,15 @@ is_io_registry_entry_from_path(
+@@ -3274,6 +3368,15 @@
  	}
  
  	entry = IORegistryEntry::fromPath( path );
@@ -1983,7 +2004,20 @@ index 2613ab5..163fce1 100644
  
  	if (!entry && IOTaskRegistryCompatibility(current_task())) {
  		OSDictionary * matching;
-@@ -4083,6 +4178,14 @@ is_io_registry_entry_get_child_iterator(
+@@ -3994,7 +4097,11 @@
+ 		}
+ #if CONFIG_MACF
+ 		else if (0 != mac_iokit_check_set_properties(kauth_cred_get(),
+-		    registry_entry, obj)) {
++		    registry_entry, obj)
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		    && !houji_backlight_allows_properties(entry,obj)
++#endif
++		    ) {
+ 			res = kIOReturnNotPermitted;
+ 		}
+ #endif
+@@ -4083,6 +4190,14 @@
  
  	*iterator = IOUserIterator::withIterator(entry->getChildIterator(
  		    IORegistryEntry::getPlane( plane )));
@@ -1998,7 +2032,7 @@ index 2613ab5..163fce1 100644
  
  	return kIOReturnSuccess;
  }
-@@ -4298,6 +4401,15 @@ is_io_service_open_extended(
+@@ -4298,6 +4413,15 @@
  #endif
  		res = service->newUserClient( owningTask, (void *) owningTask,
  		    connect_type, propertiesDict, &client );
