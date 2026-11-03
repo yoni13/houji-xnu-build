@@ -53,27 +53,33 @@ Remaining steps once the modem starts (the SteamOS port shows each is required):
 4. QMI LOC client (SteamOS `gps/houji-loc-test.c`: hold one QRTR client for the session, XTRA/UTC assistance).
 5. iOS: feed positions to locationd (no Qualcomm GNSS path exists in iOS).
 
-## Cameras — front sensor powered and identified
+## Cameras — all four sensors powered and identified
 No reference implementation: SteamOS lists cameras as not implemented, UniXNU-sheng has none, mainline has only camcc and CCI for
-SM8650 (no ISP driver). `houji-camera/HoujiCamera.cpp`, boot argument `houji_camera=1` (off by default; runs 70 s into the boot, then
-powers everything down; USB console `camera probe` reruns it).
+SM8650 (no ISP driver). `houji-camera/HoujiCamera.cpp`, boot argument `houji_camera=1` (off by default; runs 70 s into the boot and
+powers each camera down after its scan). USB console: `camera probe` (all) or `camera probe N` (cell N).
 
-Layout from the stock dtbo (fragment@68-70):
+Layout from the stock dtbo (fragments 67-70) and the base dtb in `vendor_boot` (pin groups):
 
-| Cell | Camera | Bus | MCLK / reset | vana / vdig / vio |
-|---|---|---|---|---|
-| 0 | wide | CCI0 master 1 | MCLK0 / `CAM_RESET_WIDE` | `camera_wide_avdd_ldo` / not yet read / not yet read, plus vaf |
-| 1 | front | QUP2 SE1 I2C (SDA GPIO 4, SCL GPIO 5) | MCLK4 GPIO 104 / GPIO 7 | L3M 2.8 V / L1M 1.1 V / L5M 1.8 V |
-| 2 | ultra-wide | CCI0 master 0 | MCLK1 GPIO 101 / GPIO 109 | `camera_ultra_avdd_ldo` / L2C / — |
-| 3 | tele | CCI0 master 0 | MCLK3 GPIO 103 / GPIO 110 | `camera_tele_avdd_ldo` / L1E / —, plus vaf |
+| Cell | Camera | Bus (SDA/SCL GPIO) | MCLK GPIO, camcc RCG/branch | Reset | vio / vana / vdig |
+|---|---|---|---|---|---|
+| 0 | wide | CCI0 master 1 (115/116) | 100, `0x15000`/`0x15018` | 108 | L10B 1.8 V / GPIO 127 switch / L2M 1.25 V |
+| 1 | front | QUP2 SE1 I2C (4/5) | 104, `0x15070`/`0x15088` | 7 | L5M 1.8 V / L3M 2.8 V / L1M 1.1 V |
+| 2 | ultra-wide | CCI1 master 0 (117/118) | 101, `0x1501c`/`0x15034` | 109 | L10B / GPIO 126 switch / L2C 1.104 V |
+| 3 | tele | CCI0 master 0 (113/114) | 103, `0x15054`/`0x1506c` | 110 | L10B / GPIO 125 switch / L1E 1.104 V |
 
-Front camera, verified on the phone (read-only probe):
-- Power: BOB2 (3.296 V, auto; PM8010 L3/L4 input, left on afterwards), then L5M, L3M, L1M through RPMh active TCS 2.
-- Clocks: GCC camera AHB/XO, Titan top GDSC (camcc `0x132bc`), MCLK4 RCG `0x15070` from XO (19.2 MHz) and branch `0x15088`.
-- Pins: GPIOs 4, 5 and 7 have an island (egpio) function and boot island-owned (config `0x801`); writes only reach them with
-  EGPIO_ENABLE (bit 12) set. I2C is bit-banged at about 100 kHz.
-- Bus scan: `0x10` and `0x21` answer with OmniVision chip ID `56 32 42` (OV32B) at `0x300a-0x300c`; `0x51` and `0x59` look like the
-  module EEPROM.
+Verified on the phone (read-only probe, 19.2 MHz MCLK from XO):
 
-Next: the rear sensors on CCI0 (the CCI controller, or its pins by hand, and the GPIO-switched supplies); then streaming, which needs
-CSIPHY, CSID and IFE programming with no public driver for this chip.
+| Cell | Sensor answers | ID read | Other devices |
+|---|---|---|---|
+| 0 wide | `0x10`, `0x21` | OmniVision `56 50 46` at `0x300a-0x300c` | `0x51`, `0x59` (EEPROM-like) |
+| 1 front | `0x10`, `0x21` | OmniVision `56 32 42` (OV32B) | `0x51`, `0x59` (EEPROM-like) |
+| 2 ultra-wide | `0x3d` | `38 e1` at `0x0000-0x0001` (Samsung S5KJN1) | `0x50` (EEPROM-like) |
+| 3 tele | `0x2d` | `38 e1` (Samsung S5KJN1) | `0x54` |
+
+Power sequence: BOB2 (3.296 V auto; PM8010 L3/L4 input, left on), GCC camera AHB/XO, Titan top GDSC (camcc `0x132bc`), then per
+camera vio, vana, vdig, MCLK, reset released. L10B is shared by the rear cameras and left on. GPIOs 4, 5 and 7 have an island (egpio)
+function and boot island-owned (config `0x801`): writes only reach them with EGPIO_ENABLE (bit 12) set. I2C is bit-banged at about
+100 kHz.
+
+Next: streaming, which needs sensor mode tables (the stock vendor sensor libraries), CSIPHY, CSID and IFE programming, and no public
+driver covers this chip; a first target is one raw frame from the front OV32B into memory.
