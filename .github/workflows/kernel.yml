@@ -43,7 +43,7 @@ jobs:
           python-version: '3.12'
       - name: Select Xcode and tools
         run: |
-          brew install jq gum cmake ninja bash ccache || true
+          brew install ccache   # jq, gum, cmake, ninja, bash: only for a dependency rebuild, below
           printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
           sudo chmod +x /usr/local/bin/xcodes
           if [ -n "${{ inputs.xcode }}" ]; then sudo xcode-select -s "/Applications/Xcode_${{ inputs.xcode }}.app"; fi
@@ -94,6 +94,7 @@ jobs:
         working-directory: dxb
         run: |
           set -o pipefail
+          brew install jq gum cmake ninja bash || true
           python3 - <<'EOF'
           from pathlib import Path
           p = Path('build.sh'); s = p.read_text()
