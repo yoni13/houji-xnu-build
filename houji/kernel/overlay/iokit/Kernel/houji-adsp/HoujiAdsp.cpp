@@ -134,17 +134,6 @@ void ipccIrq(void *) {
     native_adsp_stats[2] = native_adsp_stats[2] + 1;
     if (bits) wake(bits);
 }
-void rscIrq(void *) {
-    // As a real level interrupt every enabled completion must be acknowledged, not only our TCS's: Wi-Fi (TCS 0) and the camera
-    // (TCS 2) never wait for theirs, and a bit the boot firmware left enabled would otherwise hold the line.
-    const uint32_t pending = rd(gRsc, kRscTcs + gLayout.irq_status) & rd(gRsc, kRscTcs + 0);
-    if (pending) wr(gRsc, kRscTcs + gLayout.irq_clear, pending);
-    const uint32_t status = pending & gRscIrqBits;
-    if (!status) return;
-    __atomic_fetch_or(&gRscDone, status, __ATOMIC_RELEASE);
-    native_adsp_stats[15] = native_adsp_stats[15] + (1 << 16);
-    wake(kEvRsc);
-}
 
 // Waits for an event up to ms milliseconds; returns the event bits (0: the deadline passed).
 uint32_t waitEvents(uint32_t ms) {
@@ -255,9 +244,14 @@ int vote(uint32_t lcx, uint32_t lmx) {
     for (unsigned i = 0; i < n; ++i) wr(gRsc, kRscTcs + writes[i].offset, writes[i].value);
     uint64_t deadline;
     clock_interval_to_deadline(100, kMillisecondScale, &deadline);
-    while (!(__atomic_load_n(&gRscDone, __ATOMIC_ACQUIRE) & gRscIrqBits) && mach_absolute_time() < deadline) service(waitEvents(20));
-    bool done = (__atomic_load_n(&gRscDone, __ATOMIC_ACQUIRE) & gRscIrqBits) != 0;
-    if (!done && (rd(gRsc, kRscTcs + gLayout.irq_status) & gRscIrqBits)) done = true;  // one look in case the line is not ours
+    // The RSC's completion line is not taken as an interrupt (as a GIC SPI it froze the phone at boot): the TCS status is read here
+    // every millisecond while other events are still served.
+    bool done = false;
+    while (mach_absolute_time() < deadline) {
+        if (rd(gRsc, kRscTcs + gLayout.irq_status) & gRscIrqBits) {done = true; break;}
+        service(waitEvents(1));
+    }
+    if (done) wr(gRsc, kRscTcs + gLayout.irq_clear, gRscIrqBits);
     const unsigned m = qcom_rpmh_finish(&gLayout, (unsigned)gTcs, writes, 16);
     for (unsigned i = 0; i < m; ++i) wr(gRsc, kRscTcs + writes[i].offset, writes[i].value);
     native_adsp_stats[15] = (native_adsp_stats[15] & ~0xffff) | (int32_t)(lcx | lmx << 8 | (done ? 0 : 1u << 15));
@@ -519,7 +513,7 @@ bool attachIrqs() {
         IOSleep(250);
     }
     if (rc) {fail(StDoorbells, rc); return false;}
-    if (armcpu_spi_attach(32 + kSpiRsc, false, rscIrq, nullptr, nullptr, nullptr)) native_adsp_stats[15] |= 0x80 << 16;
+    // RSC completions: polled by vote() itself (attaching its line as a GIC SPI froze the boot)
     const uint32_t enable[3] = {qcom_ipcc_id(QCOM_IPCC_CLIENT_LPASS, QCOM_IPCC_SIGNAL_SMP2P),
                                 qcom_ipcc_id(QCOM_IPCC_CLIENT_LPASS, QCOM_IPCC_SIGNAL_GLINK_QMP),
                                 qcom_ipcc_id(QCOM_IPCC_CLIENT_AOP, QCOM_IPCC_SIGNAL_GLINK_QMP)};
@@ -1423,7 +1417,7 @@ extern "C" uint64_t houji_spi_count(uint32_t);
 extern "C" {volatile int32_t native_spi_stats[4];}   // [0] attached, [1] fell back to polling, [2] last attach result, [3] last INTID
 extern "C" int armcpu_spi_attach(uint32_t intid, bool edge, void (*handler)(void *), void *context, uint32_t *readback, uint64_t *router) {
     unsigned real = 1; PE_parse_boot_argn("houji_spi", &real, sizeof real);
-    unsigned mask = 7; PE_parse_boot_argn("houji_spi_mask", &mask, sizeof mask);   // bit 0 IPCC, 1 RSC, 2 Wi-Fi MSI
+    unsigned mask = 5; PE_parse_boot_argn("houji_spi_mask", &mask, sizeof mask);   // bit 0 IPCC, 1 RSC (froze the boot), 2 Wi-Fi MSI
     const unsigned bit = intid == 261 ? 1u : intid == 37 ? 2u : intid == 173 ? 4u : 0u;
     if (real && handler && (mask & bit)) {
         const int rc = houji_spi_attach(intid, edge ? 1 : 0, handler, context, readback, router);
