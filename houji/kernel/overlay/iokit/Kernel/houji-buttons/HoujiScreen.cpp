@@ -6,7 +6,9 @@
 // matching iOS, which ignores touches while its display is off.
 // iOS's own idle timer never fires on this port (Auto-Lock set, no dim or sleep request ever arrives), so with the display on and no
 // touch for houji_autolock seconds (default 60, 0 never) this presses the power key for it: iOS then locks and turns the display off
-// exactly as for a real press.
+// exactly as for a real press. Until the first touch after the display comes on the screen is the lock screen, whose "swipe up" hint
+// redraws at 120 Hz (a full-screen copy each frame here): like iOS's own lock-screen timeout, that wait is houji_autolock_lockscreen
+// seconds (default 10).
 // Commands go through DSI0's command DMA FIFO (0x0ae94000) with lonzzi/UniXNU-houji's HoujiBacklightProtocol.h; short DCS writes use the
 // MDSS header (last packet bit 31, data type 0x05, the command in bits 7:0).
 // Brightness: HoujiBacklight below answers iOS's AppleARMBacklight queries (lonzzi/UniXNU-houji's approach: the registry object stays
@@ -122,6 +124,8 @@ void screenThread(void *, wait_result_t) {
     st[0] = 1; st[1] = 1; st[2] = (int32_t)gLevel;
     IOLog("HOUJI SCREEN: ready, level %u (%s), panel sleep %s\n", gLevel, st[7] ? "read from the panel" : "default", gSleepIn ? "on" : "off");
     unsigned autolock = 60; PE_parse_boot_argn("houji_autolock", &autolock, sizeof autolock);
+    unsigned lockscreen = 10; PE_parse_boot_argn("houji_autolock_lockscreen", &lockscreen, sizeof lockscreen);
+    if (lockscreen > autolock) lockscreen = autolock;
     uint64_t activeSince = mach_absolute_time(), lockPressed = 0;
     for (;;) {
         IOLockLock(gLock);
@@ -137,8 +141,9 @@ void screenThread(void *, wait_result_t) {
             uint64_t sincePress = UINT64_MAX;
             if (lockPressed) absolutetime_to_nanoseconds(mach_absolute_time() - lockPressed, &sincePress);
             // one press per idle period; again only if iOS did not act on it within 10 s
-            if (idleNs > (uint64_t)autolock * 1000000000ull && sincePress > 10000000000ull) {
-                IOLog("HOUJI SCREEN: %u s without a touch, pressing power for iOS's lock\n", autolock);
+            const unsigned limit = touch > activeSince ? autolock : lockscreen;   // no touch since the display came on: the lock screen
+            if (limit && idleNs > (uint64_t)limit * 1000000000ull && sincePress > 10000000000ull) {
+                IOLog("HOUJI SCREEN: %u s without a touch%s, pressing power for iOS's lock\n", limit, limit == autolock ? "" : " on the lock screen");
                 sweet_hid_key(0, 1); IOSleep(120); sweet_hid_key(0, 0);
                 lockPressed = mach_absolute_time();
             }
