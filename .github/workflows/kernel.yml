@@ -11,6 +11,10 @@ on:
         description: Xcode version (empty = runner default)
         type: string
         default: ''
+      source_ref:
+        description: Branch or commit of yoni13/UniXNU-houji (the kernel sources)
+        type: string
+        default: main
 permissions:
   contents: read
 env:
@@ -27,6 +31,13 @@ jobs:
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
+      # Kernel sources: the public fork. This repository adds only private inputs (firmware headers, this phone's GPT and log
+      # trial bindings).
+      - uses: actions/checkout@v4
+        with:
+          repository: yoni13/UniXNU-houji
+          ref: ${{ inputs.source_ref }}
+          path: src
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -48,11 +59,10 @@ jobs:
           git init -q xnu-upstream
           git -C xnu-upstream fetch -q --depth 1 https://github.com/apple-oss-distributions/xnu.git "$XNU_REV"
           git -C xnu-upstream checkout -q FETCH_HEAD
-          python3 houji/tools/prepare-sources.py kernel --upstream xnu-upstream --output dxb/xnu
-          # Unmodified upstream files the published overlay references but does not carry
-          # (Apple hfs 31d5ec23 B-tree sources, IOHIDFamily usage tables, VerifiedRoot headers,
-          # and the untracked MASTER.arm64.sweet created by ios-vermeer-lab d68e05df 0006-0008).
-          cp -Rn houji/kernel/upstream-fill/. dxb/xnu/
+          python3 src/tools/prepare-sources.py kernel --upstream xnu-upstream --output dxb/xnu
+          git -C src log -1 --format='kernel sources: yoni13/UniXNU-houji %H %s'
+          # this phone's log file allocation and GPU handoff identity, and its GPT
+          cp private/HoujiLogAllocation.h private/HoujiZapTrial.h dxb/xnu/iokit/Kernel/houji-ufs-root/
           python3 retarget-layout.py dxb/xnu
           # dxb applies its generic patches with `git apply`; give the tree a repository.
           git -C dxb/xnu init -q && git -C dxb/xnu add -A >/dev/null && git -C dxb/xnu -c user.email=ci@local -c user.name=ci commit -qm houji
@@ -121,7 +131,7 @@ jobs:
           git init -q ath12k-wifi
           git -C ath12k-wifi fetch -q --depth 1 https://github.com/UniXNU/Ath12kWifi.git "$ATH12K_WIFI_REV"
           git -C ath12k-wifi checkout -q FETCH_HEAD
-          python3 houji/tools/build-ath12k.py ath12k-wifi out/ath12k | tee ath12k-build.log
+          python3 src/tools/build-ath12k.py ath12k-wifi out/ath12k | tee ath12k-build.log
           test -f out/ath12k/houji_ath12k.o
           echo "HOUJI_EXTRA_OBJS=$PWD/out/ath12k/houji_ath12k.o" >> "$GITHUB_ENV"
       - name: Build houji kernel
@@ -134,7 +144,7 @@ jobs:
           export HOUJI_JOBS="$(sysctl -n hw.ncpu)"
           # The kernel build writes into DSTROOT=$HOUJI_BUILD_ROOT/fakeroot, but headers and
           # libfirehose_kernel come from FAKEROOT_DIR, which is the dxb fakeroot.
-          bash houji/tools/build-kernel.sh 2>&1 | tee kernel-build.log
+          bash src/tools/build-kernel.sh 2>&1 | tee kernel-build.log
       - name: Collect kernel
         if: always()
         run: |
