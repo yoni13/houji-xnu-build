@@ -23,6 +23,23 @@ Safari loading a page by name.
   after each join); a heartbeat HTT stats request crashed this firmware (removed).
 - USB console: `wifi scan | join SSID PASS | leave | status`; `type TEXT` (`\n` = Return) types through a virtual keyboard.
 
+## Display power and brightness — working
+`houji-buttons/HoujiScreen.cpp` owns the panel's DSI0 command FIFO (`0x0ae94000`, lonzzi/UniXNU-houji's HoujiBacklightProtocol.h).
+- **Display power follows iOS.** backboardd calls IOMobileFramebuffer selector 12 with 0 on sleep and 1 on wake (seen on every
+  power-key press and lock); `SweetFramebuffer.cpp` forwards it. Off: brightness 0, DCS `0x28`; on: DCS `0x29`, then the last
+  non-zero level. `houji_panel_sleep=1` adds sleep in/out (`0x10`/`0x11`, 120 ms), untested on the panel. A touch on a dark screen
+  does nothing, as on iOS (which also ignores it); only the power key wakes.
+- **Brightness.** `HoujiBacklight` answers `io_object_conforms_to(..., "AppleARMBacklight")` and accepts backboardd's
+  `IODisplayParameters` writes (upstream's IOUserClient.cpp hooks in `patches/local.patch`); levels go to the same thread. The
+  Settings slider drove 0..2866 with no DSI failures. The panel's boot level is read back with DCS `0x52` (307 here).
+- **Auto-lock.** iOS's idle timer never fires on this port (Auto-Lock 1 minute: no dim or display-off request arrives). Fallback:
+  after `houji_autolock` seconds without a touch (default 60, 0 off) the kernel presses the power key, and iOS locks itself.
+  Open: why the idle timer does not run.
+- Verified on the phone: power-key sleep, taps and swipes on the dark screen (stayed off), power-key wake, swipe to unlock (home
+  screen), automatic lock after 60 s, slider.
+- Not done: the panel's refresh rate (it keeps the stock idle-refresh mode from the boot firmware; no 1-120 Hz/LTPO control), and
+  powering the touch controller down while the display is off.
+
 ## Buttons — implemented, not yet pressed on hardware
 `iokit/Kernel/houji-buttons/HoujiButtons.cpp`: power (PMK8550 PON pwrkey), volume down (resin), volume up (PM8550 GPIO 6) read
 every 20 ms through the SPMI observer (read only) and sent to SweetHID. Verified: both peripherals found, no read errors, idle state
