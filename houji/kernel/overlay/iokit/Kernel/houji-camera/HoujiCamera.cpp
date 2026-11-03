@@ -3,7 +3,8 @@
 // (off by default); runs once, 70 s into the boot, powering every camera down again after its scan. USB console: "camera probe" (all),
 // "camera probe N" (cell N only).
 // Facts from the handset's stock dtbo (fragments 67-70, qcom,cam-sensorN): the front sensor (cell 1) and its EEPROM sit on QUP2 SE1's
-// I2C (SDA GPIO 4, SCL GPIO 5); the rear ones on CCI0 (master 0: GPIO 113/114, ultra-wide and tele; master 1: GPIO 115/116, wide). Each
+// I2C (SDA GPIO 4, SCL GPIO 5); the rear ones on CCI: CCI0 master 0 (GPIO 113/114) tele, CCI0 master 1 (115/116) wide, CCI1 master 0
+// (117/118, fragment@69's cci_i2c_*2 pins) ultra-wide. Each
 // has an MCLK pin (function 1) fed by a camcc MCLK RCG/branch pair (camcc-sm8650.c), an active-low reset GPIO, and supplies (vio, vana,
 // vdig); the rear vana supplies are fixed regulators switched by a GPIO. camcc needs the MMCX rail (on for the display), GCC's camera
 // AHB (0x26004) and XO (0x26028) branches and, for the MCLKs, the Titan top GDSC. I2C is driven by toggling the two pins (open drain:
@@ -132,7 +133,7 @@ struct Camera {
 const Camera kCameras[4] = {
     {"wide", 115, 116, 100, 108, 127, 0x15000, 0x15018, {"ldob10", 1800, true}, {nullptr, 0, false}, {"ldom2", 1250, false}},
     {"front", 4, 5, 104, 7, -1, 0x15070, 0x15088, {"ldom5", 1800, false}, {"ldom3", 2800, false}, {"ldom1", 1100, false}},
-    {"ultra-wide", 113, 114, 101, 109, 126, 0x1501c, 0x15034, {"ldob10", 1800, true}, {nullptr, 0, false}, {"ldoc2", 1104, false}},
+    {"ultra-wide", 117, 118, 101, 109, 126, 0x1501c, 0x15034, {"ldob10", 1800, true}, {nullptr, 0, false}, {"ldoc2", 1104, false}},
     {"tele", 113, 114, 103, 110, 125, 0x15054, 0x1506c, {"ldob10", 1800, true}, {nullptr, 0, false}, {"ldoe1", 1104, false}},
 };
 volatile int32_t gOnly = -1;   // a console request for one cell
