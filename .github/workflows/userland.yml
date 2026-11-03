@@ -1,0 +1,35 @@
+name: houji userland helpers
+# Builds the fork's small iOS userland programs on macOS (iOS SDK, ad-hoc signing): the system-app registrar
+# (tools/build-system-apps.py) and the keyboard/status-bar geometry library (tools/build-userland-compat.py).
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch or commit of yoni13/UniXNU-houji
+        type: string
+        default: main
+permissions:
+  contents: read
+jobs:
+  userland:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: yoni13/UniXNU-houji
+          ref: ${{ inputs.source_ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build
+        run: |
+          set -euo pipefail
+          xcrun --sdk iphoneos --show-sdk-path
+          python3 tools/build-system-apps.py --output out/system-apps
+          python3 tools/build-userland-compat.py --output out/compat
+          ls -la out/system-apps out/compat
+      - uses: actions/upload-artifact@v4
+        with:
+          name: houji-userland
+          path: out/
+          retention-days: 30
