@@ -35,10 +35,26 @@ Safari loading a page by name.
 - **Auto-lock.** iOS's idle timer never fires on this port (Auto-Lock 1 minute: no dim or display-off request arrives). Fallback:
   after `houji_autolock` seconds without a touch (default 60, 0 off) the kernel presses the power key, and iOS locks itself.
   Open: why the idle timer does not run.
+  Before the first touch after a wake (the lock screen) the wait is `houji_autolock_lockscreen` (default 10 s), as on iOS: the
+  lock screen's "swipe up" hint bounces the home indicator at 120 Hz, a full-screen CPU copy per frame here (about +0.5-1 W).
 - Verified on the phone: power-key sleep, taps and swipes on the dark screen (stayed off), power-key wake, swipe to unlock (home
   screen), automatic lock after 60 s, slider.
 - Not done: the panel's refresh rate (it keeps the stock idle-refresh mode from the boot firmware; no 1-120 Hz/LTPO control), and
   powering the touch controller down while the display is off.
+
+## Idle power
+Measured as USB input minus battery charge power (charger readings), screen off, nothing drawing:
+
+| Boot line | Phone draw | CPU temperature | single-sample peaks |
+|---|---|---|---|
+| `wfi=0` (the inherited base boot line) | 3.2-3.5 W | about 60 C | 82-85 C |
+| `cpus=2 wfi=0` (six cores never started) | 2.6-2.9 W | | |
+| `wfi=1` (now the default) | 2.5-2.8 W | about 52 C | 54-62 C |
+
+`wfi=0` made XNU's `cpu_idle` skip the WFI instruction, so every idle core spun in the idle loop. Upstream r244 had already run
+`wfi=1` on all eight cores without missed wakeups; here wake, unlock, touch and Settings all worked with it.
+The remaining floor includes charger conversion loss. Not yet done: CPU power collapse in idle (PSCI CPU_SUSPEND; only WFI now),
+GPU power collapse, DDR/CX votes left by the boot firmware, copying only the changed area of a frame, and system sleep.
 
 ## Buttons — implemented, not yet pressed on hardware
 `iokit/Kernel/houji-buttons/HoujiButtons.cpp`: power (PMK8550 PON pwrkey), volume down (resin), volume up (PM8550 GPIO 6) read
