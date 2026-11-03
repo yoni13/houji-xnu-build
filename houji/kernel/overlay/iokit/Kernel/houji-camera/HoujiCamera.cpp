@@ -40,18 +40,21 @@ Window gTlmm, gGcc, gCamcc;
 // ---- TLMM: config at pin * 0x1000 (pull 1:0, function 5:2, drive 8:6, output enable 9), io at +4 (bit 0 in, bit 1 out) ----
 volatile uint32_t &pinCfg(unsigned pin) {return gTlmm.va[pin * 0x1000 / 4];}
 volatile uint32_t &pinIo(unsigned pin) {return gTlmm.va[(pin * 0x1000 + 4) / 4];}
+// Pins with an island (egpio) function belong to the application processor only while EGPIO_ENABLE (bit 12) is set; EGPIO_PRESENT is
+// bit 11 (pinctrl-sm8650.c, msm_pinmux_set_mux). Without it writes here do not reach the pin.
+void setCfg(unsigned pin, uint32_t v) {pinCfg(pin) = v | ((pinCfg(pin) & (1u << 11)) ? 1u << 12 : 0u);}
 void pinGpio(unsigned pin, bool output, int level) {
     if (level >= 0) pinIo(pin) = level ? 2u : 0u;
-    pinCfg(pin) = (output ? 1u << 9 : 0u) | (1u << 6);   // function 0 (GPIO), 4 mA, no pull
+    setCfg(pin, (output ? 1u << 9 : 0u) | (1u << 6));   // function 0 (GPIO), 4 mA, no pull
     dsb();
 }
 
 // ---- I2C by hand, about 100 kHz ----
 void half() {IODelay(5);}
-void sdaLow() {pinIo(kSda) = 0; pinCfg(kSda) = (1u << 9) | (1u << 6); dsb();}
-void sdaRelease() {pinCfg(kSda) = 1u << 6; dsb();}
-void sclLow() {pinIo(kScl) = 0; pinCfg(kScl) = (1u << 9) | (1u << 6); dsb();}
-bool sclRelease() {pinCfg(kScl) = 1u << 6; dsb(); for (unsigned i = 0; i < 1000; ++i) {if (pinIo(kScl) & 1) return true; IODelay(1);} return false;}
+void sdaLow() {pinIo(kSda) = 0; setCfg(kSda, (1u << 9) | (1u << 6)); dsb();}
+void sdaRelease() {setCfg(kSda, 1u << 6); dsb();}
+void sclLow() {pinIo(kScl) = 0; setCfg(kScl, (1u << 9) | (1u << 6)); dsb();}
+bool sclRelease() {setCfg(kScl, 1u << 6); dsb(); for (unsigned i = 0; i < 1000; ++i) {if (pinIo(kScl) & 1) return true; IODelay(1);} return false;}
 bool sdaRead() {return pinIo(kSda) & 1;}
 void start() {sdaRelease(); sclRelease(); half(); sdaLow(); half(); sclLow(); half();}
 void stop() {sdaLow(); half(); sclRelease(); half(); sdaRelease(); half();}
@@ -127,6 +130,10 @@ void cameraThread(void *, wait_result_t) {
     Rpmh rpmh = {};
     if ((!gTlmm.va && !mapWindow(gTlmm, kTlmm, 0x100000)) || (!gGcc.va && !mapWindow(gGcc, kGcc, 0x80000)) || !rpmh.open()) {cs[0] = -1; return;}
     cs[0] = 1;
+    static const unsigned pins[4] = {kSda, kScl, kReset, kMclk};
+    uint32_t saved[4];
+    for (unsigned i = 0; i < 4; ++i) saved[i] = pinCfg(pins[i]);
+    IOLog("HOUJI CAMERA: pins before: gpio4 %08x gpio5 %08x gpio7 %08x gpio104 %08x\n", saved[0], saved[1], saved[2], saved[3]);
     // camcc's rail MMCX is already up for the display (dispcc shares it); a vote from this DRV would replace the firmware's, so none here.
     uint32_t found = 0;
     static const uint32_t branches[] = {0x26004u, 0x26028u};
@@ -160,7 +167,7 @@ void cameraThread(void *, wait_result_t) {
     cs[2] = (int32_t)*cbcr;
     IOLog("HOUJI CAMERA: gdsc %08x cfg %08x (%s), mclk4 rcg cmd %08x cfg %08x, cbcr %08x\n", (unsigned)gdsc[0], (unsigned)gdsc[1],
           gdscOn ? "on" : "not on", (unsigned)rcg[0], (unsigned)rcg[1], (unsigned)*cbcr);
-    pinCfg(kMclk) = (1u << 2) | (1u << 6); dsb();   // function 1, 4 mA
+    setCfg(kMclk, (1u << 2) | (1u << 6)); dsb();   // function 1, 4 mA
     cs[0] = running ? 4 : -4;
     // reset: low, then released after the clock runs
     pinGpio(kReset, true, 0); IOSleep(5);
@@ -185,7 +192,9 @@ void cameraThread(void *, wait_result_t) {
     cs[0] = 6;
     // power down: reset, clock, supplies in reverse
     pinGpio(kReset, true, 0);
-    pinGpio(kMclk, false, -1);
+    IOSleep(1);
+    for (unsigned i = 0; i < 4; ++i) pinCfg(pins[i]) = saved[i];
+    dsb();
     *cbcr &= ~1u; dsb();
     *gdsc |= 1u; dsb();
     rpmh.ldo("ldom1", 0, false); rpmh.ldo("ldom3", 0, false); rpmh.ldo("ldom5", 0, false);
