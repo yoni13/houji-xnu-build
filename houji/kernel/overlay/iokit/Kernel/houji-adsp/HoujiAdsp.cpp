@@ -135,9 +135,12 @@ void ipccIrq(void *) {
     if (bits) wake(bits);
 }
 void rscIrq(void *) {
-    const uint32_t status = rd(gRsc, kRscTcs + gLayout.irq_status) & gRscIrqBits;
+    // As a real level interrupt every enabled completion must be acknowledged, not only our TCS's: Wi-Fi (TCS 0) and the camera
+    // (TCS 2) never wait for theirs, and a bit the boot firmware left enabled would otherwise hold the line.
+    const uint32_t pending = rd(gRsc, kRscTcs + gLayout.irq_status) & rd(gRsc, kRscTcs + 0);
+    if (pending) wr(gRsc, kRscTcs + gLayout.irq_clear, pending);
+    const uint32_t status = pending & gRscIrqBits;
     if (!status) return;
-    wr(gRsc, kRscTcs + gLayout.irq_clear, status);
     __atomic_fetch_or(&gRscDone, status, __ATOMIC_RELEASE);
     native_adsp_stats[15] = native_adsp_stats[15] + (1 << 16);
     wake(kEvRsc);
@@ -1399,8 +1402,9 @@ extern "C" void sheng_adsp_probe(void) {
 }
 
 // ---- houji glue ----
-// No GIC SPI attach in this kernel: the two interrupt handlers above only acknowledge a hardware status register (IPCC RECV_ID returns
-// NONE when nothing is pending, the RSC irq_status is masked to our TCS), so a 2 ms poller thread calls them instead.
+// GIC SPIs through pexpert's HoujiSpi (lonzzi/UniXNU-houji, from UniXNU ArmCpu's armcpu_spi_attach): IPCC (INTID 261), the apps RSC
+// (37) and PCIe0 MSI group 0 (173, Wi-Fi) as level interrupts on the boot CPU; the handlers acknowledge their status registers and only
+// wake threads. houji_spi=0, or an attach that fails, keeps the old 2 ms poller thread for that handler.
 namespace {
 struct Poller {void (*fn)(void *); void *context;};
 Poller gPollers[4];
@@ -1414,7 +1418,23 @@ void pollerThread(void *, wait_result_t) {
     }
 }
 }  // namespace
-extern "C" int armcpu_spi_attach(uint32_t, bool, void (*handler)(void *), void *context, uint32_t *, uint64_t *) {
+extern "C" int houji_spi_attach(uint32_t, int, void (*)(void *), void *, uint32_t *, uint64_t *);
+extern "C" uint64_t houji_spi_count(uint32_t);
+extern "C" {volatile int32_t native_spi_stats[4];}   // [0] attached, [1] fell back to polling, [2] last attach result, [3] last INTID
+extern "C" int armcpu_spi_attach(uint32_t intid, bool edge, void (*handler)(void *), void *context, uint32_t *readback, uint64_t *router) {
+    unsigned real = 1; PE_parse_boot_argn("houji_spi", &real, sizeof real);
+    if (real && handler) {
+        const int rc = houji_spi_attach(intid, edge ? 1 : 0, handler, context, readback, router);
+        native_spi_stats[2] = rc; native_spi_stats[3] = (int32_t)intid;
+        if (rc == -1) return kIOReturnNotReady;   // HoujiSpiNotReady: the GIC driver has not started yet; the callers retry
+        if (rc == 0) {
+            native_spi_stats[0] = native_spi_stats[0] + 1;
+            IOLog("HOUJI SPI: INTID %u attached as a GIC interrupt\n", intid);
+            return kIOReturnSuccess;
+        }
+        native_spi_stats[1] = native_spi_stats[1] + 1;
+        IOLog("HOUJI SPI: INTID %u attach failed (%d), 2 ms polling instead\n", intid, rc);
+    }
     static bool started;
     const unsigned n = __atomic_load_n(&gPollerCount, __ATOMIC_ACQUIRE);
     if (n >= 4 || !handler) return kIOReturnNoResources;
@@ -1507,6 +1527,8 @@ extern "C" void houji_power_start(void) {
     if (kernel_thread_start(houjiPowerThread, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
 }
 extern "C" void houji_power_report(void) {
+    IOLog("HOUJI SPI STATE: attached=%d polled=%d last=%d/%d interrupts ipcc=%llu rsc=%llu wifi-msi=%llu\n", native_spi_stats[0],
+          native_spi_stats[1], native_spi_stats[2], native_spi_stats[3], houji_spi_count(261), houji_spi_count(37), houji_spi_count(173));
     houji_wifi_report();
     houji_buttons_report();
     houji_screen_report();
