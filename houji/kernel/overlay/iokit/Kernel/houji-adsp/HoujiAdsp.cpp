@@ -1038,15 +1038,14 @@ void tftpFinish(Transfer &t) {
     if (!t.write && t.data) IOFreeData(t.data, t.size ? t.size : 1);
     t = {};
 }
-// tftp_send_data: one DATA block of the file at offset, cut to response_size when that is not 0
-void tftpData(unsigned slot, uint16_t block, uint32_t offset, uint32_t responseSize) {
+// one DATA block: length bytes of the file from offset (fewer when the file ends first)
+void tftpData(unsigned slot, uint16_t block, uint32_t offset, uint32_t length) {
     Transfer &t = gTx[slot];
     uint8_t b[4 + kTftpMaxBlk] = {0, 3, (uint8_t)(block >> 8), (uint8_t)block};
-    uint32_t len = offset < t.size ? (t.size - offset < t.blksize ? t.size - offset : t.blksize) : 0;
+    uint32_t len = offset < t.size ? (t.size - offset < length ? t.size - offset : length) : 0;
+    if (len > kTftpMaxBlk) len = kTftpMaxBlk;
     if (len) memcpy(b + 4, t.data + offset, len);
-    uint32_t send = 4 + len;
-    if (responseSize) {if (responseSize > len) return; send = 4 + responseSize;}
-    tftpSendRaw(slot, t.node, t.port, b, send);
+    tftpSendRaw(slot, t.node, t.port, b, 4 + len);
     ts[5] = ts[5] + 1;
 }
 void tftpOack(unsigned slot, bool tsize, bool timeout, uint32_t timeoutms) {
@@ -1062,16 +1061,18 @@ void tftpOack(unsigned slot, bool tsize, bool timeout, uint32_t timeoutms) {
     tftpSendRaw(slot, t.node, t.port, (const uint8_t *)b, n);
     IOLog("HOUJI TFTP: oack slot %u (%u bytes), queue %u, glink refused %u last %d\n", slot, n, gMCount, gMRefused, (int)gMLastRc);
 }
-// handle_reader: an ACK of block last; the next window, as tqftpserv cuts it with rsize
+// An ACK of block last: the next window. tqftpserv relies on the modem's own block size, larger than every rsize read it makes; with
+// the smaller blocks here each read stops exactly at rsize (one block past it reached the modem as the answer to its next request).
+// rsize 0: one block, as tqftpserv sends it (the modem asks with tsize, then ends the transfer).
 void tftpAck(unsigned slot, uint16_t last) {
     Transfer &t = gTx[slot];
-    if ((uint64_t)last * t.blksize > t.rsize) {tftpFinish(t); return;}
+    if (!t.rsize) {if (last >= 1) {tftpFinish(t); return;} tftpData(slot, 1, t.seek, t.blksize); return;}
+    if ((uint64_t)last * t.blksize >= t.rsize) {tftpFinish(t); return;}
     for (uint32_t block = last; block < (uint32_t)last + t.wsize; ++block) {
-        const uint32_t offset = t.seek + block * t.blksize;
-        uint32_t responseSize = 0;
-        if ((uint64_t)(block + 1) * t.blksize > t.rsize) responseSize = t.rsize % t.blksize;
-        tftpData(slot, (uint16_t)(block + 1), offset, responseSize);
-        if ((uint64_t)(block + 1) * t.blksize > t.rsize) break;
+        const uint64_t off = (uint64_t)block * t.blksize;
+        if (off >= t.rsize) break;
+        const uint32_t n = t.rsize - off < t.blksize ? (uint32_t)(t.rsize - off) : t.blksize;
+        tftpData(slot, (uint16_t)(block + 1), (uint32_t)(t.seek + off), n);
     }
 }
 bool tftpMap(const char *path, char *out, size_t size) {
@@ -1132,7 +1133,7 @@ void tftpRequest(void *, QcomQrtr *, uint32_t, uint32_t node, uint32_t from, con
         if (rc) {ts[2] = ts[2] + 1; tftpError(slot, node, from, 1, "file not found"); return;}
         ts[1] = ts[1] + 1;
         t.active = true; t.data = bytes; t.size = (uint32_t)size;
-        if (options) tftpOack(slot, tsize, timeout, timeoutms); else tftpData(slot, 1, 0, 0);
+        if (options) tftpOack(slot, tsize, timeout, timeoutms); else tftpData(slot, 1, 0, blksize);
     } else {
         ts[3] = ts[3] + 1;
         RwFile *f = !strncmp(file, "/readwrite/", 11) ? rwFile(file + 11, true) : nullptr;
@@ -1153,7 +1154,6 @@ void tftpPort(void *context, QcomQrtr *, uint32_t, uint32_t node, uint32_t from,
         char msg[48] = {}; if (length > 4) memcpy(msg, data + 4, length - 4 < sizeof msg - 1 ? length - 4 : sizeof msg - 1);
         IOLog("HOUJI TFTP: the modem ended a transfer: code %u %.47s\n", block, msg);
         ts[6] = ts[6] + 1; tftpFinish(t); return;}
-    if (op == 4 && !t.write) IOLog("HOUJI TFTP: ack %u on slot %u\n", block, slot);
     if (!t.write) {if (op == 4) tftpAck(slot, block); return;}
     if (op != 3) return;
     if (block != t.expected) {tftpError(slot, node, from, 4, "Block number out of sequence"); return;}
