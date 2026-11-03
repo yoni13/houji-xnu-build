@@ -155,7 +155,9 @@ jobs:
           ccache -z
           export HOUJI_FAKEROOT="$PWD/dxb/fakeroot"
           export HOUJI_BUILD_ROOT="$PWD/out/kernel"
-          export HOUJI_JOBS="$(sysctl -n hw.ncpu)"
+          # Warm builds are ~4500 short steps (header installs, ccache hits, MIG) that wait on I/O more than CPU: run more than the
+          # runner's 3 cores.
+          export HOUJI_JOBS=8
           # The kernel build writes into DSTROOT=$HOUJI_BUILD_ROOT/fakeroot, but headers and
           # libfirehose_kernel come from FAKEROOT_DIR, which is the dxb fakeroot.
           # About 100 MB of compiler warnings: kept in kernel-build.log (uploaded), not streamed into the job log.
@@ -164,6 +166,10 @@ jobs:
           set -o pipefail
           bash src/tools/build-kernel.sh 2>&1 | perl -MTime::HiRes=time -ne 'BEGIN{$t0=time} printf "%7.2f %s", time-$t0, $_' > kernel-build.log || status=$?
           ccache -s
+          # A new cache entry only when this build compiled something real (each save uploads ~600 MB, about 14 s).
+          misses=$(ccache --print-stats | awk '$1=="local_storage_miss"{print $2}')
+          echo "ccache misses: ${misses:-?}"
+          [ "${misses:-1}" -ge 20 ] && echo "CCACHE_SAVE=1" >> "$GITHUB_ENV"
           echo "kernel build exit $status, $(wc -c < kernel-build.log) bytes of output"
           if [ "$status" != 0 ]; then
             grep -E ' error: |Undefined symbols|undefined reference|ld: |referenced from|patch failed|does not apply|Trial binding|\*\*\* ' kernel-build.log | head -60
@@ -171,7 +177,7 @@ jobs:
             exit "$status"
           fi
       - name: Save compiler cache
-        if: always()
+        if: always() && env.CCACHE_SAVE == '1'
         uses: actions/cache/save@v4
         with:
           path: .ccache
