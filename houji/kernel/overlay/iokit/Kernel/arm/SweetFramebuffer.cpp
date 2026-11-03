@@ -948,6 +948,30 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
 		bzero(args->structureOutput, args->structureOutputSize);
 	}
+	/* Display power and other state changes: a call whose scalars or struct size differ from that selector's last one is logged
+	 * (the frame path, selectors 3-6, excluded). */
+	if (selector < 96 && (selector < 3 || selector > 6)) {
+		static uint64_t lastSig[96];
+		uint64_t sig = 0x9e3779b97f4a7c15ULL * (args->scalarInputCount + 1) ^ args->structureInputSize;
+		for (uint32_t i = 0; i < args->scalarInputCount && i < 4; i++) sig = (sig ^ args->scalarInput[i]) * 0x100000001b3ULL;
+		if (args->structureInput && args->structureInputSize >= 4 && args->structureInputSize <= 16) {
+			uint32_t w; memcpy(&w, args->structureInput, 4); sig = (sig ^ w) * 0x100000001b3ULL;
+		}
+		if (lastSig[selector] != sig) {
+			const bool first = !lastSig[selector];
+			lastSig[selector] = sig;
+			if (!first || selector >= 64 || (sweet_fb_logged & (1ULL << selector))) {
+				char name[32];
+				proc_selfname(name, sizeof(name));
+				uint32_t w = 0;
+				if (args->structureInput && args->structureInputSize >= 4) memcpy(&w, args->structureInput, 4);
+				IOLog("SWEET FB CHANGE: %s sel %u scalars %u [%llx %llx %llx %llx] struct %u first-word %x\n", name, selector,
+				    args->scalarInputCount, args->scalarInputCount > 0 ? args->scalarInput[0] : 0,
+				    args->scalarInputCount > 1 ? args->scalarInput[1] : 0, args->scalarInputCount > 2 ? args->scalarInput[2] : 0,
+				    args->scalarInputCount > 3 ? args->scalarInput[3] : 0, args->structureInputSize, w);
+			}
+		}
+	}
 	if (selector >= 64 || !(sweet_fb_logged & (1ULL << selector))) {
 		if (selector < 64) {
 			sweet_fb_logged |= 1ULL << selector;
