@@ -13,7 +13,7 @@ extern "C" {
 #define QCOM_QRTR_HEADER 32u
 #define QCOM_QRTR_PORT_CTRL 0xfffffffeu
 #define QCOM_QRTR_NODE_BROADCAST 0xffffffffu
-#define QCOM_QRTR_MAX_LOCAL 4u
+#define QCOM_QRTR_MAX_LOCAL 16u
 #define QCOM_QRTR_MAX_REMOTE 128u
 
 enum {

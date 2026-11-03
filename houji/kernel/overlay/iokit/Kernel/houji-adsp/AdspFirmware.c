@@ -173,22 +173,32 @@ void sheng_fw_close(void *handle)
 
 // A whole file of the firmware partition (such as "image/kiwi/amss20.bin"), read into memory from IOMallocData; the caller frees it with
 // IOFreeData(*data, *size). Returns 0, ENXIO while the storage driver is not up yet, ENOENT, EFBIG (over max bytes), ENOMEM or EIO.
-int houji_modem_file(const char *path, uint8_t **data, size_t *size, size_t max)
+// which: 0 the firmware partition (modem_a), 1 the modem's (modemfirmware_a). An empty file comes back as one allocated byte, size 0.
+int houji_fw_file(unsigned which, const char *path, uint8_t **data, size_t *size, size_t max)
 {
     fwLock();
-    int rc = mountPartition();
+    int rc = which > 1 ? EINVAL : mountVolume(which);
     FatFile file;
     if (!rc) {
-        const int found = fat_open(gVolume, path, &file);
+        const int found = fat_open(gVolumes[which], path, &file);
         rc = found == FatNotFound ? ENOENT : found ? EIO : 0;
     }
     uint8_t *bytes = NULL;
-    if (!rc && (!file.size || file.size > max)) rc = EFBIG;
-    if (!rc && !(bytes = IOMallocData(file.size))) rc = ENOMEM;
-    if (!rc && fat_read(gVolume, &file, 0, bytes, file.size)) {IOFreeData(bytes, file.size); rc = EIO;}
+    const size_t alloc = rc ? 0 : (file.size ? file.size : 1);
+    if (!rc && file.size > max) rc = EFBIG;
+    if (!rc && !(bytes = IOMallocData(alloc))) rc = ENOMEM;
+    if (!rc && file.size && fat_read(gVolumes[which], &file, 0, bytes, file.size)) {IOFreeData(bytes, alloc); rc = EIO;}
     fwUnlock();
     if (rc) return rc;
     *data = bytes;
     *size = file.size;
     return 0;
+}
+int houji_modem_file(const char *path, uint8_t **data, size_t *size, size_t max)
+{
+    size_t n = 0;
+    const int rc = houji_fw_file(0, path, data, &n, max);
+    if (!rc && !n) {IOFreeData(*data, 1); return EFBIG;}
+    if (!rc) *size = n;
+    return rc;
 }

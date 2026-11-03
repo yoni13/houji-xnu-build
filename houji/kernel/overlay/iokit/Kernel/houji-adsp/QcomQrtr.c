@@ -7,7 +7,7 @@ static void put16(uint8_t *p, uint32_t v) {p[0] = (uint8_t)v; p[1] = (uint8_t)(v
 static void put32(uint8_t *p, uint32_t v) {put16(p, v); put16(p + 2, v >> 16);}
 
 #define CTRL_BYTES 20u  /* command and four words */
-#define MAX_PACKET 512u
+#define MAX_PACKET 1100u  /* houji: a TFTP DATA block of 1024 bytes and its headers */
 
 void qcom_qrtr_init(QcomQrtr *q, uint32_t local_node, QcomQrtrSend send, void *send_context)
 {

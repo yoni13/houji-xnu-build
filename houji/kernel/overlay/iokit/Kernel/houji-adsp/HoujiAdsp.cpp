@@ -760,7 +760,7 @@ Window gRmtfsMem;
 QcomQrtr gMQrtr;
 QcomGlinkChannel *gMChannel;
 uint8_t *gMChannelStorage;
-struct MPacket {uint32_t length; uint8_t data[1536];};
+struct MPacket {uint32_t length; uint8_t data[1152];};
 MPacket *gMQueue; uint32_t gMHead, gMCount;
 bool loadRmtfs() {
     for (RmtfsFile &f : gRmtfs) {
@@ -1001,6 +1001,168 @@ void locService() {
     }
 }
 }  // namespace
+// ---- TFTP over QRTR (service 4096, version 1): the modem's file requests, as linux-msm tqftpserv (c2559a2) answers them ----
+// Reads: /readonly/firmware/image/X, /readonly/firmware/modem_pr..., /readonly/vendor/firmware/X, /readonly/vendor/firmware_mnt/image/X
+// and (the SteamOS port's mbnconfig mapping) /readonly/mbnconfig/image/modem_pr/mcfg/... all come from image/... of modemfirmware_a.
+// /readwrite/X files live in RAM for this boot. Each transfer answers from a port of its own (ports 16 to 23). Block size is held to
+// 1024 and the window to 8 so a packet fits the link's queue. [0] read requests, [1] served, [2] not found, [3] write requests,
+// [4] writes completed, [5] blocks sent, [6] errors from the modem, [7] transfers refused for want of a slot
+extern "C" int houji_fw_file(unsigned which, const char *path, uint8_t **data, size_t *size, size_t max);
+extern "C" {volatile int32_t native_tftp_stats[8];}
+namespace {
+constexpr uint32_t kTftpPortBase = 16, kTftpSlots = 8, kTftpMaxBlk = 1024, kTftpMaxWindow = 8;
+volatile int32_t *const ts = native_tftp_stats;
+struct RwFile {char name[64]; uint8_t *data; uint32_t size, cap;};
+RwFile gRw[16];
+struct Transfer {
+    bool active, write;
+    uint32_t node, port;           // the modem's end
+    uint8_t *data; uint32_t size;  // reads: the whole file; writes: into the RAM file
+    RwFile *rw;
+    uint32_t blksize, wsize, rsize, seek;
+    uint16_t expected;
+};
+Transfer gTx[kTftpSlots];
+void tftpSendRaw(unsigned slot, uint32_t node, uint32_t port, const uint8_t *b, uint32_t n) {
+    qcom_qrtr_send_data(&gMQrtr, kTftpPortBase + slot, node, port, b, n);
+}
+void tftpError(unsigned slot, uint32_t node, uint32_t port, uint16_t code, const char *msg) {
+    uint8_t b[64] = {0, 5, (uint8_t)(code >> 8), (uint8_t)code};
+    const size_t l = strlen(msg) < 50 ? strlen(msg) : 50;
+    memcpy(b + 4, msg, l); b[4 + l] = 0;
+    tftpSendRaw(slot, node, port, b, (uint32_t)(5 + l));
+}
+void tftpFinish(Transfer &t) {
+    if (!t.write && t.data) IOFreeData(t.data, t.size ? t.size : 1);
+    t = {};
+}
+// tftp_send_data: one DATA block of the file at offset, cut to response_size when that is not 0
+void tftpData(unsigned slot, uint16_t block, uint32_t offset, uint32_t responseSize) {
+    Transfer &t = gTx[slot];
+    uint8_t b[4 + kTftpMaxBlk] = {0, 3, (uint8_t)(block >> 8), (uint8_t)block};
+    uint32_t len = offset < t.size ? (t.size - offset < t.blksize ? t.size - offset : t.blksize) : 0;
+    if (len) memcpy(b + 4, t.data + offset, len);
+    uint32_t send = 4 + len;
+    if (responseSize) {if (responseSize > len) return; send = 4 + responseSize;}
+    tftpSendRaw(slot, t.node, t.port, b, send);
+    ts[5] = ts[5] + 1;
+}
+void tftpOack(unsigned slot, bool tsize, bool timeout, uint32_t timeoutms) {
+    Transfer &t = gTx[slot];
+    char b[200]; uint32_t n = 2; b[0] = 0; b[1] = 6;
+    auto opt = [&](const char *k, uint32_t v) {n += (uint32_t)snprintf(b + n, sizeof b - n, "%s", k) + 1; n += (uint32_t)snprintf(b + n, sizeof b - n, "%u", v) + 1;};
+    opt("blksize", t.blksize);
+    if (timeout) opt("timeoutms", timeoutms);
+    if (tsize) opt("tsize", t.size);
+    if (t.wsize) opt("wsize", t.wsize);
+    if (t.rsize) opt("rsize", t.rsize);
+    if (t.seek) opt("seek", t.seek);
+    tftpSendRaw(slot, t.node, t.port, (const uint8_t *)b, n);
+}
+// handle_reader: an ACK of block last; the next window, as tqftpserv cuts it with rsize
+void tftpAck(unsigned slot, uint16_t last) {
+    Transfer &t = gTx[slot];
+    if ((uint64_t)last * t.blksize > t.rsize) {tftpFinish(t); return;}
+    for (uint32_t block = last; block < (uint32_t)last + t.wsize; ++block) {
+        const uint32_t offset = t.seek + block * t.blksize;
+        uint32_t responseSize = 0;
+        if ((uint64_t)(block + 1) * t.blksize > t.rsize) responseSize = t.rsize % t.blksize;
+        tftpData(slot, (uint16_t)(block + 1), offset, responseSize);
+        if ((uint64_t)(block + 1) * t.blksize > t.rsize) break;
+    }
+}
+bool tftpMap(const char *path, char *out, size_t size) {
+    static const struct {const char *prefix; const char *to;} map[] = {
+        {"/readonly/firmware/image/", "image/"}, {"/readonly/firmware/modem_pr", "image/modem_pr"},
+        {"/readonly/vendor/firmware_mnt/image/", "image/"}, {"/readonly/vendor/firmware/", "image/"},
+        {"/readonly/mbnconfig/image/", "image/"}};
+    if (strstr(path, "..")) return false;
+    for (auto &m : map) {
+        const size_t l = strlen(m.prefix);
+        if (!strncmp(path, m.prefix, l)) {snprintf(out, size, "%s%s", m.to, path + l); return true;}
+    }
+    return false;
+}
+RwFile *rwFile(const char *name, bool create) {
+    for (RwFile &f : gRw) if (f.name[0] && !strcmp(f.name, name)) return &f;
+    if (!create) return nullptr;
+    for (RwFile &f : gRw) if (!f.name[0]) {strlcpy(f.name, name, sizeof f.name); return &f;}
+    return nullptr;
+}
+void tftpRequest(void *, QcomQrtr *, uint32_t, uint32_t node, uint32_t from, const uint8_t *data, uint32_t length) {
+    if (length < 4) return;
+    const uint16_t op = (uint16_t)(data[0] << 8 | data[1]);
+    if (op != 1 && op != 2) return;
+    char buf[512]; const uint32_t n = length < sizeof buf - 1 ? length : sizeof buf - 1;
+    memcpy(buf, data, n); buf[n] = 0;
+    const char *file = buf + 2, *mode = file + strnlen(file, n - 2) + 1;
+    if (mode >= buf + n) return;
+    const char *p = mode + strnlen(mode, (size_t)(buf + n - mode)) + 1;
+    uint32_t blksize = 512, wsize = 1, rsize = 0, seek = 0, timeoutms = 1000;
+    bool options = p < buf + n, tsize = false, timeout = false;
+    while (p < buf + n) {
+        const char *k = p; p += strnlen(p, (size_t)(buf + n - p)) + 1; if (p >= buf + n + 1) break;
+        const char *v = p; p += strnlen(p, (size_t)(buf + n - p)) + 1;
+        uint32_t x = 0; for (const char *c = v; *c >= '0' && *c <= '9'; ++c) x = x * 10 + (uint32_t)(*c - '0');
+        if (!strcmp(k, "blksize")) blksize = x; else if (!strcmp(k, "wsize")) wsize = x; else if (!strcmp(k, "rsize")) rsize = x;
+        else if (!strcmp(k, "seek")) seek = x; else if (!strcmp(k, "tsize")) tsize = true; else if (!strcmp(k, "timeoutms")) {timeout = true; timeoutms = x;}
+    }
+    if (blksize < 8) blksize = 512;
+    if (blksize > kTftpMaxBlk) blksize = kTftpMaxBlk;
+    if (!wsize) wsize = 1;
+    if (wsize > kTftpMaxWindow) wsize = kTftpMaxWindow;
+    unsigned slot = kTftpSlots;
+    for (unsigned i = 0; i < kTftpSlots; ++i) if (!gTx[i].active) {slot = i; break;}
+    if (slot == kTftpSlots) {ts[7] = ts[7] + 1; return;}
+    Transfer &t = gTx[slot];
+    t = {};
+    t.node = node; t.port = from; t.blksize = blksize; t.wsize = wsize; t.rsize = rsize; t.seek = seek;
+    if (op == 1) {
+        ts[0] = ts[0] + 1;
+        char mapped[256]; uint8_t *bytes = nullptr; size_t size = 0; int rc = ENOENT;
+        if (!strncmp(file, "/readwrite/", 11)) {
+            if (RwFile *f = rwFile(file + 11, false)) {bytes = (uint8_t *)IOMallocData(f->size ? f->size : 1); if (bytes) {memcpy(bytes, f->data, f->size); size = f->size; rc = 0;}}
+        } else if (tftpMap(file, mapped, sizeof mapped)) rc = houji_fw_file(1, mapped, &bytes, &size, 32u << 20);
+        IOLog("HOUJI TFTP: read %.100s -> %d (%lu bytes) rsize %u seek %u blk %u w %u\n", file, rc, (unsigned long)size, rsize, seek, blksize, wsize);
+        if (rc) {ts[2] = ts[2] + 1; tftpError(slot, node, from, 1, "file not found"); return;}
+        ts[1] = ts[1] + 1;
+        t.active = true; t.data = bytes; t.size = (uint32_t)size;
+        if (options) tftpOack(slot, tsize, timeout, timeoutms); else tftpData(slot, 1, 0, 0);
+    } else {
+        ts[3] = ts[3] + 1;
+        RwFile *f = !strncmp(file, "/readwrite/", 11) ? rwFile(file + 11, true) : nullptr;
+        IOLog("HOUJI TFTP: write %.100s -> %s\n", file, f ? "kept in RAM" : "refused");
+        if (!f) {tftpError(slot, node, from, 2, "Access violation"); return;}
+        t.active = true; t.write = true; t.rw = f; t.expected = 1; f->size = 0;
+        if (options) tftpOack(slot, tsize, timeout, timeoutms);
+        else {const uint8_t ack[4] = {0, 4, 0, 0}; tftpSendRaw(slot, node, from, ack, 4);}
+    }
+}
+// packets to a transfer's port: ACKs of a read, DATA of a write, ERROR (the modem's end of a transfer)
+void tftpPort(void *context, QcomQrtr *, uint32_t, uint32_t node, uint32_t from, const uint8_t *data, uint32_t length) {
+    const unsigned slot = (unsigned)(uintptr_t)context;
+    Transfer &t = gTx[slot];
+    if (!t.active || node != t.node || from != t.port || length < 4) return;
+    const uint16_t op = (uint16_t)(data[0] << 8 | data[1]), block = (uint16_t)(data[2] << 8 | data[3]);
+    if (op == 5) {ts[6] = ts[6] + 1; tftpFinish(t); return;}
+    if (!t.write) {if (op == 4) tftpAck(slot, block); return;}
+    if (op != 3) return;
+    if (block != t.expected) {tftpError(slot, node, from, 4, "Block number out of sequence"); return;}
+    t.expected++;
+    const uint32_t payload = length - 4;
+    RwFile *f = t.rw;
+    if (f->size + payload > f->cap) {
+        const uint32_t cap = (f->size + payload + 65535) & ~65535u;
+        uint8_t *grown = (uint8_t *)IOMallocData(cap);
+        if (!grown) {tftpError(slot, node, from, 3, "Disk full or write error"); tftpFinish(t); return;}
+        if (f->data) {memcpy(grown, f->data, f->size); IOFreeData(f->data, f->cap);}
+        f->data = grown; f->cap = cap;
+    }
+    memcpy(f->data + f->size, data + 4, payload); f->size += payload;
+    if (block % t.wsize == 0 || payload < t.blksize) {const uint8_t ack[4] = {0, 4, (uint8_t)(block >> 8), (uint8_t)block}; tftpSendRaw(slot, node, from, ack, 4);}
+    if (payload < t.blksize) {ts[4] = ts[4] + 1; tftpFinish(t);}
+}
+}  // namespace
 namespace {
 void serviceModem(uint32_t bits) {
     if (!gMOn) return;
@@ -1076,6 +1238,8 @@ bool modemStart() {
     qcom_qrtr_add_service(&gMQrtr, QCOM_SERVLOC_SERVICE, QCOM_SERVLOC_INSTANCE, 1, mlocator, nullptr);
     qcom_qrtr_add_service(&gMQrtr, 14, 1, 2, rmtfsReceive, nullptr);
     qcom_qrtr_add_service(&gMQrtr, 0, 0, kLocPort, locReceive, nullptr);   // the LOC client's port
+    qcom_qrtr_add_service(&gMQrtr, 4096, 1, 4, tftpRequest, nullptr);      // TFTP, before the modem starts (SteamOS: needed for GNSS)
+    for (uintptr_t i = 0; i < kTftpSlots; ++i) qcom_qrtr_add_service(&gMQrtr, 0, 0, kTftpPortBase + (uint32_t)i, tftpPort, (void *)i);
     mstep(MsRmtfs);
     {   // houji_modem=3: the main image's init alone, for comparison with the dtb's
         unsigned mode = 0; PE_parse_boot_argn("houji_modem", &mode, sizeof mode);
@@ -1313,6 +1477,9 @@ extern "C" void houji_power_report(void) {
          IOLog("HOUJI MPSS: stage=%d err=%d slave=%x ready-ms=%d glink=%d/%d services=%d rmtfs=%d/%d rd=%dK wr=%dK scm=%d servloc=%d hello=%d loc=%d drop=%d\n",
                q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11], q[12], q[13], q[14], q[15]);
          IOLog("HOUJI MPSS TEXT: %.90s\n", native_mpss_text);
+         const volatile int32_t *t = native_tftp_stats;
+         if (t[0] || t[3]) IOLog("HOUJI TFTP STATE: reads=%d served=%d missing=%d writes=%d written=%d blocks=%d modem-errors=%d no-slot=%d\n",
+                                 t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]);
          const volatile int32_t *g = native_gps_stats;
          if (g[0]) IOLog("HOUJI GPS STATE: state=%d reports=%d fixes=%d unc-cm=%d sv-reports=%d max-sv=%d status=%d indications=%d err=%d\n",
                          g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8]);
