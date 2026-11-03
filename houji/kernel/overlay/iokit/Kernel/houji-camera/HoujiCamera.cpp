@@ -104,10 +104,10 @@ struct Rpmh {
         const unsigned m = qcom_rpmh_finish(&layout, 2, writes, 16);
         for (unsigned i = 0; i < m; ++i) rsc.va[(kRscTcs + writes[i].offset) / 4] = writes[i].value;
     }
-    bool ldo(const char *name, uint32_t mv, bool on) {
+    bool ldo(const char *name, uint32_t mv, bool on, uint32_t mode = 7) {   // mode 7: LDO HPM; 6: BOB auto
         QcomRpmhResource r;
         if (qcom_cmd_db_find(db, kCmdDbSize, name, &r)) return false;
-        if (on) {send(r.address + 8, 7); send(r.address, mv); send(r.address + 4, 1);}
+        if (on) {send(r.address + 8, mode); send(r.address, mv); send(r.address + 4, 1);}
         else send(r.address + 4, 0);
         IOSleep(3);
         return true;
@@ -133,6 +133,10 @@ void cameraThread(void *, wait_result_t) {
     for (uint32_t off : branches) {gGcc.va[off / 4] |= 1u; dsb(); waitBits(&gGcc.va[off / 4], 1u << 31, false, 1000);}
     if (!gCamcc.va && !mapWindow(gCamcc, kCamcc, 0x20000)) {cs[0] = -2; rpmh.close(); return;}
     cs[0] = 2;
+    // PM8010's L3/L4 input is BOB2 (sm8650 boards: vdd-l3-l4-supply; the stock sensor also lists cam_bob2, 2.704-3.296 V). Left on
+    // afterwards: other consumers may share it and this DRV's vote would replace the firmware's.
+    if (rpmh.ldo("bobb2", 3296, true, 6)) found |= 1;
+    IOSleep(2);
     // supplies in the sensor's order: vio, vana, vdig
     if (rpmh.ldo("ldom5", 1800, true)) found |= 2;
     if (rpmh.ldo("ldom3", 2800, true)) found |= 4;
