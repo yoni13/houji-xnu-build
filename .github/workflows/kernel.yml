@@ -157,8 +157,16 @@ jobs:
           export HOUJI_JOBS="$(sysctl -n hw.ncpu)"
           # The kernel build writes into DSTROOT=$HOUJI_BUILD_ROOT/fakeroot, but headers and
           # libfirehose_kernel come from FAKEROOT_DIR, which is the dxb fakeroot.
-          bash src/tools/build-kernel.sh 2>&1 | tee kernel-build.log
+          # About 100 MB of compiler warnings: kept in kernel-build.log (uploaded), not streamed into the job log.
+          status=0
+          bash src/tools/build-kernel.sh > kernel-build.log 2>&1 || status=$?
           ccache -s
+          echo "kernel build exit $status, $(wc -c < kernel-build.log) bytes of output"
+          if [ "$status" != 0 ]; then
+            grep -E ' error: |Undefined symbols|undefined reference|ld: |referenced from|patch failed|does not apply|Trial binding|\*\*\* ' kernel-build.log | head -60
+            tail -30 kernel-build.log
+            exit "$status"
+          fi
       - name: Save compiler cache
         if: always()
         uses: actions/cache/save@v4
@@ -173,8 +181,8 @@ jobs:
           k=out/kernel/fakeroot/System/Library/Kernels/kernel.development.sweet
           [ -f "$k" ] || k=out/kernel/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet
           if [ -f "$k" ]; then cp "$k" artifact/kernel.development.sweet; file artifact/kernel.development.sweet; shasum -a 256 artifact/kernel.development.sweet > artifact/SHA256SUMS; fi
-          cp deps-build.log kernel-build.log ath12k-build.log artifact/ 2>/dev/null || true
-          tail -c 200000 kernel-build.log > artifact/kernel-build-tail.log 2>/dev/null || true
+          cp deps-build.log ath12k-build.log artifact/ 2>/dev/null || true
+          gzip -c kernel-build.log > artifact/kernel-build.log.gz 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
