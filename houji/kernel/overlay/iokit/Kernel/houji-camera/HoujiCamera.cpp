@@ -16,7 +16,7 @@
 #include "../houji-adsp/QcomRpmh.h"
 
 // [0] stage (negative: the step that failed), [1] rails found, [2] mclk branch after enable, [3] devices answering, [4..7] their addresses,
-// [8] I2C errors
+// [8] Titan top GDSC (high bits of GDSCR; bit 0: power-up complete)
 extern "C" {volatile int32_t native_camera_stats[10];}
 
 namespace {
@@ -122,15 +122,16 @@ bool waitBits(volatile uint32_t *reg, uint32_t mask, bool set, unsigned us) {
 void cameraThread(void *, wait_result_t) {
     thread_set_thread_name(current_thread(), "houji-camera");
     unsigned delay = 70; PE_parse_boot_argn("houji_camera_delay", &delay, sizeof delay);
-    IOSleep(delay * 1000);
+    if (!cs[0]) IOSleep(delay * 1000);   // the first run waits for the boot; console reruns start at once
+    for (unsigned i = 2; i < 10; ++i) cs[i] = 0;
     Rpmh rpmh = {};
-    if (!mapWindow(gTlmm, kTlmm, 0x100000) || !mapWindow(gGcc, kGcc, 0x80000) || !rpmh.open()) {cs[0] = -1; return;}
+    if ((!gTlmm.va && !mapWindow(gTlmm, kTlmm, 0x100000)) || (!gGcc.va && !mapWindow(gGcc, kGcc, 0x80000)) || !rpmh.open()) {cs[0] = -1; return;}
     cs[0] = 1;
     // camcc's rail MMCX is already up for the display (dispcc shares it); a vote from this DRV would replace the firmware's, so none here.
     uint32_t found = 0;
     static const uint32_t branches[] = {0x26004u, 0x26028u};
     for (uint32_t off : branches) {gGcc.va[off / 4] |= 1u; dsb(); waitBits(&gGcc.va[off / 4], 1u << 31, false, 1000);}
-    if (!mapWindow(gCamcc, kCamcc, 0x20000)) {cs[0] = -2; rpmh.close(); return;}
+    if (!gCamcc.va && !mapWindow(gCamcc, kCamcc, 0x20000)) {cs[0] = -2; rpmh.close(); return;}
     cs[0] = 2;
     // supplies in the sensor's order: vio, vana, vdig
     if (rpmh.ldo("ldom5", 1800, true)) found |= 2;
@@ -139,6 +140,12 @@ void cameraThread(void *, wait_result_t) {
     cs[1] = (int32_t)found;
     IOSleep(5);
     cs[0] = 3;
+    // Titan top GDSC (camcc 0x132bc, the stock cam_clk supply): clear SW_COLLAPSE (bit 0), keep flip-flop retention (bit 11), then poll
+    // POWER_UP_COMPLETE (bit 16 of the CFG_GDSCR at +4) as Linux does for POLL_CFG_GDSCR
+    volatile uint32_t *gdsc = gCamcc.va + 0x132bc / 4;
+    *gdsc = (*gdsc & ~1u) | (1u << 11); dsb();
+    const bool gdscOn = waitBits(&gdsc[1], 1u << 16, true, 5000);
+    cs[8] = (int32_t)((gdsc[0] & 0xfffff000u) | (gdscOn ? 1u : 0u));
     // MCLK4: RCG from the crystal, divider 1 (CFG source 0, SRC_DIV 2 * 1 - 1), update, then the branch; then the pin to the clock
     volatile uint32_t *rcg = gCamcc.va + 0x15070 / 4, *cbcr = gCamcc.va + 0x15088 / 4;
     rcg[1] = 1u; dsb();
@@ -147,6 +154,8 @@ void cameraThread(void *, wait_result_t) {
     *cbcr |= 1u; dsb();
     const bool running = waitBits(cbcr, 1u << 31, false, 2000);
     cs[2] = (int32_t)*cbcr;
+    IOLog("HOUJI CAMERA: gdsc %08x cfg %08x (%s), mclk4 rcg cmd %08x cfg %08x, cbcr %08x\n", (unsigned)gdsc[0], (unsigned)gdsc[1],
+          gdscOn ? "on" : "not on", (unsigned)rcg[0], (unsigned)rcg[1], (unsigned)*cbcr);
     pinCfg(kMclk) = (1u << 2) | (1u << 6); dsb();   // function 1, 4 mA
     cs[0] = running ? 4 : -4;
     // reset: low, then released after the clock runs
@@ -174,6 +183,7 @@ void cameraThread(void *, wait_result_t) {
     pinGpio(kReset, true, 0);
     pinGpio(kMclk, false, -1);
     *cbcr &= ~1u; dsb();
+    *gdsc |= 1u; dsb();
     rpmh.ldo("ldom1", 0, false); rpmh.ldo("ldom3", 0, false); rpmh.ldo("ldom5", 0, false);
     rpmh.close();
     cs[0] = 7;
@@ -188,6 +198,13 @@ extern "C" void houji_camera_start(void) {
 }
 extern "C" void houji_camera_report(void) {
     const volatile int32_t *s = native_camera_stats;
-    if (s[0]) IOLog("HOUJI CAMERA STATE: stage=%d rails=%x mclk=%08x devices=%d %02x %02x %02x %02x\n", s[0], s[1], (unsigned)s[2], s[3], s[4], s[5],
-                    s[6], s[7]);
+    if (s[0]) IOLog("HOUJI CAMERA STATE: stage=%d rails=%x mclk=%08x devices=%d %02x %02x %02x %02x gdsc=%08x\n", s[0], s[1], (unsigned)s[2], s[3],
+                    s[4], s[5], s[6], s[7], (unsigned)s[8]);
+}
+// USB console "camera probe": run the probe again once the previous run has finished (stage 7) or failed
+extern "C" void houji_camera_command(const char *what) {
+    if (strcmp(what, "probe") || (native_camera_stats[0] > 0 && native_camera_stats[0] != 7)) return;
+    if (!native_camera_stats[0]) native_camera_stats[0] = 7;
+    thread_t t = nullptr;
+    if (kernel_thread_start(cameraThread, nullptr, &t) == KERN_SUCCESS) thread_deallocate(t);
 }
