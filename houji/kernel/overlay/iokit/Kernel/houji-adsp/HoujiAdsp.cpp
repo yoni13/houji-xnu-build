@@ -861,10 +861,12 @@ int mqrtrSend(void *, const uint8_t *packet, uint32_t length) {
     memcpy(p.data, packet, length); p.length = length; gMCount++;
     return 0;
 }
+uint32_t gMRefused, gMLastRc;
 void mpump() {
     while (gMCount && gMChannel && gMChannel->up) {
         MPacket &p = gMQueue[gMHead];
-        if (qcom_glink_send(&gMGlink, gMChannel, p.data, p.length) != QcomGlinkOk) break;
+        const int rc = qcom_glink_send(&gMGlink, gMChannel, p.data, p.length);
+        if (rc != QcomGlinkOk) {gMRefused++; gMLastRc = (uint32_t)rc; break;}
         gMHead = (gMHead + 1) % 16; gMCount--;
     }
 }
@@ -1058,6 +1060,7 @@ void tftpOack(unsigned slot, bool tsize, bool timeout, uint32_t timeoutms) {
     if (t.rsize) opt("rsize", t.rsize);
     if (t.seek) opt("seek", t.seek);
     tftpSendRaw(slot, t.node, t.port, (const uint8_t *)b, n);
+    IOLog("HOUJI TFTP: oack slot %u (%u bytes), queue %u, glink refused %u last %d\n", slot, n, gMCount, gMRefused, (int)gMLastRc);
 }
 // handle_reader: an ACK of block last; the next window, as tqftpserv cuts it with rsize
 void tftpAck(unsigned slot, uint16_t last) {
