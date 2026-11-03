@@ -925,7 +925,14 @@ void locStep() {
     case 3: locSend(0xbf, nullptr, 0); break;
     case 4: locSend(0x36, nullptr, 0); break;
     case 5: {   // the engine answered status 7 (engine locked): lock none (1) for the subscription the stock query names (3)
-        const uint32_t none = 1, sub = 3; n += tlv(b + n, 0x01, &none, 4); n += tlv(b + n, 0x10, &sub, 4); locSend(0x3a, b, n); break; }
+        static uint8_t sub5;
+        if (sub5 == 0) {const uint32_t none = 1, sub = 3; n += tlv(b + n, 0x01, &none, 4); n += tlv(b + n, 0x10, &sub, 4); locSend(0x3a, b, n);}
+        // then the lock again, to see the change took (its indication is logged)
+        else if (sub5 == 1) {const uint32_t lock = 3; n += tlv(b, 0x10, &lock, 4); locSend(0x3b, b, n);}
+        // then standalone operation (4), as the stock HAL sets before every start when there is no assistance server
+        else {const uint32_t standalone = 4; n += tlv(b, 0x01, &standalone, 4); locSend(0x4a, b, n);}
+        ++sub5;
+        break; }
     case 6: {
         const uint8_t session = 1; const uint32_t periodic = 1, accuracy = 3, intermediate = 1, interval = 1000, altitude = 2;
         n += tlv(b + n, 0x01, &session, 1); n += tlv(b + n, 0x10, &periodic, 4); n += tlv(b + n, 0x11, &accuracy, 4);
@@ -952,12 +959,28 @@ void locReceive(void *, QcomQrtr *, uint32_t, uint32_t, uint32_t, const uint8_t 
             return;
         }
         if (m.message == 0x23) {gs[0] = 8; return;}
+        static uint8_t step5;
+        if (gs[0] == 5 && ++step5 < 3) {locStep(); return;}   // 0x3a, 0x3b, 0x4a
         if (gs[0] >= 1 && gs[0] < 6) {gs[0] = gs[0] + 1; locStep();}
         return;
     }
     if (m.type != QCOM_QMI_INDICATION) return;
     gs[7] = gs[7] + 1;
     static uint8_t seen[512 / 8];
+    static uint16_t ids[16]; static uint16_t counts[16];
+    for (unsigned i = 0; i < 16; ++i) {if (ids[i] == m.message || !ids[i]) {ids[i] = m.message; ++counts[i]; break;}}
+    if (gs[7] % 20 == 0 || gs[7] < 12) {
+        char line[200]; unsigned at = 0;
+        for (unsigned i = 0; i < 16 && ids[i] && at + 16 < sizeof line; ++i) at += (unsigned)snprintf(line + at, sizeof line - at, " %x:%u", ids[i], counts[i]);
+        line[at] = 0;
+        IOLog("HOUJI GPS INDICATIONS:%s\n", line);
+    }
+    if (m.message == 0x3b && (seen[0x3b / 8] & (1u << (0x3b % 8)))) {
+        char hex[100]; unsigned at = 0;
+        for (uint32_t i = 0; i < m.length && at + 3 < sizeof hex; ++i) at += (unsigned)snprintf(hex + at, sizeof hex - at, "%02x", m.tlvs[i]);
+        hex[at] = 0;
+        IOLog("HOUJI GPS: lock again: %s\n", hex);
+    }
     if (m.message < 512 && !(seen[m.message / 8] & (1u << (m.message % 8)))) {
         seen[m.message / 8] |= 1u << (m.message % 8);
         char hex[100]; unsigned at = 0;
