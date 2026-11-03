@@ -549,7 +549,6 @@ extern "C" uint64_t houji_gpu_submit_activity(void) {
         __atomic_load_n(&nativeAdrenoDispatchPerf[NativeAdrenoMethodSubmitBatch][0],__ATOMIC_RELAXED);
 }
 extern "C" void houji_sandbox_abi_report(void);
-extern "C" unsigned houji_tcc_extension_snapshot(char *,unsigned);
 extern "C" void houji_cpu_scheduler_report(void);
 
 /* Called with no issuer lock held. Keeping this path separate also lets host
@@ -1033,8 +1032,6 @@ extern "C" volatile uint32_t native_adreno_window_overflow[NativeAdrenoMaxClient
 // Bounded cached observations for the periodic log snapshot, before teardown.
 // Try the existing lock only for copying text; never hold it while printing.
 extern "C" unsigned houji_gpu_dvfs_snapshot(char *,unsigned);
-extern "C" unsigned houji_thermal_snapshot(char *,unsigned);
-extern "C" unsigned houji_backlight_snapshot(char *,unsigned);
 extern "C" unsigned houji_gpu_gate_snapshot(char *,unsigned);
 extern "C" unsigned native_adreno_present_sync_snapshot(char *,unsigned);
 extern "C" unsigned houji_gpu_cached_timing(char *out,unsigned capacity) {
@@ -1045,7 +1042,6 @@ extern "C" unsigned houji_gpu_cached_timing(char *out,unsigned capacity) {
   return n>0?((unsigned)n<capacity?(unsigned)n:capacity-1):0;
  }
  unsigned used=0;out[0]=0;bzero(rows,sizeof rows);bzero(clients,sizeof clients);bool copied=false;
- used+=houji_tcc_extension_snapshot(out,capacity);
  if(g.lock && nativeAdrenoIssuerTryLock(__LINE__)) {
   memcpy(rows,native_adreno_metal_rows,sizeof rows);
   memcpy(clients,native_adreno_client_log,sizeof clients);
@@ -1079,8 +1075,6 @@ extern "C" unsigned houji_gpu_cached_timing(char *out,unsigned capacity) {
  used+=houji_gpu_gate_snapshot(out+used,capacity-used);
  used+=native_adreno_present_sync_snapshot(out+used,capacity-used);
  used+=houji_gpu_dvfs_snapshot(out+used,capacity-used);
- used+=houji_thermal_snapshot(out+used,capacity-used);
- used+=houji_backlight_snapshot(out+used,capacity-used);
  for(const auto &client:clients)if(copied && client.name[0]) {
   unsigned window=client.slot<NativeAdrenoMaxClients?(unsigned)(kClientWindows[client.slot].bytes>>20):0;
   unsigned base=client.slot<NativeAdrenoMaxClients?(unsigned)(kClientWindows[client.slot].start>>20):0;
