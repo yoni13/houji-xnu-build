@@ -1107,6 +1107,7 @@ void tftpRequest(void *, QcomQrtr *, uint32_t, uint32_t node, uint32_t from, con
         if (!strcmp(k, "blksize")) blksize = x; else if (!strcmp(k, "wsize")) wsize = x; else if (!strcmp(k, "rsize")) rsize = x;
         else if (!strcmp(k, "seek")) seek = x; else if (!strcmp(k, "tsize")) tsize = true; else if (!strcmp(k, "timeoutms")) {timeout = true; timeoutms = x;}
     }
+    const uint32_t askedBlk = blksize, askedW = wsize;
     if (blksize < 8) blksize = 512;
     if (blksize > kTftpMaxBlk) blksize = kTftpMaxBlk;
     if (!wsize) wsize = 1;
@@ -1123,7 +1124,8 @@ void tftpRequest(void *, QcomQrtr *, uint32_t, uint32_t node, uint32_t from, con
         if (!strncmp(file, "/readwrite/", 11)) {
             if (RwFile *f = rwFile(file + 11, false)) {bytes = (uint8_t *)IOMallocData(f->size ? f->size : 1); if (bytes) {memcpy(bytes, f->data, f->size); size = f->size; rc = 0;}}
         } else if (tftpMap(file, mapped, sizeof mapped)) rc = houji_fw_file(1, mapped, &bytes, &size, 32u << 20);
-        IOLog("HOUJI TFTP: read %.100s -> %d (%lu bytes) rsize %u seek %u blk %u w %u\n", file, rc, (unsigned long)size, rsize, seek, blksize, wsize);
+        IOLog("HOUJI TFTP: read %.100s -> %d (%lu bytes) rsize %u seek %u blk %u (asked %u) w %u (asked %u) tsize %d timeout %u\n", file, rc,
+              (unsigned long)size, rsize, seek, blksize, askedBlk, wsize, askedW, tsize, timeoutms);
         if (rc) {ts[2] = ts[2] + 1; tftpError(slot, node, from, 1, "file not found"); return;}
         ts[1] = ts[1] + 1;
         t.active = true; t.data = bytes; t.size = (uint32_t)size;
@@ -1144,7 +1146,11 @@ void tftpPort(void *context, QcomQrtr *, uint32_t, uint32_t node, uint32_t from,
     Transfer &t = gTx[slot];
     if (!t.active || node != t.node || from != t.port || length < 4) return;
     const uint16_t op = (uint16_t)(data[0] << 8 | data[1]), block = (uint16_t)(data[2] << 8 | data[3]);
-    if (op == 5) {ts[6] = ts[6] + 1; tftpFinish(t); return;}
+    if (op == 5) {
+        char msg[48] = {}; if (length > 4) memcpy(msg, data + 4, length - 4 < sizeof msg - 1 ? length - 4 : sizeof msg - 1);
+        IOLog("HOUJI TFTP: the modem ended a transfer: code %u %.47s\n", block, msg);
+        ts[6] = ts[6] + 1; tftpFinish(t); return;}
+    if (op == 4 && !t.write) IOLog("HOUJI TFTP: ack %u on slot %u\n", block, slot);
     if (!t.write) {if (op == 4) tftpAck(slot, block); return;}
     if (op != 3) return;
     if (block != t.expected) {tftpError(slot, node, from, 4, "Block number out of sequence"); return;}
