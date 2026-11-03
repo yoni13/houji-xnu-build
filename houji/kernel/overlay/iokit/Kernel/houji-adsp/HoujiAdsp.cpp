@@ -1467,10 +1467,13 @@ static void houjiPowerThread(void *, wait_result_t) {
 extern "C" void houji_wifi_start(void);
 extern "C" void houji_wifi_report(void);
 extern "C" void houji_buttons_start(void);
+extern "C" void houji_screen_start(void);
+extern "C" void houji_screen_report(void);
 extern "C" void houji_buttons_report(void);
 extern "C" void houji_power_start(void) {
     houji_wifi_start();
     houji_buttons_start();
+    houji_screen_start();
     unsigned mode = 2;
     PE_parse_boot_argn("houji_adsp", &mode, sizeof mode);
     if (!mode) return;
@@ -1480,6 +1483,7 @@ extern "C" void houji_power_start(void) {
 extern "C" void houji_power_report(void) {
     houji_wifi_report();
     houji_buttons_report();
+    houji_screen_report();
     {const volatile int32_t *m = native_modem_stats;
      const volatile int32_t *q = native_mpss_stats;
      if (q[0]) {

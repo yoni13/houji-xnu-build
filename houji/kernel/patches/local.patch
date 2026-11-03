@@ -2093,7 +2093,7 @@ diff --git a/iokit/conf/files b/iokit/conf/files
 index 5fb0a52..68a64fa 100644
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -148,3 +148,49 @@ iokit/Kernel/IOWorkloadConfig.cpp			optional iokitcpp
+@@ -148,3 +148,50 @@ iokit/Kernel/IOWorkloadConfig.cpp			optional iokitcpp
  
  # Skywalk
  iokit/bsddev/skywalk/IOSkywalkSupport.cpp		optional iokitcpp skywalk
@@ -2143,6 +2143,7 @@ index 5fb0a52..68a64fa 100644
 +iokit/Kernel/houji-wifi/HoujiWifi.cpp optional iokitcpp
 +iokit/Kernel/houji-wifi/WifiNet.cpp optional iokitcpp
 +iokit/Kernel/houji-buttons/HoujiButtons.cpp optional iokitcpp
++iokit/Kernel/houji-buttons/HoujiScreen.cpp optional iokitcpp
 diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
 index f731d43..da6c812 100644
 --- a/iokit/conf/files.arm64
