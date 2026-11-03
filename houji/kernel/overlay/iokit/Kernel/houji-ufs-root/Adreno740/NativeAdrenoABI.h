@@ -12,7 +12,8 @@
  * rather than ignored. */
 enum {
     NativeAdrenoAbiVersion = 1,
-    NativeAdrenoAbiMaxBuffers = 32,   /* Turnip submits ~17 IBs per vkQueueSubmit; 16 split each into two kernel submits */
+    NativeAdrenoAbiMaxBuffers = 32,   /* Turnip submits ~17 IBs per vkQueueSubmit; 16 split each into two kernel submits (this root's userland) */
+    NativeAdrenoAbiMaxBatchBuffers = 128,   /* upstream's batch submission; used only by a userland that calls it */
     NativeAdrenoAbiMaxBoBytesShift = 28, /* 256MiB per object */
     NativeAdrenoMethodQuery = 1,
     NativeAdrenoMethodBoAlloc = 2,
@@ -30,6 +31,7 @@ enum {
     NativeAdrenoMethodBoCpuUnmap = 14,
     NativeAdrenoMethodGetDeviceInfo = 15,
     NativeAdrenoMethodBoImport = 16,
+    NativeAdrenoMethodSubmitBatch = 17,
     NativeAdrenoAbiMetadataBytes = 64,
     NativeAdrenoAbiMaxQueues = 8
 };
@@ -37,11 +39,12 @@ struct NativeAdrenoAbiParams {
     uint32_t abi_version;
     uint32_t input_bits;          /* GPU VA bits below 2^input_bits */
     uint32_t output_bits;         /* physical address bits */
-    uint32_t flags;               /* NativeAdrenoParamsHostImport or zero */
+    uint32_t flags;               /* NativeAdrenoParams flags */
     uint64_t max_bo_bytes;
 };
 enum {
-    NativeAdrenoParamsHostImport = 1  /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
+    NativeAdrenoParamsHostImport = 1, /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
+    NativeAdrenoParamsSubmitBatch = 2 /* SubmitBatch accepts up to 128 IBs; legacy Submit stays byte-compatible */
 };
 struct NativeAdrenoAbiBoAlloc {
     uint64_t bytes;               /* 4KiB multiple, <= max_bo_bytes */
@@ -84,6 +87,17 @@ struct NativeAdrenoAbiSubmit {
     uint64_t wait_fence;          /* zero or an earlier fence of this client */
     uint64_t wait_timeout_ns;     /* used only when wait_fence is nonzero */
     NativeAdrenoAbiSubmitBuffer buffers[NativeAdrenoAbiMaxBuffers];
+};
+/* Optional v1 extension, advertised by Query. Preserve method 5's 416-byte
+ * record so old runtimes work on new kernels and new runtimes can fall back
+ * on old kernels. Only the advertised method 17 accepts this larger record. */
+struct NativeAdrenoAbiSubmitBatch {
+    uint32_t buffer_count;        /* 1..NativeAdrenoAbiMaxBatchBuffers */
+    uint32_t reserved;
+    uint64_t queue;
+    uint64_t wait_fence;
+    uint64_t wait_timeout_ns;
+    NativeAdrenoAbiSubmitBuffer buffers[NativeAdrenoAbiMaxBatchBuffers];
 };
 struct NativeAdrenoAbiMetadata {
     uint64_t handle;              /* object identity */
@@ -152,6 +166,9 @@ static_assert(sizeof(NativeAdrenoAbiBoMap) == 32, "ABI map layout");
 static_assert(sizeof(NativeAdrenoAbiBoImport) == 16, "ABI import layout");
 static_assert(sizeof(NativeAdrenoAbiSubmitBuffer) == 24, "ABI buffer layout");
 static_assert(sizeof(NativeAdrenoAbiSubmit) == 800, "ABI submit layout");
+static_assert(sizeof(NativeAdrenoAbiSubmitBatch) == 3104, "ABI batch submit layout");
+static_assert(__builtin_offsetof(NativeAdrenoAbiSubmitBatch, buffers) == 32, "ABI batch header layout");
+static_assert(__builtin_offsetof(NativeAdrenoAbiSubmit, buffers) == 32, "ABI legacy header layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuMap) == 8, "ABI cpu map layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuMapReply) == 16, "ABI cpu map reply layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuUnmap) == 16, "ABI cpu unmap layout");

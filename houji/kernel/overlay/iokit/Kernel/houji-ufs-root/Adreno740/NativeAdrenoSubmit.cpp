@@ -6,6 +6,8 @@
 // timings. Observations never change submission, references or cache policy.
 extern "C" uint64_t (*native_adreno_vm_now_us)(void);
 extern "C" {volatile uint64_t native_adreno_submit_cost[12];}
+/* Accepted jobs, total IBs, largest batch, jobs with more than 16 IBs. */
+extern "C" {volatile uint64_t native_adreno_submit_batches[4];}
 static uint64_t submitDiagNow(void) {return native_adreno_vm_now_us?native_adreno_vm_now_us():0;}
 static void submitDiagRecord(unsigned slot,uint64_t began) {
     if(!began)return;
@@ -38,7 +40,7 @@ struct SubmitDiagScope {unsigned slot;uint64_t began;
  * and IB_SIZE in dwords (bits 0..19), exactly as the pinned adreno_pm4.xml
  * domain states and Linux msm_gem_submit.c converts the userspace byte size. */
 enum : uint32_t {SubmitIndirectBuffer=0x3f,SubmitIbWords=3,SubmitMaxJobs=8,
-    SubmitMaxBuffers=32,SubmitMaxIbBytes=0xfffffu*4u,
+    SubmitMaxBuffers=NativeAdrenoSubmitMaxBuffers,SubmitMaxIbBytes=0xfffffu*4u,
     SubmitAuditBytes=256u*1024u};   /* IB bytes the write-combine audit compares per submission */
 extern "C" {volatile uint32_t native_adreno_coherence[8];}
 /* The submission (1-based count) at which the write-combine audit found a dirty IB line or failed; 0 = never. */
@@ -113,9 +115,8 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     if(!buffers || !count || count>SubmitMaxBuffers)return kIOReturnBadArgument;
     /* Every buffer is validated against the live VM before any reference. */
-    /* Scratch off the kernel stack: every caller holds the provider's issuer lock (or is the single boot thread). */
-    static uint64_t handles[SubmitMaxBuffers];size_t handle_count=0;
-    static uint32_t words[SubmitMaxBuffers*(1+SubmitIbWords)];size_t word_count=0;
+    uint64_t *handles=scratch_handles_;size_t handle_count=0;
+    uint32_t *words=scratch_words_;size_t word_count=0;
     for(size_t i=0;i<count;++i) {
         const NativeAdrenoSubmitBuffer &buffer=buffers[i];
         if(!buffer.handle || !buffer.bytes || (buffer.bytes&3) || buffer.bytes>SubmitMaxIbBytes)
@@ -206,23 +207,29 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
             native_adreno_wc_distrusted=native_adreno_coherence[0]+1;
         }
     }
-    {PartScope part(3);(void)vm_->sampleWord(buffers[0].iova,&cached,&before);}
+    const bool sample=(stats_.submissions&63)==0;   /* upstream: diagnostic word on 1 submission in 64 */
+    if(sample){PartScope part(3);(void)vm_->sampleWord(buffers[0].iova,&cached,&before);}
     IOReturn status;
     {SubmitDiagScope measured(6);status=vm_->publishMapped();}
     /* Before invalidateTlb records the current tables: a change since the previous submission keeps the full prologue. */
     ring_->requestLightPrologue(native_adreno_light_prologue && vm_->tlbCurrent());
     if(!status) {
-        {PartScope part(3);(void)vm_->sampleWord(buffers[0].iova,&ignored,&after);}
+        if(sample){PartScope part(3);(void)vm_->sampleWord(buffers[0].iova,&ignored,&after);}
         native_adreno_coherence[0]=native_adreno_coherence[0]+1;
-        native_adreno_coherence[1]=cached;native_adreno_coherence[2]=before;native_adreno_coherence[3]=after;
-        if(cached!=before || before!=after) {
+        if(sample){native_adreno_coherence[1]=cached;native_adreno_coherence[2]=before;native_adreno_coherence[3]=after;}
+        if(sample && (cached!=before || before!=after)) {
             if(!native_adreno_coherence[4]) {
                 native_adreno_coherence[5]=cached;native_adreno_coherence[6]=before;native_adreno_coherence[7]=after;
             }
             native_adreno_coherence[4]=native_adreno_coherence[4]+1;
         }
-        {PartScope part(5);status=vm_->invalidateTlb();}
     }
+    /* The active ArmSmmu4KLiveUpdateContextBatch fills invalid leaves only,
+     * publishes their table pages, and synchronously invalidates each unmap
+     * before releasing its memory. Upper tables stay fixed. A successful
+     * unchanged VM therefore needs no TLBIALL at each submission; that would
+     * discard useful translations and serialize every frame on device MMIO.
+     * Failed table updates still poison the VM and retain their resources. */
     if(status) {
         for(size_t i=0;i<handle_count;++i) {vm_->retireJobAfterCompletion(handles[i]);++stats_.references_retired;}
         return status;
@@ -251,6 +258,11 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
     for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
     job->count=handle_count;job->fence=value;job->queue=queue;job->active=true;
     ++stats_.submissions;
+    __atomic_fetch_add(&native_adreno_submit_batches[0],1ull,__ATOMIC_RELAXED);
+    __atomic_fetch_add(&native_adreno_submit_batches[1],(uint64_t)count,__ATOMIC_RELAXED);
+    uint64_t peak=__atomic_load_n(&native_adreno_submit_batches[2],__ATOMIC_RELAXED);
+    while(count>peak && !__atomic_compare_exchange_n(&native_adreno_submit_batches[2],&peak,(uint64_t)count,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
+    if(count>16)__atomic_fetch_add(&native_adreno_submit_batches[3],1ull,__ATOMIC_RELAXED);
     if(outstanding()>stats_.peak_jobs)stats_.peak_jobs=outstanding();
     *fence=value;
     return kIOReturnSuccess;

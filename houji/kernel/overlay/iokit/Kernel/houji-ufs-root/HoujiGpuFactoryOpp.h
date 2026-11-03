@@ -4,7 +4,7 @@
 #ifndef HOUJI_GPU_FACTORY_OPP_H
 #define HOUJI_GPU_FACTORY_OPP_H
 #include <stdint.h>
-enum { HCO_COUNT=12, HCO_BOOT_LEVEL=5 };
+enum { HCO_COUNT=12, HCO_BOOT_LEVEL=5, HCO_DEFAULT_CAP=HCO_COUNT };
 struct HoujiGpuOpp {uint32_t khz,arc_vote,bw_index;};
 static const struct HoujiGpuOpp houjiGpuOpps[HCO_COUNT]={
  {231000u,0x00340201u,1u},
@@ -26,6 +26,16 @@ static inline const struct HoujiGpuOpp *hco_opp(unsigned level) {
 static inline unsigned hco_at_least(uint64_t khz,unsigned cap) {
  if(!cap || cap>HCO_COUNT)return 0;
  unsigned level=1;while(level<cap && houjiGpuOpps[level-1].khz<khz)++level;
+ return level;
+}
+/* A ceiling must round DOWN, unlike an interactive floor. Zero means the
+ * full factory runtime range; boot frequency is a separate decision.
+ * Out-of-table requests are rejected. */
+static inline unsigned hco_cap_mhz(unsigned mhz) {
+ if(!mhz)return HCO_DEFAULT_CAP;
+ if(mhz<houjiGpuOpps[0].khz/1000 || mhz>houjiGpuOpps[HCO_COUNT-1].khz/1000)return 0;
+ unsigned level=HCO_COUNT;
+ while(level>1 && houjiGpuOpps[level-1].khz>(uint64_t)mhz*1000)--level;
  return level;
 }
 #endif

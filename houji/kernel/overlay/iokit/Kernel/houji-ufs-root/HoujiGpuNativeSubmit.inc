@@ -44,6 +44,17 @@ static int houjiSubmitWrite(void*,uint32_t reg,uint32_t v){
   IODelay(10);}
  return 1;
 }
+// The hint reads only this boot's retained, Normal-NC CP completion word.
+// The pointer is set once after adoptLive and an AT read verifies the exact
+// backing PA/cache attribute; the owner never releases it before reset.
+// No MMIO, cache invalidation, ring accounting or error state is changed here.
+static const volatile uint32_t *houjiSubmitFenceHint=nullptr;
+extern "C" bool native_adreno_board_fence_pending(uint32_t fence) {
+ const volatile uint32_t *word=houjiSubmitFenceHint;
+ if(!word || !fence)return false;
+ const uint32_t seen=*word;houjiStockReadBarrier();
+ return seen<fence;
+}
 static int houjiSubmitAcquire(void*,volatile uint32_t*words,size_t bytes){
  if(houjiSubmitGuard() || words!=houjiCpCpu()+(HHR_SCRATCH+0x100-HHR_RING)/4 || bytes!=64)return 1;houjiStockFullBarrier();return 0;
 }
@@ -83,6 +94,16 @@ static void houjiRuntimeAtStop(void){
  {const NativeAdrenoRingIo io={nullptr,houjiSubmitWrite,houjiSubmitRead,houjiSubmitBarrier};const NativeAdrenoRingCache cache={nullptr,houjiSubmitPublish,houjiSubmitAcquire};
   s.code=gHoujiSubmit.ring.adoptLive(&io,&cache,(void*)houjiCpCpu(),HHR_BYTES,HHR_RING,(void*)(houjiCpCpu()+(HHR_SCRATCH+0x100-HHR_RING)/4),64,HHR_SCRATCH+0x100,51);if(s.code)goto done;}
  s.adopted=1;s.last_phase=2;
+ {const auto&e=gHoujiFullMemory.entry(12);
+  const uint64_t offset=0xc0000+(HHR_SCRATCH+0x104-HHR_RING);
+  const uintptr_t address=(uintptr_t)e.backing.cpu+offset;uint64_t translation=0;
+  if(offset+sizeof(uint32_t)<=e.request.owned_bytes &&
+     houjiFullHostAt(address,false,&translation) && !(translation&1) &&
+     (translation>>56)==0x44 &&
+     ((translation&UINT64_C(0x0000fffffffff000))|(address&4095))==e.backing.physical+offset)
+   houjiSubmitFenceHint=(const volatile uint32_t*)address;
+  IOLog("HOUJI FENCE HINT: enabled=%u; retained exact-PA Normal-NC word; locked completion still mandatory\n",houjiSubmitFenceHint!=nullptr);
+ }
  for(s.iteration=1;s.iteration<=32;s.iteration++){
   if(houjiSubmitGuard() || (s.completed && houjiSubmitDrainPointers())){s.code=2;goto done;}
   {auto*output=(volatile uint8_t*)((uintptr_t)gHoujiFullMemory.entry(12).backing.cpu+HGKI_CLASS_CURSOR+5*4096);for(unsigned i=0;i<4096;i++)output[i]=0x6d;houjiStockFullBarrier();}

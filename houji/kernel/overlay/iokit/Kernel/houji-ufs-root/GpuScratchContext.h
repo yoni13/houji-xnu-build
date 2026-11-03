@@ -9,6 +9,7 @@
 #define HOUJI_GPU_SCRATCH_CONTEXT_H
 #include "GpuSmmuContext.h"
 #include "GpuSharedMemory.h"
+#include "HoujiGpuAddressLayout.h"
 enum { HSC_OK,HSC_ARGUMENT,HSC_GUARD,HSC_IO,HSC_VERIFY,HSC_TIMEOUT };
 struct hsc_result {
  unsigned code,phase,reads,writes,polls,attempted,enabled,attached,retained,last_operation,observed_valid;
@@ -73,7 +74,7 @@ static inline unsigned hsc_run_profile(const struct hgp_io *io,const ArmSmmu4KCo
       (built->table_pages==HSC_LARGE_TABLE_PAGES && built->leaf_pages==HSC_LARGE_LEAF_PAGES) ||
       (built->table_pages==HSC_DATA_TABLE_PAGES && built->leaf_pages==HSC_DATA_LEAF_PAGES) ||
       (built->table_pages==HSC_GPU_TABLE_PAGES && built->leaf_pages==HSC_GPU_LEAF_PAGES) ||
-      (built->table_pages==1027 && built->leaf_pages==HSC_GPU_LEAF_PAGES && config->leaf_budget==524288)))return r->code=HSC_ARGUMENT;
+      (built->table_pages==HOUJI_GPU_TABLE_USED_PAGES && built->leaf_pages==HSC_GPU_LEAF_PAGES && config->leaf_budget==HOUJI_GPU_APERTURE/4096)))return r->code=HSC_ARGUMENT;
  ArmSmmu4KContextConfig cfg={config,0,built,0,0x4c017e18,0x5511,0x751,0,0,0};
  ArmSmmu4KContextImage image;uint32_t value=0;uint64_t wide=0;
  if(ArmSmmu4KEncodeContext(&cfg,&image))return r->code=HSC_ARGUMENT;

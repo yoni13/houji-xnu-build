@@ -16,6 +16,10 @@ struct NativeAdrenoCpuState {
     uint64_t kernel_page_bytes,kernel_map_page_bytes;
     unsigned cpu_page_shift;
 };
+extern "C" {
+extern volatile uint32_t native_adreno_pool_mib,native_adreno_pool_status,native_adreno_pool_wc;
+extern volatile uint32_t native_adreno_pool_stats[8];
+}
 IOReturn NativeAdrenoQueryCpuPages(NativeAdrenoCpuState *);
 /* Legacy query retains its strict 4 KiB semantics. */
 IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *);
@@ -55,6 +59,8 @@ class NativeAdrenoMemory final {
     uint32_t surface_seed_=0;
     uint8_t surface_state_=0,seed_valid_=0;   /* state: 0 unresolved, 1 surface, 2 none */
     uint16_t seed_skips_=0;
+    bool pooled_=false;
+    size_t pool_offset_=0;
     IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
 public:
     NativeAdrenoMemory()=default;
@@ -68,13 +74,18 @@ public:
      * Exact CPU 4K/16K state and kernel page ABI are checked before allocation.
      * prepare(), raw unmapped physical segments, span/PA bounds and optional
      * physical contiguity are verified before zeroing/PoC publication. */
-    /* The pooled argument is retained for source compatibility. This candidate
-     * always uses an exclusive CPU-page allocation; no page is shared by BOs. */
+    /* A qualified pool owns whole CPU pages per BO, including logical padding.
+     * Exhaustion falls back to an independent allocation. Imports never pool. */
     IOReturn allocate(size_t bytes,unsigned output_bits,bool contiguous,size_t byte_budget,bool pooled=false);
     /* Zero means the runtime page ABI/rounding/bounded budget is unqualified. */
     static size_t backingBudget(size_t logical_bytes);
-    /* Pooling is deliberately disabled in this first candidate: reservePool
-     * and writeCombinePool return Unsupported; poolBytes returns zero. */
+    /* Arena capacity, not the per-BO ABI limit (which remains 256 MiB).
+     * Explicit boot opt-in; the entire range is checked before use. */
+    static constexpr size_t MaximumPoolBytes=512u*1024u*1024u;
+    /* Before publishing any user clients: one retained, bounded, contiguous
+     * IOBuffer allocation from XNU-managed RAM. No carved/guessed PA range.
+     * Pool pages keep WC until reset, including across BO release/reuse.
+     * Failed cache conversion retains the descriptor and disables the pool. */
     static IOReturn reservePool(unsigned output_bits,size_t bytes);
     static size_t poolBytes();
     static IOReturn writeCombinePool();
@@ -93,7 +104,8 @@ public:
     /* Reassert over complete exclusive CPU pages, never clipped GPU leaves. */
     IOReturn reassertWriteCombined(uint32_t *reset) const
     {return write_combined_ && owned_span_count_?NativeAdrenoReassertWriteCombined(owned_spans_,owned_span_count_,reset):kIOReturnSuccess;}
-    bool backed() const {return descriptor_ || imported_;}
+    bool backed() const {return descriptor_ || imported_ || pooled_;}
+    bool pooled() const {return pooled_;}
     /* Refuses device references/quarantine; only clears ownership after real
      * descriptor complete() succeeds. No automatic reset or resource recycling. */
     IOReturn release();
@@ -125,7 +137,7 @@ public:
     bool cpuView(NativeAdrenoCpuView *out) const
     {
         if(!out)return false;*out={};
-        if(!descriptor_ || imported_ || !prepared_ || quarantined_ || !mapping_ ||
+        if(!(descriptor_ || pooled_) || imported_ || !prepared_ || quarantined_ || !mapping_ ||
             !owned_spans_ || !owned_span_count_ || !owned_bytes_)return false;
         *out={owned_spans_,owned_span_count_,owned_bytes_};return true;
     }

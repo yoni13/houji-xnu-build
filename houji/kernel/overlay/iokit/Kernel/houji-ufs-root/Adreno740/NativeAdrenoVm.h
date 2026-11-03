@@ -5,7 +5,7 @@
 #include "../ArmSmmu4KStreams.h"
 struct NativeAdrenoVmRegion {
     NativeAdrenoMemory *tables;
-    ArmSmmu4KLiveArena *arena;
+    const ArmSmmu4KLiveArena *arena;
     ArmSmmu4KLiveState *state;
 };
 struct NativeAdrenoVmResult {
@@ -51,15 +51,21 @@ class NativeAdrenoVm final {
     ArmSmmu4KContextConfig *context_=nullptr;
     ArmSmmu4KStreamState *streams_=nullptr;
     ArmSmmu4KRange *ranges_=nullptr;
+    // CPU-only workspace shared by serialized preflight and live-table checks.
+    // Capacity matches the fixed span budget; no allocation on the map path.
+    // A call-local arena view carries it; caller metadata can be sealed by GMU.
+    uint32_t *alias_scratch_=nullptr;
     size_t capacity_=0,lower_count_=0,upper_count_=0,objects_=0;
     unsigned budget_=0;
     uint64_t next_handle_=1;
     bool attached_=false,poisoned_=false,distrust_write_combined_=false;
+    bool per_page_tlb_invalidation_=true;
     NativeAdrenoVmResult result_{};
-    ArmSmmu4KLiveRegion region(unsigned) const;
+    ArmSmmu4KLiveRegion region(unsigned,ArmSmmu4KLiveArena &) const;
     ArmSmmu4KStatus observe() const;
-    /* The route check alone: the table walk is the update's own (it verifies every region before the first store and after the last), so
-     * map/unmap pay a full extra audit only every 64th operation (int-139: 4 full walks of the 2 GiB aperture made every map 70 ms). */
+    /* Attach audits every table; each update checks the descriptors it changes.
+     * Periodic checks scan routes/context for conflicts without another whole
+     * table walk under the issuer lock. auditLive() remains an explicit audit. */
     ArmSmmu4KStatus observeStreamsOnly() const;
     ArmSmmu4KStatus observeCheap();
     unsigned since_audit_=0;
@@ -68,6 +74,7 @@ class NativeAdrenoVm final {
     bool tlb_valid_=false;
     uint64_t tableGeneration() const;
     IOReturn fail(ArmSmmu4KStatus);
+    void freeMetadata();
     Mapping *find(uint64_t);
     void insert(size_t,unsigned);
     void erase(size_t,size_t,unsigned);
@@ -82,11 +89,19 @@ public:
         size_t max_spans,unsigned poll_budget);
     /* Adopt actual prepared boot mappings in the same live arena. The board
      * retains those BOs separately until reset; no client handle can unmap them.
-     * Every seed is exact-graph audited before allocation or attachment. */
+     * Every seed is exact-graph audited before allocation or attachment.
+     * Boards with expensive guarded MMIO may choose ASID-wide unmap instead
+     * of the per-page optimization. Both wait for TLBSYNC before retirement. */
     IOReturn attachSeeded(const ArmSmmu4KIo *,ArmSmmu4KContextConfig *,ArmSmmu4KStreamState *,
         const NativeAdrenoVmRegion *,const NativeAdrenoVmRegion *,size_t,unsigned,
         const ArmSmmu4KRange *lower_seeds,size_t lower_count,
-        const ArmSmmu4KRange *upper_seeds,size_t upper_count);
+        const ArmSmmu4KRange *upper_seeds,size_t upper_count,bool per_page_tlb_invalidation=true,
+        bool allocate_alias_workspace=true);
+    bool perPageTlbInvalidation() const {return per_page_tlb_invalidation_;}
+    /* Serialized owner only, before mapping client objects. Allows the board
+     * to retain its boot qualification allocation/order, then enable indexing
+     * before publishing the provider. Both table audits and alias checks stay. */
+    IOReturn enableAliasWorkspace();
     IOReturn auditLive() const {return attached_ && !poisoned_ && !observe()?kIOReturnSuccess:kIOReturnNotReady;}
     /* Frees CPU metadata only, with no BOs remaining. Never releases roots,
      * disables a bank or returns the platform lease; board lifecycle owns it. */
@@ -96,9 +111,8 @@ public:
         unsigned permissions,unsigned writeback,unsigned shareability,uint64_t *handle);
     IOReturn unmap(uint64_t handle);
     IOReturn holdJob(uint64_t handle);
-    /* TLBIALL for the context bank plus TLBSYNC: drops every cached translation of the bank whatever its ASID. Unmap already
-     * synchronizes by ASID; this is the stronger form the submit path uses before each submission (int-070: on sheng the CP read
-     * zeros from an IB whose table entry and DRAM were both correct, after the address had been mapped to other pages before). */
+    /* Explicit diagnostic/recovery TLBIALL plus TLBSYNC. Ordinary submission
+     * relies on the live mapper's invalid-leaf and synchronous-unmap contract. */
     IOReturn invalidateTlb();
     /* No table change since the last TLBIALL: maps fill only invalid leaves (never cached) and unmaps synchronize themselves, so
      * a further TLBIALL adds nothing. Any map/unmap advances the generation and makes the next submission invalidate again. */

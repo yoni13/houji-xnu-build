@@ -5,6 +5,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Full packet capture for 128 IBs, the 42-word frame, and the optional
+ * 26-word context reset. The board validates every captured word before WPTR. */
+enum : size_t {
+    NativeAdrenoRingMaxBuffers=128,
+    NativeAdrenoRingFrameWords=42,
+    NativeAdrenoRingLogWords=NativeAdrenoRingFrameWords+26+4*NativeAdrenoRingMaxBuffers
+};
+extern "C" volatile uint32_t native_adreno_ring_log[4][4+NativeAdrenoRingLogWords];
+extern "C" volatile uint32_t native_adreno_ring_log_count;
+
 /* A7XX command processor ring and timestamp fence, not a scheduler.
  * Register indices are dword offsets; the platform adds the MMIO base and
  * multiplies by four. Caller must already own an exclusive, powered GPU with

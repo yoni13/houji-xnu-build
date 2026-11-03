@@ -5,6 +5,7 @@
 #include "NativeAdrenoSubmit.h"
 #include "NativeAdrenoTimer.h"
 #include "NativeAdrenoStatus.h"
+#include "NativeAdrenoHandleIndex.h"
 
 /* Kernel-side body of the Adreno user client, deliberately free of IOKit so it
  * can be exercised on a host. The future IOService/IOUserClient wrapper only
@@ -33,6 +34,8 @@ class NativeAdrenoUserClient final {
     /* Allocated at open(), all-zero is the free state. */
     Entry *entries_=nullptr;
     size_t entry_count_=0;
+    NativeAdrenoHandleIndex<NativeAdrenoClientMaxObjects> index_;
+    size_t free_hint_=0,live_=0;
     Queue queues_[NativeAdrenoAbiMaxQueues]{};
     NativeAdrenoVm *vm_=nullptr;
     NativeAdrenoSubmit *submit_=nullptr;
@@ -51,9 +54,14 @@ class NativeAdrenoUserClient final {
     uint64_t window_start_=0,window_bytes_=0,window_peak_=0;
     uint64_t next_handle_=1;
     bool open_=false;
+    /* The issuer lock serializes dispatch and submission. A 128-IB wire
+     * record plus its resolved handles must not live on the kernel stack. */
+    NativeAdrenoAbiSubmitBatch submit_request_{};
+    NativeAdrenoSubmitBuffer submit_buffers_[NativeAdrenoAbiMaxBatchBuffers]{};
     Entry *find(uint64_t);
     Entry *free();
-    static void clear(Entry &);
+    void publish(Entry &);
+    void clear(Entry &);
 public:
     NativeAdrenoUserClient()=default;
     ~NativeAdrenoUserClient()=default;
@@ -92,6 +100,8 @@ public:
     /* Board-only trial: remove a completed mapping but retain its CPU allocation until platform reset. */
     IOReturn unmapRetainedForTrial(uint64_t handle);
     IOReturn submit(const NativeAdrenoAbiSubmit *,NativeAdrenoAbiSubmitReply *,
+        const NativeAdrenoRingClock *);
+    IOReturn submitBatch(const NativeAdrenoAbiSubmitBatch *,NativeAdrenoAbiSubmitReply *,
         const NativeAdrenoRingClock *);
     IOReturn cpuMap(const NativeAdrenoAbiBoCpuMap *,NativeAdrenoAbiBoCpuMapReply *);
     IOReturn cpuUnmap(const NativeAdrenoAbiBoCpuUnmap *);

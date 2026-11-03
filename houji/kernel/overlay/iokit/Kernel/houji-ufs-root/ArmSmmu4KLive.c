@@ -405,7 +405,7 @@ ArmSmmu4KStatus ArmSmmu4KLiveAuditContext(const ArmSmmu4KContextConfig *context,
 static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *state,
     const ArmSmmu4KIo *io,unsigned bank,const ArmSmmu4KContextConfig *context,
     const ArmSmmu4KLiveVisibility *visibility,const ArmSmmu4KRange *before,size_t count,
-    const ArmSmmu4KLiveRegion *peer,const ArmSmmu4KRange *changes,size_t change_count,unsigned map,unsigned exclusive,unsigned budget,
+    const ArmSmmu4KLiveRegion *peer,const ArmSmmu4KRange *changes,size_t change_count,unsigned map,unsigned exclusive,unsigned page_limit,unsigned budget,
     ArmSmmu4KLiveResult *r)
 {
     if(!r)return ArmSmmu4KArgument;
@@ -514,7 +514,7 @@ static ArmSmmu4KStatus update(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveState *st
     } else if(!map) {
         /* Up to ArmSmmu4KTlbPageLimit pages are dropped one by one and the rest of the ASID's translations stay cached; a bigger
          * unmap invalidates the ASID (i568: 3622 unmaps each emptied the GPU's TLB). */
-        status=changed<=ArmSmmu4KTlbPageLimit?
+        status=changed<=page_limit?
             ArmSmmu4KSyncContextTlbPages(io,state->context_offset,context->asid,changes,change_count,budget,&r->synchronization):
             ArmSmmu4KSyncContextTlb(io,state->context_offset,context->asid,0,budget,&r->synchronization);
         if(status!=ArmSmmu4KSuccess)goto poisoned;
@@ -546,11 +546,11 @@ ArmSmmu4KStatus ArmSmmu4KLiveUpdate(const ArmSmmu4KLiveArena *a,ArmSmmu4KLiveSta
     const ArmSmmu4KIo *io,unsigned bank,const ArmSmmu4KContextConfig *context,
     const ArmSmmu4KLiveVisibility *visibility,const ArmSmmu4KRange *before,size_t count,
     const ArmSmmu4KRange *change,unsigned map,unsigned budget,ArmSmmu4KLiveResult *r)
-{return update(a,state,io,bank,context,visibility,before,count,0,change,1,map,0,budget,r);}
+{return update(a,state,io,bank,context,visibility,before,count,0,change,1,map,0,ArmSmmu4KTlbPageLimit,budget,r);}
 static ArmSmmu4KStatus update_context(const ArmSmmu4KIo *io,unsigned bank,
     const ArmSmmu4KContextConfig *context,const ArmSmmu4KLiveRegion *lower,
     const ArmSmmu4KLiveRegion *upper,unsigned change_upper,const ArmSmmu4KLiveVisibility *visibility,
-    const ArmSmmu4KRange *changes,size_t change_count,unsigned map,unsigned exclusive,unsigned budget,ArmSmmu4KLiveResult *r)
+    const ArmSmmu4KRange *changes,size_t change_count,unsigned map,unsigned exclusive,unsigned page_limit,unsigned budget,ArmSmmu4KLiveResult *r)
 {
     if(!r)return ArmSmmu4KArgument;
     *r=(ArmSmmu4KLiveResult){0};r->must_retain_resources=1;
@@ -559,18 +559,26 @@ static ArmSmmu4KStatus update_context(const ArmSmmu4KIo *io,unsigned bank,
     if(!target || !target->state)return ArmSmmu4KArgument;
     ArmSmmu4KStatus status=context_metadata(context,lower,upper,target->state->generation==0);if(status)return status;
     return update(target->arena,target->state,io,bank,context,visibility,target->ranges,target->count,
-        peer,changes,change_count,map,exclusive,budget,r);
+        peer,changes,change_count,map,exclusive,page_limit,budget,r);
 }
 ArmSmmu4KStatus ArmSmmu4KLiveUpdateContextBatch(const ArmSmmu4KIo *io,unsigned bank,
     const ArmSmmu4KContextConfig *context,const ArmSmmu4KLiveRegion *lower,
     const ArmSmmu4KLiveRegion *upper,unsigned change_upper,const ArmSmmu4KLiveVisibility *visibility,
     const ArmSmmu4KRange *changes,size_t change_count,unsigned map,unsigned budget,ArmSmmu4KLiveResult *r)
-{return update_context(io,bank,context,lower,upper,change_upper,visibility,changes,change_count,map,0,budget,r);}
+{return update_context(io,bank,context,lower,upper,change_upper,visibility,changes,change_count,map,0,ArmSmmu4KTlbPageLimit,budget,r);}
+/* Board-selected unmap for guarded/expensive MMIO. Same proof, PTE stores,
+ * table publication, ASID invalidate, TLBSYNC and fail-closed lifetime as the
+ * existing large-unmap branch. Only the per-page optimization is bypassed. */
+ArmSmmu4KStatus ArmSmmu4KLiveUnmapContextBatchAsid(const ArmSmmu4KIo *io,unsigned bank,
+    const ArmSmmu4KContextConfig *context,const ArmSmmu4KLiveRegion *lower,
+    const ArmSmmu4KLiveRegion *upper,unsigned change_upper,const ArmSmmu4KLiveVisibility *visibility,
+    const ArmSmmu4KRange *changes,size_t change_count,unsigned budget,ArmSmmu4KLiveResult *r)
+{return update_context(io,bank,context,lower,upper,change_upper,visibility,changes,change_count,0,0,0,budget,r);}
 ArmSmmu4KStatus ArmSmmu4KLiveMapContextBatchExclusive(const ArmSmmu4KIo *io,unsigned bank,
     const ArmSmmu4KContextConfig *context,const ArmSmmu4KLiveRegion *lower,
     const ArmSmmu4KLiveRegion *upper,unsigned change_upper,const ArmSmmu4KLiveVisibility *visibility,
     const ArmSmmu4KRange *changes,size_t change_count,unsigned budget,ArmSmmu4KLiveResult *r)
-{return update_context(io,bank,context,lower,upper,change_upper,visibility,changes,change_count,1,1,budget,r);}
+{return update_context(io,bank,context,lower,upper,change_upper,visibility,changes,change_count,1,1,ArmSmmu4KTlbPageLimit,budget,r);}
 ArmSmmu4KStatus ArmSmmu4KLiveUpdateContext(const ArmSmmu4KIo *io,unsigned bank,
     const ArmSmmu4KContextConfig *context,const ArmSmmu4KLiveRegion *lower,
     const ArmSmmu4KLiveRegion *upper,unsigned change_upper,const ArmSmmu4KLiveVisibility *visibility,

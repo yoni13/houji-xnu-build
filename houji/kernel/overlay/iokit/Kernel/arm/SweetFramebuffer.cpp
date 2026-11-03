@@ -1,7 +1,7 @@
 /*
- * Built-in IOMobileFramebuffer for SWEET: the ABL's continuous-splash
- * framebuffer (1080x2400 a8r8g8b8 in RAM, the panel scans it out by
- * itself) as the main display, driven by CoreAnimation's CPU renderer.
+ * Built-in IOMobileFramebuffer for houji on the SWEET kernel target: the
+ * ABL's continuous-splash framebuffer (1200x2670 in RAM) remains scanout.
+ * Completed compositor surfaces are copied into it by a separate worker.
  *
  * IOMobileFramebuffer.framework (iOS 16.7) counts /arm-io children with
  * device_type "display-subsystem", waits for that many services matching
@@ -19,8 +19,8 @@
  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
  * Everything else is accepted and logged once.
  *
- * SwapEnd copies the enabled layers' surfaces into the panel memory (no
- * scaling, CPU copy). Vsync (notification type 5) is a 60 Hz timer that
+ * SwapEnd retains the enabled layers for a fenced CPU copy (no scaling).
+ * Vsync (notification type 5) is a configurable 60/120 Hz software timer that
  * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
  * enabled it, through the port they registered (IOConnectSetNotificationPort).
  *
@@ -81,6 +81,12 @@ static uint64_t houji_fb_copy_wakes,houji_fb_copy_worker_ticks,houji_fb_copy_wor
 static uint64_t houji_fb_started_at,houji_fb_last_notify_at,houji_fb_max_notify_gap;
 static uint32_t houji_fb_hz_arg_found,houji_fb_config_hz,houji_fb_flush_every;
 static size_t houji_fb_command_line_bytes;
+static uint64_t sweet_fb_swap_count,houji_fb_present_count;
+static uint64_t houji_fb_sync_deferred,houji_fb_cache_bytes,houji_fb_cache_ticks,houji_fb_cache_denied;
+static uint64_t houji_fb_retired,houji_fb_waits,houji_fb_wait_blocked,houji_fb_wait_timeout,houji_fb_queue_full,houji_fb_queue_peak;
+struct HoujiDisplayHistory {uint32_t sequence;uint64_t values[7];};
+static HoujiDisplayHistory houji_fb_history[40];
+static uint32_t houji_fb_history_count;
 struct HoujiRectObservation { uint32_t sequence,values[15]; };
 static HoujiRectObservation houji_fb_rects[8];
 static uint32_t houji_fb_rect_count;
@@ -91,6 +97,7 @@ static HoujiColourObservation houji_fb_colour_peaks[SWEET_FB_LAYERS];
 static uint64_t houji_fb_colour_frames,houji_fb_colour_purple,houji_fb_colour_zero_alpha;
 static void houjiSaveColour(HoujiColourObservation &slot,uint32_t n,const uint32_t *values){
  __atomic_store_n(&slot.sequence,0u,__ATOMIC_RELEASE);
+ __atomic_thread_fence(__ATOMIC_RELEASE);
  for(unsigned i=0;i<12;i++)__atomic_store_n(&slot.values[i],values[i],__ATOMIC_RELAXED);
  __atomic_store_n(&slot.sequence,n,__ATOMIC_RELEASE);
 }
@@ -130,12 +137,14 @@ static void houjiReportColours(void){
  for(auto &slot:houji_fb_colour_peaks){
   uint32_t n=__atomic_load_n(&slot.sequence,__ATOMIC_ACQUIRE),v[12];if(!n)continue;
   for(unsigned i=0;i<12;i++)v[i]=__atomic_load_n(&slot.values[i],__ATOMIC_RELAXED);
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
   if(n!=__atomic_load_n(&slot.sequence,__ATOMIC_ACQUIRE))continue;
   IOLog("HOUJI COLOUR PEAK: n=%u frame=%u layer=%u fmt=%x rect=%ux%u dst=%u,%u samples=%u opaque-black=%u transparent-black=%u purple-candidates=%u alpha-zero=%u; retained across scene changes\n",n,v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8],v[9],v[10],v[11]);
  }
  for(auto &slot:houji_fb_colours){
   uint32_t n=__atomic_load_n(&slot.sequence,__ATOMIC_ACQUIRE),v[12];if(!n)continue;
   for(unsigned i=0;i<12;i++)v[i]=__atomic_load_n(&slot.values[i],__ATOMIC_RELAXED);
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
   if(n!=__atomic_load_n(&slot.sequence,__ATOMIC_ACQUIRE))continue;
   IOLog("HOUJI COLOUR SOURCE: n=%u frame=%u layer=%u fmt=%x rect=%ux%u dst=%u,%u samples=%u opaque-black=%u transparent-black=%u purple-candidates=%u alpha-zero=%u; completed source samples, packed-word counts only\n",n,v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8],v[9],v[10],v[11]);
  }
@@ -152,6 +161,7 @@ static void houjiObserveRect(uint32_t frame,uint32_t layer,uint32_t id,uint32_t 
  if(!scale&&!crop)return;v[14]=(scale?1u:0u)|(crop?2u:0u);
  uint32_t n=__atomic_add_fetch(&houji_fb_rect_count,1u,__ATOMIC_RELAXED);auto &slot=houji_fb_rects[(n-1)%8];
  __atomic_store_n(&slot.sequence,0u,__ATOMIC_RELEASE);
+ __atomic_thread_fence(__ATOMIC_RELEASE);
  for(unsigned i=0;i<15;i++)__atomic_store_n(&slot.values[i],v[i],__ATOMIC_RELAXED);
  __atomic_store_n(&slot.sequence,n,__ATOMIC_RELEASE);
 }
@@ -159,15 +169,68 @@ static void houjiReportRects(void) {
  for(unsigned slot=0;slot<8;slot++){
   auto &s=houji_fb_rects[slot];uint32_t n=__atomic_load_n(&s.sequence,__ATOMIC_ACQUIRE),v[15];if(!n)continue;
   for(unsigned i=0;i<15;i++)v[i]=__atomic_load_n(&s.values[i],__ATOMIC_RELAXED);
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
   if(n!=__atomic_load_n(&s.sequence,__ATOMIC_ACQUIRE))continue;
   IOLog("HOUJI DISPLAY RECT: n=%u frame=%u layer=%u surface=%u %ux%u fmt=%x src=%d,%d,%u,%u dst=%d,%d,%u,%u flags=%u; observed record only\n",n,v[0],v[1],v[2],v[3],v[4],v[5],int32_t(v[6]),int32_t(v[7]),v[8],v[9],int32_t(v[10]),int32_t(v[11]),v[12],v[13],v[14]);
  }
 }
 
-static uint64_t houji_fb_sync_deferred,houji_fb_cache_bytes,houji_fb_cache_ticks,houji_fb_cache_denied;
+// Copy cached facts into the reserved log prefix. IOLog-only observations can
+// disappear from the ring before recovery; this path never reads pixels/MMIO.
+extern "C" unsigned houji_framebuffer_snapshot(char *out,unsigned capacity) {
+ if(!out || !capacity)return 0;
+ unsigned used=0;out[0]=0;
+ auto append=[&](const char *format,auto... args){
+  if(used>=capacity-1)return;
+  int n=snprintf(out+used,capacity-used,format,args...);
+  if(n>0 && (unsigned)n<capacity-used)used+=(unsigned)n;
+  else out[used]=0; // retain only complete rows in the fixed log prefix
+ };
+ auto load=[](const uint64_t *v){return __atomic_load_n(v,__ATOMIC_RELAXED);};
+ auto us=[](uint64_t ticks){uint64_t ns=0;absolutetime_to_nanoseconds(ticks,&ns);return ns/1000;};
+ uint64_t now=mach_absolute_time(),began=load(&houji_fb_started_at);
+ append("HOUJI DISPLAY TIMING: configured-hz=%u elapsed-ms=%llu callbacks=%llu due=%llu max-gap-us=%llu missed=%llu; software notifications, not panel vblank\n",
+  houji_fb_config_hz,began && now>=began?us(now-began)/1000:0,load(&houji_fb_callbacks),load(&houji_fb_due_ticks),us(load(&houji_fb_max_notify_gap)),load(&houji_fb_missed_timer_ticks));
+ append("HOUJI DISPLAY COPY: swaps=%llu completed=%llu bytes=%llu copy-us=%llu max-us=%llu worker-us=%llu max-worker-us=%llu; CPU copy and store barrier\n",
+  load(&sweet_fb_swap_count),load(&houji_fb_present_count),load(&houji_fb_copy_bytes),us(load(&houji_fb_present_ticks)),us(load(&houji_fb_max_present_ticks)),us(load(&houji_fb_copy_worker_ticks)),us(load(&houji_fb_copy_worker_max_ticks)));
+ append("HOUJI DISPLAY QUEUE: retired=%llu waits=%llu blocked=%llu timeouts=%llu full=%llu peak=%llu deferred=%llu cache-bytes=%llu cache-us=%llu denied=%llu\n",
+  load(&houji_fb_retired),load(&houji_fb_waits),load(&houji_fb_wait_blocked),load(&houji_fb_wait_timeout),load(&houji_fb_queue_full),load(&houji_fb_queue_peak),load(&houji_fb_sync_deferred),load(&houji_fb_cache_bytes),us(load(&houji_fb_cache_ticks)),load(&houji_fb_cache_denied));
+ const uint32_t end=__atomic_load_n(&houji_fb_history_count,__ATOMIC_ACQUIRE);
+ // Reserve room for colour/crop facts too. Four recent windows survive even
+ // when the IOLog tail has wrapped during a long interactive test.
+ for(uint32_t offset=0;offset<4 && offset<end;offset++){
+  uint32_t n=end-offset;auto &slot=houji_fb_history[(n-1)%40];uint64_t v[7];
+  if(__atomic_load_n(&slot.sequence,__ATOMIC_ACQUIRE)!=n)continue;
+  for(unsigned i=0;i<7;i++)v[i]=__atomic_load_n(&slot.values[i],__ATOMIC_RELAXED);
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
+  if(__atomic_load_n(&slot.sequence,__ATOMIC_ACQUIRE)!=n)continue;
+  append("HOUJI DISPLAY HISTORY: sample=%u up-ms=%llu window-ms=%llu swaps=%llu presents=%llu copy-us=%llu max-us=%llu missed=%llu; CPU copy, not panel FPS\n",n,v[0],v[1],v[2],v[3],v[4],v[5],v[6]);
+ }
+ append("HOUJI DISPLAY SOURCE: surfaces=%llu purple-candidates=%llu alpha-zero=%llu; cached samples, intentional colours included\n",
+  __atomic_load_n(&houji_fb_colour_frames,__ATOMIC_RELAXED),
+  __atomic_load_n(&houji_fb_colour_purple,__ATOMIC_RELAXED),
+  __atomic_load_n(&houji_fb_colour_zero_alpha,__ATOMIC_RELAXED));
+ for(auto &slot:houji_fb_colour_peaks){
+  uint32_t n=__atomic_load_n(&slot.sequence,__ATOMIC_ACQUIRE),v[12];if(!n)continue;
+  for(unsigned i=0;i<12;i++)v[i]=__atomic_load_n(&slot.values[i],__ATOMIC_RELAXED);
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
+  if(n!=__atomic_load_n(&slot.sequence,__ATOMIC_ACQUIRE))continue;
+  append("HOUJI DISPLAY SOURCE PEAK: frame=%u layer=%u fmt=%x rect=%ux%u dst=%d,%d samples=%u black=%u transparent-black=%u purple=%u alpha-zero=%u\n",
+   v[0],v[1],v[2],v[3],v[4],int32_t(v[5]),int32_t(v[6]),v[7],v[8],v[9],v[10],v[11]);
+ }
+ for(auto &slot:houji_fb_rects){
+  uint32_t n=__atomic_load_n(&slot.sequence,__ATOMIC_ACQUIRE),v[15];if(!n)continue;
+  for(unsigned i=0;i<15;i++)v[i]=__atomic_load_n(&slot.values[i],__ATOMIC_RELAXED);
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
+  if(n!=__atomic_load_n(&slot.sequence,__ATOMIC_ACQUIRE))continue;
+  append("HOUJI DISPLAY SOURCE RECT: frame=%u layer=%u fmt=%x src=%d,%d,%u,%u dst=%d,%d,%u,%u flags=%u\n",
+   v[0],v[1],v[5],int32_t(v[6]),int32_t(v[7]),v[8],v[9],int32_t(v[10]),int32_t(v[11]),v[12],v[13],v[14]);
+ }
+ return used;
+}
+
 extern "C" int native_adreno_present_begin_frame(uint32_t);
 extern "C" uint32_t native_adreno_present_capture_fence(void);
-static uint64_t houji_fb_retired,houji_fb_waits,houji_fb_wait_blocked,houji_fb_wait_timeout,houji_fb_queue_full,houji_fb_queue_peak;
 static uint64_t houji_fb_last_wait_id,houji_fb_last_wait_mode,houji_fb_last_wait_ns;
 static uint64_t houji_fb_wait_ticks;   /* total time SwapWait blocked */
 struct HoujiDisplayFrame {
@@ -554,11 +617,6 @@ static void houjiNoteSwapInterval(void){
  if(b<6){__atomic_fetch_add(&houji_fb_anim_frames,1ull,__ATOMIC_RELAXED);__atomic_fetch_add(&houji_fb_anim_ticks,now-last,__ATOMIC_RELAXED);}
 }
 static uint32_t sweet_fb_swaps_logged;
-static uint64_t sweet_fb_swap_count;
-static uint64_t houji_fb_present_count;
-struct HoujiDisplayHistory {uint32_t sequence;uint64_t values[7];};
-static HoujiDisplayHistory houji_fb_history[40];
-static uint32_t houji_fb_history_count;
 extern "C" void houji_framebuffer_history_report(void) {
  houjiReportColours();
  const uint32_t end=__atomic_load_n(&houji_fb_history_count,__ATOMIC_ACQUIRE);
@@ -567,6 +625,7 @@ extern "C" void houji_framebuffer_history_report(void) {
   auto &s=houji_fb_history[(n-1)%40];uint64_t v[7];
   if(__atomic_load_n(&s.sequence,__ATOMIC_ACQUIRE)!=n)continue;
   for(unsigned i=0;i<7;i++)v[i]=__atomic_load_n(&s.values[i],__ATOMIC_RELAXED);
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
   if(__atomic_load_n(&s.sequence,__ATOMIC_ACQUIRE)!=n)continue;
   IOLog("HOUJI DISPLAY HISTORY: sample=%u up-ms=%llu window-ms=%llu swaps=%llu presents=%llu copy-us=%llu max-us=%llu missed=%llu; CPU copy windows, not panel FPS\n",n,v[0],v[1],v[2],v[3],v[4],v[5],v[6]);
  }
@@ -595,6 +654,7 @@ extern "C" void houji_framebuffer_report(void)
 	 const uint64_t v[7]={upNs/NSEC_PER_MSEC,windowNs/NSEC_PER_MSEC,swaps-previousSwaps,delta,delta?presentNs/NSEC_PER_USEC/delta:0,maximumNs/NSEC_PER_USEC,__atomic_load_n(&houji_fb_missed_timer_ticks,__ATOMIC_RELAXED)};
 	 const uint32_t n=__atomic_add_fetch(&houji_fb_history_count,1u,__ATOMIC_RELAXED);auto &slot=houji_fb_history[(n-1)%40];
 	 __atomic_store_n(&slot.sequence,0u,__ATOMIC_RELEASE);
+ __atomic_thread_fence(__ATOMIC_RELEASE);
 	 for(unsigned i=0;i<7;i++)__atomic_store_n(&slot.values[i],v[i],__ATOMIC_RELAXED);
 	 __atomic_store_n(&slot.sequence,n,__ATOMIC_RELEASE);
 	}
@@ -697,7 +757,6 @@ AppleCLCD::present(const HoujiDisplayFrame &frame)
  if(token<0){__atomic_fetch_add(&houji_fb_sync_deferred,1ull,__ATOMIC_RELAXED);return false;}
  struct UnlockGpu {int token;~UnlockGpu(){if(token>0)native_adreno_present_end();}} unlock{token};
 	uint32_t mask = get32(rec, 0x104);
-	__atomic_add_fetch(&houji_fb_present_count, 1, __ATOMIC_RELAXED);
 	uint64_t started = mach_absolute_time(), copied = 0;
 
 
@@ -792,14 +851,15 @@ AppleCLCD::present(const HoujiDisplayFrame &frame)
 		}
 		s->release();
 	}
+ __asm__ volatile("dsb sy":::"memory"); /* all scanout stores before retirement */
 	uint64_t elapsed = mach_absolute_time() - started;
+	__atomic_add_fetch(&houji_fb_present_count,1ull,__ATOMIC_RELAXED);
 	__atomic_add_fetch(&houji_fb_copy_bytes, copied, __ATOMIC_RELAXED);
 	__atomic_add_fetch(&houji_fb_present_ticks, elapsed, __ATOMIC_RELAXED);
 	uint64_t maximum = __atomic_load_n(&houji_fb_max_present_ticks, __ATOMIC_RELAXED);
 	while (elapsed > maximum && !__atomic_compare_exchange_n(&houji_fb_max_present_ticks,
 	    &maximum, elapsed, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
 
- __asm__ volatile("dsb sy":::"memory"); /* all scanout stores before retirement */
  return true;
 }
 

@@ -122,6 +122,13 @@ ArmSmmu4KStatus ArmSmmu4KLiveMapContextBatchExclusive(const ArmSmmu4KIo *,unsign
     const ArmSmmu4KLiveRegion *upper,unsigned change_upper,
     const ArmSmmu4KLiveVisibility *,const ArmSmmu4KRange *changes,size_t change_count,
     unsigned poll_budget,ArmSmmu4KLiveResult *);
+/* Same synchronous unmap contract as UpdateContextBatch(map=0), choosing
+ * the existing ASID-wide invalidation even for a small change. */
+ArmSmmu4KStatus ArmSmmu4KLiveUnmapContextBatchAsid(const ArmSmmu4KIo *,unsigned bank,
+    const ArmSmmu4KContextConfig *,const ArmSmmu4KLiveRegion *lower,
+    const ArmSmmu4KLiveRegion *upper,unsigned change_upper,
+    const ArmSmmu4KLiveVisibility *,const ArmSmmu4KRange *changes,size_t change_count,
+    unsigned poll_budget,ArmSmmu4KLiveResult *);
 #ifdef __cplusplus
 }
 #endif

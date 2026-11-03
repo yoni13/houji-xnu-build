@@ -18,14 +18,17 @@ static struct {
 static bool houjiApiActive(void){return gHoujiApi.active;}
 static bool houjiApiInOperation(void){return gHoujiApi.active && gHoujiApi.in_op;}
 static bool houjiProviderTlbValue(uint64_t);
+static bool houjiCoherenceTlbValue(uint64_t);
+static int houjiCoherencePublish(const volatile uint32_t*,size_t);
 static bool houjiApiTlbValue(uint64_t v){
  if(gHoujiApi.phase==11)return houjiProviderTlbValue(v);
+ if(gHoujiApi.phase==12)return houjiCoherenceTlbValue(v);
  return houjiApiInOperation() && (v>>48)==0x751 && (v&UINT64_C(0x0000ffffffffffff))>=0x40000 && (v&UINT64_C(0x0000ffffffffffff))<0x4000c;
 }
 static int houjiProviderPublish(const volatile uint32_t*,size_t);
 static int houjiLiveCoexistPublish(const volatile uint32_t*,size_t);
 static int houjiApiPublish(const volatile uint32_t*words,size_t bytes){
- auto&s=gHoujiSubmit;auto&a=gHoujiApi;if(a.phase==11)return houjiProviderPublish(words,bytes);if(a.phase==9)return houjiLiveCoexistPublish(words,bytes);if(!houjiApiInOperation() || a.phase!=5 || houjiSubmitGuard() || !s.adopted ||
+ auto&s=gHoujiSubmit;auto&a=gHoujiApi;if(a.phase==12)return houjiCoherencePublish(words,bytes);if(a.phase==11)return houjiProviderPublish(words,bytes);if(a.phase==9)return houjiLiveCoexistPublish(words,bytes);if(!houjiApiInOperation() || a.phase!=5 || houjiSubmitGuard() || !s.adopted ||
   s.published || s.pending || words!=houjiCpCpu() || bytes!=HHR_BYTES || s.iteration<65 || s.iteration>80)return 1;
  const uint32_t seq=s.iteration,fence=HHR_SCRATCH+0x104,bv=HHR_SCRATCH+0x10c;
  const uint32_t expected[]={
@@ -72,8 +75,14 @@ static int houjiNativeClientBatch(void){
  const ArmSmmu4KIo io={nullptr,0x40000,houjiVmRead32,houjiVmRead64,houjiVmWrite32,houjiVmWrite64,houjiVmBarrier};
  const ArmSmmu4KStream routes[]={{1,0},{2,1}};ArmSmmu4KStreamResult observed{};
  a.code=ArmSmmu4KAdoptStreams(&io,&a.streams,routes,2,0,&v.context,&observed);if(a.code)goto done;
- a.region={const_cast<NativeAdrenoMemory*>(&gHoujiFullMemory.bo(14)),const_cast<ArmSmmu4KLiveArena*>(v.binding.arena),v.binding.state};
- a.code=a.vm.attachSeeded(&io,&v.context,&a.streams,&a.region,nullptr,65536,1000,v.binding.boot_ranges,12,nullptr,0);if(a.code)goto done;
+ a.region={const_cast<NativeAdrenoMemory*>(&gHoujiFullMemory.bo(14)),v.binding.arena,v.binding.state};
+ /* Each page TLBI repeats houjiVmIoLease's four GPU register observations.
+  * r249 unmap transactions reached 79 ms under the issuer lock. Use the
+  * existing ASID invalidation path, preserving idle proofs and TLBSYNC. */
+ /* r276/r277 stopped before userspace with the owned alias workspace enabled.
+  * Keep the qualified boot allocation/order here. Provider startup enables
+  * indexing after coexistence/coherence, before its known-image rounds. */
+ a.code=a.vm.attachSeeded(&io,&v.context,&a.streams,&a.region,nullptr,65536,1000,v.binding.boot_ranges,12,nullptr,0,false,false);if(a.code)goto done;
  a.phase=2;native_adreno_vm_now_us=houjiApiNow;
  a.code=a.submit.attach(&a.vm,&s.ring);if(a.code)goto done;
  /* Same kernel owner has actually completed HFC and64 framed draws. Only this

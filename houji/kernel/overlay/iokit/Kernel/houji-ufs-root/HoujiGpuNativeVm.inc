@@ -5,6 +5,7 @@
  */
 #ifndef HOUJI_GPU_NATIVE_VM_INC
 #define HOUJI_GPU_NATIVE_VM_INC
+#include "HoujiGpuCanaryRanges.h"
 static_assert(sizeof(ArmSmmu4KContextConfig)==64 && offsetof(ArmSmmu4KContextConfig,polling_faults)==56,"current exact context ABI");
 static struct {
  FhrGpuLiveBinding binding;ArmSmmu4KContextConfig context;
@@ -35,7 +36,9 @@ static int houjiVmWrite32(void*,size_t at,uint32_t value){
 }
 static int houjiVmWrite64(void*,size_t at,uint64_t value){
  auto&g=gHoujiVm;g.last_offset=(uint32_t)at;g.last_op=4;g.last_value=value;
- if(!houjiVmIoLease() || at!=0x20620 || (value!=((UINT64_C(0x751)<<48)|(UINT64_C(0x40000000)>>12)) && !houjiApiTlbValue(value)))return 1;
+ const bool canary=g.active && g.in_update && g.change.bytes==4096 &&
+  value==((UINT64_C(0x751)<<48)|(g.change.iova>>12));
+ if(!houjiVmIoLease() || at!=0x20620 || (!canary && !houjiApiTlbValue(value)))return 1;
  auto*ptr=houjiFullPointer(0x3da0000+(uint32_t)at,8);if(!ptr)return 1;
  *reinterpret_cast<volatile uint64_t*>(ptr)=value;houjiStockWriteBarrier();return 0;
 }
@@ -75,6 +78,7 @@ static int houjiVmNormalizeOwnedTcr(void){
 }
 static int houjiVmUpdate(unsigned map){
  auto&g=gHoujiVm;if(!g.active || g.mapped==map || !houjiVmIdle() || !houjiFullLease() || !houjiFullTables())return 1;
+ if(map && !houjiGpuCanaryRanges(g.binding.boot_ranges,g.binding.boot_count,&g.change,g.ranges,13))return 1;
  const ArmSmmu4KIo io={nullptr,0x40000,houjiVmRead32,houjiVmRead64,houjiVmWrite32,houjiVmWrite64,houjiVmBarrier};
  const ArmSmmu4KLiveVisibility visibility={nullptr,houjiVmPublish};
  g.in_update=1;
@@ -88,7 +92,6 @@ static int houjiVmUpdate(unsigned map){
   IOLog("HOUJI VM CTX ACTUAL: CBAR=%x CBA2R=%x TCR=%x TCR2=%x MAIR=%x/%x SCTLR=%x TTBR=%llx/%llx zero=%x\n",got.cbar,got.cba2r,got.tcr,got.tcr2,got.mair0,got.mair1,got.sctlr,got.ttbr0,got.ttbr1,got.reserved_zero);
   IOLog("HOUJI NATIVE VM FAILED: map=%u status=%u complete=%u poison=%u phase=%u offset=%x op=%u value=%llx stores=%lu published=%lu\n",map,status,g.last.complete,g.binding.state->poisoned,g.last.synchronization.phase,g.last_offset,g.last_op,g.last_value,g.last.descriptor_writes,g.last.published_pages);return 1;
  }
- if(map){g.ranges[0]=g.change;for(unsigned i=0;i<12;i++)g.ranges[i+1]=g.binding.boot_ranges[i];}
  ArmSmmu4KLiveResult audit{};status=ArmSmmu4KLiveAudit(g.binding.arena,g.binding.state,map?g.ranges:g.binding.boot_ranges,map?13:12,&audit);
  if(status || !audit.complete || !houjiVmIdle())return 1;
  /* Only this successful exact whole-graph transaction advances the GPU-table
@@ -97,31 +100,34 @@ static int houjiVmUpdate(unsigned map){
  if(!houjiFullTables())return 1;g.mapped=map;if(map)++g.maps;else ++g.unmaps;return 0;
 }
 static int houjiVmCommand(unsigned restore){
- auto&g=gHoujiVm;if(!houjiVmIdle())return 1;
+ auto&g=gHoujiVm;if(!houjiVmIdle() || g.change.iova>UINT32_MAX)return 1;
  auto*words=(volatile uint32_t*)((uintptr_t)gHoujiFullMemory.entry(12).backing.cpu+HGKI_CLASS_CURSOR+4*4096);
  unsigned n=0;for(unsigned i=0;i<HGKI_SELECTED_COMMAND_WORDS;i++){
-  uint32_t original=hgki_command_word(i),want=original==HGKI_OUTPUT?0x40000000:original;
+  uint32_t original=hgki_command_word(i),want=original==HGKI_OUTPUT?(uint32_t)g.change.iova:original;
   if(words[i]!=(restore?want:original))return 1;if(original==HGKI_OUTPUT)++n;
  }
  if(n!=1)return 1;
- for(unsigned i=0;i<HGKI_SELECTED_COMMAND_WORDS;i++){uint32_t original=hgki_command_word(i);if(original==HGKI_OUTPUT)words[i]=restore?original:0x40000000;}
+ for(unsigned i=0;i<HGKI_SELECTED_COMMAND_WORDS;i++){uint32_t original=hgki_command_word(i);if(original==HGKI_OUTPUT)words[i]=restore?original:(uint32_t)g.change.iova;}
  houjiStockFullBarrier();if(!restore)++g.relocations;return 0;
 }
 static int houjiVmDynamicBatch(void){
  auto&g=gHoujiVm;auto&s=gHoujiSubmit;if(g.active || g.phase || s.completed!=32 || !houjiVmIdle())return 1;
  s.iteration=s.seq;g.active=1;g.phase=1;g.started_us=houjiSubmitNow(nullptr);g.original_crc=gHoujiFull.table_crc[1];
  if(fhr_gpu_live_binding(&gHoujiFull.storage,sizeof(gHoujiFull.storage),&g.binding,sizeof(g.binding)) ||
-  !g.binding.arena || !g.binding.state || g.binding.boot_count!=12 || g.binding.state->tables.table_pages!=1027 ||
+  !g.binding.arena || !g.binding.state || g.binding.boot_count!=12 || g.binding.state->tables.table_pages!=FHG_LIVE_GPU_USED_PAGES ||
   g.binding.state->tables.leaf_pages!=1567 || g.binding.state->generation || g.binding.state->context_offset)return g.code=1;
  g.context={&g.binding.arena->config,nullptr,&g.binding.state->tables,nullptr,0x4c017e18,0x5511,0x751,0,0,0,1};
  if(houjiVmNormalizeOwnedTcr())return g.code=14;
+ /* Exercise both high L2 roots, including the final 4K leaf, before exposing
+  * a user client. Every cycle restores the original table CRC and canaries. */
+ const uint64_t probe_iova[]={0x40000000,HOUJI_GPU_RENDER_START,0xc0000000,HOUJI_GPU_APERTURE-4096};
  for(g.cycle=0;g.cycle<4;g.cycle++){
   const uint64_t offset=(g.cycle&1)?0x94000:0x90000;const auto&e=gHoujiFullMemory.entry(12);
   auto*out=(volatile uint8_t*)((uintptr_t)e.backing.cpu+offset);
   /* Two separate CPU16K-aligned, already owned NC spans in read/write class2.
    * Existing aliases have identical NormalNC/nonprivileged/shareable attrs. */
   if(offset<0x87000 || offset+16384>0xc0000 || !houjiFullLease())return g.code=2;
-  g.change={0x40000000,e.backing.physical+offset,4096,ArmSmmu4KRead|ArmSmmu4KWrite,0,3};g.phase=2;
+  g.change={probe_iova[g.cycle],e.backing.physical+offset,4096,ArmSmmu4KRead|ArmSmmu4KWrite,0,3};g.phase=2;
   if(houjiVmUpdate(1))return g.code=3;
   for(unsigned draw=0;draw<8;draw++){
    if(!houjiVmIdle())return g.code=4;
@@ -138,7 +144,7 @@ static int houjiVmDynamicBatch(void){
   }
   g.phase=5;if(houjiVmUpdate(0))return g.code=12;
   if(gHoujiFull.table_crc[1]!=g.original_crc)return g.code=13;
-  IOLog("HOUJI NATIVE VM STEP: cycle=%u maps=%u unmaps=%u draws=%u IOVA=40000000 PA=%llx seq=%u observed=%u CRC=%08x generation=%llu published=%u TLB-sync=%u; old/new retained\n",g.cycle,g.maps,g.unmaps,g.draws,g.change.physical,s.seq,s.observed,g.crc,g.binding.state->generation,g.publishes,g.tlb_syncs);
+  IOLog("HOUJI NATIVE VM STEP: cycle=%u maps=%u unmaps=%u draws=%u IOVA=%llx PA=%llx seq=%u observed=%u CRC=%08x generation=%llu published=%u TLB-sync=%u; old/new retained\n",g.cycle,g.maps,g.unmaps,g.draws,g.change.iova,g.change.physical,s.seq,s.observed,g.crc,g.binding.state->generation,g.publishes,g.tlb_syncs);
  }
  g.phase=6;g.active=0;
  IOLog("HOUJI NATIVE VM RESULT: code=%u maps=%u unmaps=%u draws=%u topology=%lu leaves=%lu generation=%llu seq=%u observed=%u RPTR=%u WPTR=%u CRC=%08x published=%u TLB-sync=%u elapsed-us=%llu; no user-client/desktop claim\n",g.code,g.maps,g.unmaps,g.draws,g.binding.state->tables.table_pages,g.binding.state->tables.leaf_pages,g.binding.state->generation,s.seq,s.observed,s.rptr,s.wptr,g.crc,g.publishes,g.tlb_syncs,houjiSubmitNow(nullptr)-g.started_us);return 0;

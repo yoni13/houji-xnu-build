@@ -98,10 +98,11 @@ static int houjiCpKeepLive(void*,hhr_result*r){
 }
 static int houjiFullKeepLive(void*){return gHoujiLive.requested && gHoujiLive.retained && gHoujiLive.coexist && !gHoujiLive.code && !houjiSubmitGuard() && houjiVmIdle() && houjiFullLease() && houjiFullTables()?1:0;}
 #include "HoujiGpuNativeProvider.inc"
+#include "HoujiGpuCoherenceProbe.inc"
 #include "HoujiGpuProbeLog.inc"
 static void houjiLiveDeadline(void*,wait_result_t){
  thread_set_thread_name(current_thread(),"houji-gpu-guard");uint64_t began=houjiSubmitNow(nullptr);
- while(houjiSubmitNow(nullptr)-began<(gHoujiLive.mode==3?420000000ull:360000000ull))IOSleep(1000);
+ while(houjiSubmitNow(nullptr)-began<(gHoujiLive.mode==3?210000000ull:360000000ull))IOSleep(1000);
  /* Independent of provider/VFS locks. All device resources remain pinned;
   * the host prearmed recovery BCB. Panic recovery does no filesystem I/O. */
  native_adreno_provider_snapshot();panic("HOUJI LIVE: independent runtime deadline; retained resources, PSCI-only recovery, no FS");
@@ -158,6 +159,8 @@ static void houjiLiveWorker(void*,wait_result_t){
 }
 static bool houjiLiveStart(void){
  if(!houjiFullKeepLive(nullptr))return false;
+ {unsigned coherent=1;PE_parse_boot_argn("houji_gpu_coherent",&coherent,sizeof(coherent));
+  if((gHoujiLive.mode==4 && coherent) || gHoujiLive.mode==5)houjiCoherenceTrial();}
  if(houjiProviderStart())return false;
  houjiDvfsStart();
  IOLog("HOUJI LIVE COMMIT: exact retained handoff and coexistence before userland; completed=%u real jobs\n",gHoujiSubmit.completed);

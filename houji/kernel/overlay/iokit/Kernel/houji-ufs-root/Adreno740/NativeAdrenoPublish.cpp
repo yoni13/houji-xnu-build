@@ -17,10 +17,16 @@
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOUserClient.h>
 #include <string.h>
+#include "../HoujiGpuAddressLayout.h"
 #include <kern/thread.h>
+#include <kern/clock.h>
+#include <kern/sched_prim.h>
+#include <pexpert/pexpert.h>
+#include "NativeAdrenoIssuerTrace.h"
 #include "NativeAdrenoUserClient.h"
 
 extern "C" IOReturn native_adreno_board_quiesce(void);
+extern "C" IOReturn native_adreno_board_prepare_submit(void);
 extern "C" void native_adreno_board_teardown_checkpoint(const char*,uint32_t,uint32_t);
 static_assert(__is_same(decltype(((IOUserClient*)nullptr)->removeMappingForDescriptor(nullptr)),IOMemoryMap*),"This integrated XNU uses raw OSPtr; map references require explicit release");
 extern "C" bool native_adreno_board_va_window(uint64_t,uint64_t);
@@ -80,6 +86,9 @@ volatile uint32_t *gMailboxWords=nullptr;
 volatile bool gPollerStarted=false;
 }
 class AGXDeviceUserClient;
+struct NativeAdrenoDispatchClock;
+static IOReturn nativeAdrenoRunGuarded(AGXDeviceUserClient *,uint32_t,const void *,size_t,void *,size_t,NativeAdrenoDispatchClock &);
+static IOReturn nativeAdrenoWaitFence(AGXDeviceUserClient *,const void *,void *,size_t,NativeAdrenoDispatchClock &);
 /* The render server's connection serves the mailbox; it is retained while set (under g.lock), so the poller never runs on a freed object. */
 static AGXDeviceUserClient *gMailboxOwner=nullptr;
 void nativeAdrenoMailboxPoller(void *,wait_result_t);
@@ -110,16 +119,7 @@ volatile uint32_t native_adreno_mount_fail[4];
 struct NativeAdrenoAskerRecord {char name[20]; uint32_t reads;};
 struct NativeAdrenoAskerRecord native_adreno_metal_askers[12];
 }
-/* GPU address windows inside the board's VA range (GpuPowerProbe gDeviceInfo: 0x20000000..0x80000000 of the 2 GiB aperture). Slot 0 is the
- * render server's (it held the whole 1.5 GiB alone before int-155 and used at most a few hundred MiB); slots 1 and 2 are for other Metal
- * processes. A kernel connection (the board's self-test) maps where it likes and is never scoped. */
-/* Slot 0 is the render server's 1 GiB (it reached 934 MiB in int-196); the rest of the aperture is shared by three more processes (PosterBoard for the
- * wallpaper, iconservicesagent for the icons, WidgetRenderer_Default for the widgets: int-196's screen pictures showed a black wallpaper and white widget
- * boxes, none of which had a native device), 170 MiB each (page aligned). int-198: iconservicesagent reached 128 MiB into its window and then lost its
- * Metal device; whether the window is the cause is what the [gpu windows] log row decides before these sizes change. */
-enum : unsigned {NativeAdrenoMaxClients=4};
-static const struct {uint64_t start,bytes;} kClientWindows[NativeAdrenoMaxClients]={
-    {0x20000000ull,0x40000000ull},{0x10000000ull,0x10000000ull},{0x64000000ull,0x0C000000ull},{0x70000000ull,0x0C000000ull}};
+#include "../HoujiGpuClientLayout.h"
 
 namespace {
 void shiftName(char names[3][17]) {
@@ -142,6 +142,49 @@ struct Published {
     uint32_t input_bits=0,output_bits=0;
     uint32_t opened=0,closed=0;
 } g;
+}
+
+// gtrace=1 is an explicit CPU-only diagnostic. The wrappers preserve the
+// original mutex acquisition, try-lock failure and release points exactly.
+static NativeAdrenoIssuerTrace nativeAdrenoIssuerTrace;
+static uint64_t nativeAdrenoIssuerNow() {
+ return nativeAdrenoIssuerTrace.enabled && g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
+}
+static void nativeAdrenoIssuerLock(unsigned site) {
+ const uint64_t requested=nativeAdrenoIssuerNow();
+ IOLockLock(g.lock);
+ nativeAdrenoIssuerTrace.begin(requested,nativeAdrenoIssuerNow(),site);
+}
+static bool nativeAdrenoIssuerTryLock(unsigned site) {
+ const uint64_t requested=nativeAdrenoIssuerNow();
+ if(!IOLockTryLock(g.lock))return false;
+ nativeAdrenoIssuerTrace.begin(requested,nativeAdrenoIssuerNow(),site);return true;
+}
+static void nativeAdrenoIssuerUnlock() {
+ if(nativeAdrenoIssuerTrace.enabled)
+  nativeAdrenoIssuerTrace.end(nativeAdrenoIssuerNow(),g.ring?g.ring->lastSubmitted():0,g.ring?g.ring->completedFence():0);
+ IOLockUnlock(g.lock);
+}
+static void nativeAdrenoIssuerContext(unsigned method,unsigned client,const void *input,size_t bytes) {
+ if(!nativeAdrenoIssuerTrace.enabled)return;
+ uint64_t subject=0;
+ if(input && bytes>=sizeof(subject) && (method==NativeAdrenoMethodWaitFence ||
+    method==NativeAdrenoMethodBoMap || method==NativeAdrenoMethodBoFree ||
+    method==NativeAdrenoMethodBoCpuMap || method==NativeAdrenoMethodBoCpuUnmap))memcpy(&subject,input,sizeof subject);
+ nativeAdrenoIssuerTrace.context(method,client,subject);
+}
+
+static uint64_t gHoujiPresentSync[14];
+// The event address outlives every client and display instance. Predicate and
+// wait registration share g.lock; only a changed, observed completion wakes it.
+static uint32_t gHoujiPresentProgress;
+static void nativeAdrenoSignalProgressLocked(void) {
+ if(!g.ring)return;
+ const uint32_t completed=g.ring->completedFence(); // cached, no extra MMIO
+ if(completed==gHoujiPresentProgress)return;
+ gHoujiPresentProgress=completed;
+ __atomic_fetch_add(&gHoujiPresentSync[13],1ull,__ATOMIC_RELAXED);
+ thread_wakeup((event_t)&gHoujiPresentProgress);
 }
 
 class NativeAdrenoGpuPublished : public IOService {
@@ -179,6 +222,8 @@ public:
     void setHandoffOnly() {handoffOnly_=true;}
     bool mount(bool kernel);
     friend IOReturn runCore(AGXDeviceUserClient *,uint32_t,const void *,size_t,void *,size_t);
+    friend IOReturn nativeAdrenoRunGuarded(AGXDeviceUserClient *,uint32_t,const void *,size_t,void *,size_t,NativeAdrenoDispatchClock &);
+    friend IOReturn nativeAdrenoWaitFence(AGXDeviceUserClient *,const void *,void *,size_t,NativeAdrenoDispatchClock &);
     friend void nativeAdrenoMailboxPoller(void *,wait_result_t);
     IOReturn clientClose() APPLE_KEXT_OVERRIDE;
     void free() APPLE_KEXT_OVERRIDE;
@@ -203,10 +248,10 @@ void nativeAdrenoMailboxPoller(void *,wait_result_t)
         if(in_size<=0x700 && out_size<=0x700) {
             uint8_t input[0x700],output[0x700];
             memcpy(input,const_cast<uint32_t *>(gMailboxWords)+0x10,in_size);
-            IOLockLock(g.lock);
+            nativeAdrenoIssuerLock(__LINE__);
             AGXDeviceUserClient *owner=gMailboxOwner;
             if(owner)owner->retain();
-            IOLockUnlock(g.lock);
+            nativeAdrenoIssuerUnlock();
             status=owner?runCore(owner,method,input,in_size,output,out_size):kIOReturnNotReady;
             if(owner)owner->release();
             if(!status)memcpy(const_cast<uint32_t *>(gMailboxWords)+0x200,output,out_size);
@@ -233,14 +278,15 @@ bool AGXDeviceUserClient::mount(bool kernel)
     proc_selfname(name_,sizeof name_);
     NativeAdrenoUserClient *core=new NativeAdrenoUserClient;
     if(!core)return false;
-    IOLockLock(g.lock);
+    nativeAdrenoIssuerLock(__LINE__);
     bool ok=false;
-    /* The render server takes slot 0 (the large window) when free; every other process, or a second render-server connection, the next free one. */
+    /* Keep the existing generic slots and reserve a separate bounded window
+     * for Preferences; its Core Image icon path cannot use the GL fallback. */
     unsigned slot=NativeAdrenoMaxClients;
     if(kernel)slot=g.kernel_client?NativeAdrenoMaxClients:0;
     else {
-        if(!strncmp(name_,"backboardd",sizeof name_) && !g.slots[0])slot=0;
-        for(unsigned i=1;slot==NativeAdrenoMaxClients && i<NativeAdrenoMaxClients;++i)if(!g.slots[i])slot=i;
+        slot=houjiGpuClientSlot(!strncmp(name_,"backboardd",sizeof name_),
+                               !strncmp(name_,"Preferences",sizeof name_),g.slots);
     }
     const IOReturn opened=slot<NativeAdrenoMaxClients?core->open(NativeAdrenoAbiVersion,g.vm,g.submit,g.ring,g.input_bits,g.output_bits,true):kIOReturnNoSpace;
     if(opened!=kIOReturnSuccess) {native_adreno_mount_fail[0]=slot<NativeAdrenoMaxClients?2:1;native_adreno_mount_fail[1]=uint32_t(opened);native_adreno_mount_fail[2]=slot;native_adreno_mount_fail[3]=native_adreno_mount_fail[3]+1;}
@@ -277,7 +323,7 @@ bool AGXDeviceUserClient::mount(bool kernel)
         if(gMailboxOwner)gMailboxOwner->release();
         retain();gMailboxOwner=this;
     }
-    IOLockUnlock(g.lock);
+    nativeAdrenoIssuerUnlock();
     if(core)delete core;
     return ok;
 }
@@ -289,9 +335,9 @@ IOReturn AGXDeviceUserClient::dropViews(uint32_t token)
     if(previous)return previous;
     for(;;) {
         IOMemoryDescriptor *view=nullptr;
-        IOLockLock(g.lock);
+        nativeAdrenoIssuerLock(__LINE__);
         if(views_)for(size_t i=0;i<MaxViews;++i){View&v=views_[i];if(v.descriptor && (!token || v.token==token)){view=v.descriptor;v.descriptor=nullptr;v.token=0;break;}}
-        IOLockUnlock(g.lock);
+        nativeAdrenoIssuerUnlock();
         if(!view)return kIOReturnSuccess;
         /* IOUserClient returns an owned RAW IOMemoryMap* in this integrated
          * Darwin22 build. A discarded pointer leaks a live task PTE. Revoke
@@ -318,7 +364,7 @@ IOReturn AGXDeviceUserClient::clientClose()
     if(g.dying)return kIOReturnNotReady;
     if(!kernel_ && views_ && !strcmp(name_,"adrenometalprobe") && teardown_traces_++<4)native_adreno_board_teardown_checkpoint("before-clientClose-views",0,0);
     const IOReturn dropped=dropViews(0);if(dropped)return dropped;
-    IOLockLock(g.lock);
+    nativeAdrenoIssuerLock(__LINE__);
     IOReturn status=kIOReturnSuccess;
     AGXDeviceUserClient *mailbox=nullptr;
     if(gMailboxOwner==this) {mailbox=gMailboxOwner;gMailboxOwner=nullptr;}
@@ -338,7 +384,7 @@ IOReturn AGXDeviceUserClient::clientClose()
             }
         }
     }
-    IOLockUnlock(g.lock);
+    nativeAdrenoIssuerUnlock();
     if(mailbox)mailbox->release();
     if(!status)terminate();
     return status;
@@ -379,21 +425,21 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
     native_adreno_view_diag[0]=native_adreno_view_diag[0]+1;
     /* [5]: threads inside this function right now (a thread stuck here, on the gate or in a mapping, shows as a non-zero count that stays). */
     struct Inside {Inside() {__atomic_fetch_add(&native_adreno_view_diag[5],1,__ATOMIC_RELAXED);} ~Inside() {__atomic_fetch_sub(&native_adreno_view_diag[5],1,__ATOMIC_RELAXED);}} inside;
-    IOLockLock(g.lock);
+    nativeAdrenoIssuerLock(__LINE__);
     if(!views_)views_=IONewZero(View,MaxViews);
-    if(!views_) {IOLockUnlock(g.lock);return kIOReturnNoMemory;}
+    if(!views_) {nativeAdrenoIssuerUnlock();return kIOReturnNoMemory;}
     NativeAdrenoMemory *backing=live_?core_->memoryForToken(type):nullptr;
     NativeAdrenoCpuView view{};
     enum {MaxSpans=65536};
     /* Recheck even a cached view: quarantine or retired ownership must not
      * grant another descriptor lease. Already mapped views remain retained. */
     if(!backing || !backing->cpuView(&view) || !view.count || view.count>MaxSpans) {
-        IOLockUnlock(g.lock);return kIOReturnNotReady;
+        nativeAdrenoIssuerUnlock();return kIOReturnNotReady;
     }
     for(size_t i=0;i<MaxViews;++i)if(views_[i].descriptor && views_[i].token==type) {
         views_[i].descriptor->retain();*memory=views_[i].descriptor;*options=kIOMapAnywhere|kIOMapWriteCombineCache;
         native_adreno_view_diag[2]=native_adreno_view_diag[2]+1;
-        IOLockUnlock(g.lock);
+        nativeAdrenoIssuerUnlock();
         return kIOReturnSuccess;
     }
     if(backing) {
@@ -435,17 +481,28 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
             }
         }
     }
-    IOLockUnlock(g.lock);
+    nativeAdrenoIssuerUnlock();
     if(status){native_adreno_view_diag[3]=native_adreno_view_diag[3]+1;native_adreno_view_diag[4]=(uint32_t)status;}
     return status;
 }
 /* Fence waits as the callers see them (int-147; method 6's own statistics count every poll): [0] waits, [1] us waited in total, [2] pauses
- * taken outside the connection lock, [3] the longest wait in us. */
-extern "C" {volatile uint64_t native_adreno_wait_outer[4];}
+ * taken outside the connection lock, [3] the longest wait in us,
+ * [4] pending observations that skipped the issuer mutex. */
+extern "C" {volatile uint64_t native_adreno_wait_outer[5];}
+extern "C" bool native_adreno_board_fence_pending(uint32_t fence);
+// A negative hint never retires a job. These are published under the issuer
+// mutex; lock-free readers only skip a still-pending poll until its deadline.
+static uint32_t nativeAdrenoHintIssued=0,nativeAdrenoHintEnabled=0;
+static bool nativeAdrenoFencePending(uint64_t fence) {
+ if(!fence || fence>UINT32_MAX || !__atomic_load_n(&nativeAdrenoHintEnabled,__ATOMIC_ACQUIRE))return false;
+ const uint32_t issued=__atomic_load_n(&nativeAdrenoHintIssued,__ATOMIC_ACQUIRE);
+ return fence<=issued && native_adreno_board_fence_pending((uint32_t)fence);
+}
 /* Query/status/info and metadata use only host bookkeeping under g.lock.
  * Timestamp uses the original guarded, rollover-checked counter reader: it
  * reads but never mutates GPU state. Neither path needs to drain unrelated
- * rendering. VM, BO, queue and submission operations keep the original path. */
+ * rendering. VM/BO mutations and submissions poll, then sleep outside the lock
+ * while pending GPU writes finish; both retain the original drain/proof. */
 static bool nativeAdrenoNonMutatingGpuMethod(uint32_t method) {
     switch(method) {
     case NativeAdrenoMethodQuery:
@@ -457,8 +514,6 @@ static bool nativeAdrenoNonMutatingGpuMethod(uint32_t method) {
     default:return false;
     }
 }
-static uint32_t gHoujiLastSubmittedFence;
-extern "C" IOReturn native_adreno_board_light_gate(int submit);
 extern "C" void houji_gate_hitch_snapshot(uint64_t out[6]);
 extern "C" void houji_surface_lazy_report(void);
 extern "C" void houji_power_report(void);
@@ -468,27 +523,153 @@ extern "C" {extern volatile uint64_t native_adreno_wptr_stats[4];}
 extern "C" {extern volatile uint64_t native_adreno_dvfs_skips[2];}
 extern "C" {extern volatile uint64_t native_adreno_submit_parts[12][2];}
 extern "C" {extern volatile uint64_t native_adreno_pipeline_stats[5];extern volatile uint64_t native_adreno_tlb_stats[2];}
-/* Methods that may skip waiting for the GPU (see native_adreno_board_light_gate): no page table, SMMU or GPU register access,
- * except the submission itself, which the gate admits only under unchanged, already synchronized tables. */
-static bool nativeAdrenoPipelinedMethod(uint32_t method) {
-    switch(method) {
-    case NativeAdrenoMethodSubmit:
-    case NativeAdrenoMethodBoAlloc:
-    case NativeAdrenoMethodBoCpuMap:
-    case NativeAdrenoMethodBoCpuUnmap:
-    case NativeAdrenoMethodCreateQueue:
-    case NativeAdrenoMethodCloseQueue:return true;
-    default:return false;
-    }
-}
 static uint64_t nativeAdrenoDispatchPerf[20][4]; // calls, time us, max us, cached path
+/* Issuer-lock protected. A draining mutation keeps its place while asleep,
+ * so new submissions cannot refill the GPU ahead of it. Queries, fence polls
+ * and the display observer still take the free issuer lock normally. */
+static const void *nativeAdrenoMutationOwner;
+static uint64_t nativeAdrenoGateRetries[2]; // BO/queue operations, submissions
+#include "NativeAdrenoLatency.h"
+#include "NativeAdrenoAllocationTrace.h"
+static NativeAdrenoLatency nativeAdrenoLatency;
+struct NativeAdrenoDispatchClock {
+ uint64_t began=g.clock.now_us?g.clock.now_us(g.clock.cookie):0,last=began,phases[4]{};
+ void lap(unsigned phase){uint64_t now=g.clock.now_us?g.clock.now_us(g.clock.cookie):last;phases[phase]+=now-last;last=now;}
+ void finish(unsigned method,IOReturn status){lap(3);nativeAdrenoLatency.record(method,began,last-began,phases,(uint32_t)status);}
+};
+static bool nativeAdrenoSubmitMethod(uint32_t method) {
+ return method==NativeAdrenoMethodSubmit || method==NativeAdrenoMethodSubmitBatch;
+}
 extern "C" volatile uint64_t native_adreno_submit_cost[12];
+extern "C" volatile uint64_t native_adreno_submit_batches[4];
 extern "C" volatile uint32_t native_adreno_io_coherent,native_adreno_coherent_skips[4],native_adreno_wc_audit[6],native_adreno_wc_distrusted;
+extern "C" volatile uint32_t native_adreno_coherent_import_fallbacks;
 extern "C" uint64_t houji_gpu_submit_activity(void) {
- return __atomic_load_n(&nativeAdrenoDispatchPerf[NativeAdrenoMethodSubmit][0],__ATOMIC_RELAXED);
+ return __atomic_load_n(&nativeAdrenoDispatchPerf[NativeAdrenoMethodSubmit][0],__ATOMIC_RELAXED)+
+        __atomic_load_n(&nativeAdrenoDispatchPerf[NativeAdrenoMethodSubmitBatch][0],__ATOMIC_RELAXED);
 }
 extern "C" void houji_sandbox_abi_report(void);
+extern "C" unsigned houji_tcc_extension_snapshot(char *,unsigned);
 extern "C" void houji_cpu_scheduler_report(void);
+
+/* Called with no issuer lock held. Keeping this path separate also lets host
+ * checks exercise the actual lock/retry/dispatch ordering with scheduler peers. */
+static IOReturn nativeAdrenoRunGuarded(AGXDeviceUserClient *connection,uint32_t method,const void *input,size_t input_size,void *output,size_t output_size,NativeAdrenoDispatchClock &timing)
+{
+    // Host imports must use the same pending-work gate as other BO mutations.
+    // The former special case drained the GPU while holding the issuer lock,
+    // blocking completion/present observers and bypassing this timing record.
+    if(method==NativeAdrenoMethodBoImport &&
+       (!input || input_size!=sizeof(NativeAdrenoAbiBoImport) || !output || output_size!=sizeof(NativeAdrenoAbiBoAllocReply)))
+        return kIOReturnBadArgument;
+    IOReturn status;
+    const uint64_t began=g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
+    for(;;) {
+        timing.lap(3);
+        nativeAdrenoIssuerLock(__LINE__);
+        timing.lap(0);
+        nativeAdrenoIssuerContext(method,connection->slot_,input,input_size);
+        const bool cached=nativeAdrenoNonMutatingGpuMethod(method);
+        if(!connection->live_ || g.dying || !native_adreno_board_running())status=kIOReturnNotReady;
+        else if(cached)status=kIOReturnSuccess;
+        else if(nativeAdrenoMutationOwner && nativeAdrenoMutationOwner!=&timing)status=kIOReturnTimeout;
+        else {
+            if(!nativeAdrenoSubmitMethod(method))nativeAdrenoMutationOwner=&timing;
+            status=native_adreno_board_prepare_submit();
+        }
+        timing.lap(1);
+        // BO mutations use the same zero-timeout readiness poll as submits.
+        // Keep the original quiescence, cache and VM proof before dispatch;
+        // only its pending-GPU wait moves outside the issuer lock. Never
+        // retry a dispatched operation, even if it returns Timeout.
+        if(!cached && status==kIOReturnTimeout && g.clock.now_us) {
+            uint64_t elapsed=g.clock.now_us(g.clock.cookie)-began;
+            if(elapsed<500000) {
+                __atomic_fetch_add(&nativeAdrenoGateRetries[nativeAdrenoSubmitMethod(method)?1:0],1ull,__ATOMIC_RELAXED);
+                nativeAdrenoSignalProgressLocked();
+                nativeAdrenoIssuerUnlock();
+                uint32_t pause=(uint32_t)((500000-elapsed)<100?(500000-elapsed):100);
+                assert_wait_timeout((event_t)&native_adreno_wait_outer,THREAD_UNINT,pause,NSEC_PER_USEC);
+                thread_block(THREAD_CONTINUE_NULL);
+                continue;
+            }
+        }
+        if(!status) {
+            if(!connection->live_ || g.dying || !native_adreno_board_running())status=kIOReturnNotReady;
+            else if(method==NativeAdrenoMethodBoImport) {
+                // An external method runs in its caller's task, even after a
+                // bounded wait. Keep that task, aligned copies and the original
+                // pinning/ownership checks; never retry a dispatched import.
+                NativeAdrenoAbiBoImport request{};
+                NativeAdrenoAbiBoAllocReply reply{};
+                memcpy(&request,input,sizeof(request));
+                status=connection->core_->importBo(&request,current_task(),&reply);
+                if(!status)memcpy(output,&reply,sizeof(reply));
+            } else status=connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock);
+        }
+        timing.lap(2);
+        if(!status && nativeAdrenoSubmitMethod(method) && output && output_size==sizeof(NativeAdrenoAbiSubmitReply)) {
+            const uint64_t fence=static_cast<const NativeAdrenoAbiSubmitReply*>(output)->fence;
+            __atomic_store_n(&nativeAdrenoHintIssued,fence<=UINT32_MAX?(uint32_t)fence:0u,__ATOMIC_RELEASE);
+            nativeAdrenoIssuerTrace.subject(fence);
+        }
+        if(method<20) {
+            const uint64_t elapsed=g.clock.now_us?g.clock.now_us(g.clock.cookie)-began:0;
+            __atomic_fetch_add(&nativeAdrenoDispatchPerf[method][0],1ull,__ATOMIC_RELAXED);__atomic_fetch_add(&nativeAdrenoDispatchPerf[method][1],elapsed,__ATOMIC_RELAXED);
+            uint64_t maximum=__atomic_load_n(&nativeAdrenoDispatchPerf[method][2],__ATOMIC_RELAXED);while(elapsed>maximum && !__atomic_compare_exchange_n(&nativeAdrenoDispatchPerf[method][2],&maximum,elapsed,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
+            if(cached)__atomic_fetch_add(&nativeAdrenoDispatchPerf[method][3],1ull,__ATOMIC_RELAXED);
+        }
+        if(method==NativeAdrenoMethodBoMap && !status && connection->live_ && !connection->kernel_)
+            if(NativeAdrenoClientRecord *record=clientRecord(connection->name_))
+                if(connection->core_->windowPeak()>>20>record->peak_mib)record->peak_mib=uint32_t(connection->core_->windowPeak()>>20);
+        nativeAdrenoSignalProgressLocked();
+        if(nativeAdrenoMutationOwner==&timing)nativeAdrenoMutationOwner=nullptr;
+        nativeAdrenoIssuerUnlock();
+        return status;
+    }
+}
+
+static IOReturn nativeAdrenoWaitFence(AGXDeviceUserClient *connection,const void *input,void *output,size_t output_size,NativeAdrenoDispatchClock &timing)
+{
+    // Adapted from Adreno740 dd43abd: pending polls do not queue on the
+    // issuer mutex. The qualified NC hint cannot authorize success, resource
+    // release, or a cache operation. Completion, errors, invalid/unknown fences
+    // and the deadline ALWAYS go through the original locked dispatch.
+    NativeAdrenoAbiWaitFence poll{};
+    memcpy(&poll,input,sizeof(poll));
+    const uint64_t timeout_us=poll.timeout_ns/1000,began=g.clock.now_us(g.clock.cookie);
+    poll.timeout_ns=0;
+    uint64_t waited=0;
+    IOReturn status=kIOReturnTimeout;
+    for(;;) {
+        waited=g.clock.now_us(g.clock.cookie)-began;
+        if(waited>=timeout_us || !nativeAdrenoFencePending(poll.fence)) {
+            timing.lap(3);
+            nativeAdrenoIssuerLock(__LINE__);
+            timing.lap(0);
+            nativeAdrenoIssuerContext(NativeAdrenoMethodWaitFence,connection->slot_,input,sizeof(poll));
+            status=connection->live_ && !g.dying && native_adreno_board_running()?
+                connection->core_->dispatch(NativeAdrenoMethodWaitFence,&poll,sizeof(poll),output,output_size,&g.clock):kIOReturnNotReady;
+            timing.lap(2);
+            nativeAdrenoSignalProgressLocked();
+            nativeAdrenoIssuerUnlock();
+            waited=g.clock.now_us(g.clock.cookie)-began;
+            if(status!=kIOReturnTimeout || waited>=timeout_us)break;
+        } else __atomic_fetch_add(&native_adreno_wait_outer[4],1ull,__ATOMIC_RELAXED);
+        __atomic_fetch_add(&native_adreno_wait_outer[2],1ull,__ATOMIC_RELAXED);
+        // Houji has no GPU IRQ wake source. Retain the bounded scheduler
+        // sleep outside the lock; never exceed the caller's remaining slice.
+        const uint64_t remaining=timeout_us-waited;
+        const uint32_t pause=(uint32_t)(remaining<100?remaining:100);
+        assert_wait_timeout((event_t)&native_adreno_wait_outer,THREAD_UNINT,pause,NSEC_PER_USEC);
+        thread_block(THREAD_CONTINUE_NULL);
+    }
+    __atomic_fetch_add(&native_adreno_wait_outer[0],1ull,__ATOMIC_RELAXED);
+    __atomic_fetch_add(&native_adreno_wait_outer[1],waited,__ATOMIC_RELAXED);
+    uint64_t old=__atomic_load_n(&native_adreno_wait_outer[3],__ATOMIC_RELAXED);
+    while(waited>old && !__atomic_compare_exchange_n(&native_adreno_wait_outer[3],&old,waited,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
+    return status;
+}
 
 static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const void *input,size_t input_size,void *output,size_t output_size)
 {
@@ -508,68 +689,19 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
     native_adreno_metal_diag.inflight=method+1;
     native_adreno_metal_diag.inflight_since_calls=native_adreno_metal_diag.calls;
     IOReturn status;
+    NativeAdrenoDispatchClock timing;
     if(method==NativeAdrenoMethodWaitFence && connection->live_ && input && input_size==sizeof(NativeAdrenoAbiWaitFence) && g.clock.now_us) {
-        /* int-147: a fence wait polls under the lock but pauses outside it. int-146 slept inside the lock (up to the caller's 1 ms slice per
-         * call), so every other thread's submit, map or allocation waited for the GPU to finish unrelated work: a frame could not be queued
-         * while the previous one ran. Each poll is the core's own zero-timeout wait (same checks, retirement and statistics); the pause is the
-         * board's (until the next GPU interrupt, at most 100 us). */
-        NativeAdrenoAbiWaitFence poll{};
-        memcpy(&poll,input,sizeof(poll));
-        const uint64_t timeout_us=poll.timeout_ns/1000,began=g.clock.now_us(g.clock.cookie);
-        poll.timeout_ns=0;
-        uint64_t waited=0;
-        const uint32_t want=(uint32_t)poll.fence;
-        for(;;) {
-            /* Poll the GPU-written fence without the issuer lock while the job runs: locked polls queued behind submissions
-             * (about 2 ms each) and stretched every wait. The lock is taken once the fence passed, to retire the job, or once
-             * the time is up, so the core reports the timeout or error exactly as before. */
-            if(want && g.ring && connection->live_ && (int32_t)(want-g.ring->lastSubmitted())<=0 &&
-                (int32_t)(g.ring->peekCompleted()-want)<0) {
-                waited=g.clock.now_us(g.clock.cookie)-began;
-                if(waited<timeout_us) {
-                    native_adreno_wait_outer[2]=native_adreno_wait_outer[2]+1;
-                    if(g.clock.idle && !g.clock.idle(g.clock.cookie))continue;
-                }
-            }
-            /* The connection's own core while it is live; a close that ran between two polls ends the wait. */
-            IOLockLock(g.lock);
-            status=connection->live_?connection->core_->dispatch(method,&poll,sizeof(poll),output,output_size,&g.clock):kIOReturnNotReady;
-            IOLockUnlock(g.lock);
-            waited=g.clock.now_us(g.clock.cookie)-began;
-            if(status!=kIOReturnTimeout || waited>=timeout_us)break;
-            native_adreno_wait_outer[2]=native_adreno_wait_outer[2]+1;
-            if(!g.clock.idle || g.clock.idle(g.clock.cookie))break;
-        }
-        native_adreno_wait_outer[0]=native_adreno_wait_outer[0]+1;native_adreno_wait_outer[1]=native_adreno_wait_outer[1]+waited;
-        if(waited>native_adreno_wait_outer[3])native_adreno_wait_outer[3]=waited;
+        status=nativeAdrenoWaitFence(connection,input,output,output_size,timing);
     } else {
-        IOLockLock(g.lock);
-        const uint64_t began=g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
-        const bool cached=nativeAdrenoNonMutatingGpuMethod(method);
-        status=cached?kIOReturnSuccess:nativeAdrenoPipelinedMethod(method)?
-            native_adreno_board_light_gate(method==NativeAdrenoMethodSubmit):native_adreno_board_quiesce();
-        if(!status)status=connection->live_?connection->core_->dispatch(method,input,input_size,output,output_size,&g.clock):kIOReturnNotReady;
-        if(method<20) {
-            const uint64_t elapsed=g.clock.now_us?g.clock.now_us(g.clock.cookie)-began:0;
-            __atomic_fetch_add(&nativeAdrenoDispatchPerf[method][0],1ull,__ATOMIC_RELAXED);__atomic_fetch_add(&nativeAdrenoDispatchPerf[method][1],elapsed,__ATOMIC_RELAXED);
-            uint64_t maximum=__atomic_load_n(&nativeAdrenoDispatchPerf[method][2],__ATOMIC_RELAXED);while(elapsed>maximum && !__atomic_compare_exchange_n(&nativeAdrenoDispatchPerf[method][2],&maximum,elapsed,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
-            if(cached)__atomic_fetch_add(&nativeAdrenoDispatchPerf[method][3],1ull,__ATOMIC_RELAXED);
-        }
-        if(method==NativeAdrenoMethodBoMap && !status && connection->live_ && !connection->kernel_)
-            if(NativeAdrenoClientRecord *record=clientRecord(connection->name_))
-                if(connection->core_->windowPeak()>>20>record->peak_mib)record->peak_mib=uint32_t(connection->core_->windowPeak()>>20);
-        /* Published inside the lock, before the submitter sees its reply, so a
-         * later SwapEnd can read it without waiting for the GPU gate. */
-        if(method==NativeAdrenoMethodSubmit && !status && g.ring)
-            __atomic_store_n(&gHoujiLastSubmittedFence,g.ring->lastSubmitted(),__ATOMIC_RELEASE);
-        IOLockUnlock(g.lock);
+        status=nativeAdrenoRunGuarded(connection,method,input,input_size,output,output_size,timing);
     }
+    timing.finish(method,status);
     native_adreno_metal_diag.inflight=0;
     native_adreno_metal_diag.calls=native_adreno_metal_diag.calls+1;
     native_adreno_metal_diag.last_selector=method;
     native_adreno_metal_diag.last_status=uint32_t(status);
     if(!strcmp(connection->name_,"backboardd")){
-        if(method==NativeAdrenoMethodSubmit){
+        if(nativeAdrenoSubmitMethod(method)){
             if(!status && output && output_size==sizeof(NativeAdrenoAbiSubmitReply)){
                 __atomic_fetch_add(&gHoujiDesktopSubmits,1ull,__ATOMIC_RELAXED);
                 __atomic_store_n(&gHoujiDesktopLastFence,static_cast<const NativeAdrenoAbiSubmitReply*>(output)->fence,__ATOMIC_RELEASE);
@@ -608,30 +740,11 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
          * render server's crash in the command stream writes of vkCmdCopyBuffer. Only the last lease takes the view down; the earlier
          * ones leave their mapping until it, or the client unmaps it itself (IOConnectUnmapMemory64 works on the cached view). */
         const uint32_t token=static_cast<const NativeAdrenoAbiBoCpuUnmap *>(input)->token;
-        IOLockLock(g.lock);
+        nativeAdrenoIssuerLock(__LINE__);
         const uint32_t leases=live_?core_->mappingLeases(token):0;
-        IOLockUnlock(g.lock);
+        nativeAdrenoIssuerUnlock();
         if(leases>1)native_adreno_view_kept=native_adreno_view_kept+1;
         else {const IOReturn dropped=dropViews(token);if(dropped)return dropped;}
-    }
-    if(method==NativeAdrenoMethodBoImport) {
-        /* The pages belong to the task making this call (an external method runs in the caller's context). */
-        if(!input || input_size!=sizeof(NativeAdrenoAbiBoImport) || !output || output_size!=sizeof(NativeAdrenoAbiBoAllocReply))
-            return kIOReturnBadArgument;
-        NativeAdrenoAbiBoImport request{};
-        memcpy(&request,input,sizeof(request));
-        NativeAdrenoAbiBoAllocReply reply{};
-        native_adreno_metal_diag.inflight=method+1;
-        IOLockLock(g.lock);
-        IOReturn status=native_adreno_board_quiesce();
-        if(!status)status=live_?core_->importBo(&request,current_task(),&reply):kIOReturnNotReady;
-        IOLockUnlock(g.lock);
-        native_adreno_metal_diag.inflight=0;
-        native_adreno_metal_diag.calls=native_adreno_metal_diag.calls+1;
-        native_adreno_metal_diag.last_selector=method;
-        native_adreno_metal_diag.last_status=uint32_t(status);
-        if(!status)memcpy(output,&reply,sizeof(reply));
-        return status;
     }
     return runCore(this,method,input,input_size,output,output_size);
 }
@@ -664,7 +777,8 @@ IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodA
         {&action,0,sizeof(NativeAdrenoAbiBoCpuMap),0,sizeof(NativeAdrenoAbiBoCpuMapReply)},
         {&action,0,sizeof(NativeAdrenoAbiBoCpuUnmap),0,0},
         {&action,0,0,0,sizeof(NativeAdrenoAbiDeviceInfo)},
-        {&action,0,sizeof(NativeAdrenoAbiBoImport),0,sizeof(NativeAdrenoAbiBoAllocReply)}};
+        {&action,0,sizeof(NativeAdrenoAbiBoImport),0,sizeof(NativeAdrenoAbiBoAllocReply)},
+        {&action,0,sizeof(NativeAdrenoAbiSubmitBatch),0,sizeof(NativeAdrenoAbiSubmitReply)}};
     native_adreno_metal_diag.ext_entries=native_adreno_metal_diag.ext_entries+1;
     if(selector<256)native_adreno_metal_diag.sel_bits[selector>>5]|=1u<<(selector&31);
     /* Tunnel. The sandbox resolves a filter policy for this class at open time and then admits only the selectors its profile lists,
@@ -827,24 +941,24 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
     /* limit caps the connections granted to each process name, so one process that crashes on every launch cannot loop forever, and cannot use
      * up the others' opens; a process other than the render server gets at most eight per boot. */
     const unsigned cap=strncmp(opener,"backboardd",sizeof opener)?(limit && limit<8?limit:8):limit;
-    IOLockLock(g.lock);
+    nativeAdrenoIssuerLock(__LINE__);
     NativeAdrenoClientRecord *record=kernel?nullptr:clientRecord(opener);
     const bool capped=cap && record && record->opens>=cap;
-    IOLockUnlock(g.lock);
+    nativeAdrenoIssuerUnlock();
     IOReturn refusal=kIOReturnSuccess;
     if(capped)refusal=kIOReturnBusy;
     else if(!connection->mount(kernel))refusal=kIOReturnBusy;   /* every slot taken */
     if(refusal) {
         connection->release();
         native_adreno_metal_diag.busy=native_adreno_metal_diag.busy+1;
-        IOLockLock(g.lock);
+        nativeAdrenoIssuerLock(__LINE__);
         if(record) {record->refused=record->refused+1;record->last_refusal=uint32_t(refusal);}
-        IOLockUnlock(g.lock);
+        nativeAdrenoIssuerUnlock();
         return refusal;
     }
-    IOLockLock(g.lock);
+    nativeAdrenoIssuerLock(__LINE__);
     if(record)record->opens=record->opens+1;
-    IOLockUnlock(g.lock);
+    nativeAdrenoIssuerUnlock();
     native_adreno_metal_diag.opens=native_adreno_metal_diag.opens+1;
     *handler=connection;
     return kIOReturnSuccess;
@@ -885,7 +999,13 @@ extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit 
         if(service)service->release();
         return kIOReturnNoMemory;
     }
-    g.vm=vm;g.submit=submit;g.ring=ring;g.clock=*clock;g.timer=timer;g.info=info;g.input_bits=input_bits;g.output_bits=output_bits;
+    g.vm=vm;g.submit=submit;g.ring=ring;g.clock=*clock;
+    unsigned trace=0;
+    nativeAdrenoIssuerTrace.enabled=PE_parse_boot_argn("gtrace",&trace,sizeof trace) && trace==1;
+    __atomic_store_n(&native_adreno_memory_now_us,+[]()->uint64_t{return g.clock.now_us(g.clock.cookie);},__ATOMIC_RELEASE);
+    g.timer=timer;g.info=info;g.input_bits=input_bits;g.output_bits=output_bits;
+    __atomic_store_n(&nativeAdrenoHintIssued,g.ring->lastSubmitted(),__ATOMIC_RELEASE);
+    __atomic_store_n(&nativeAdrenoHintEnabled,1u,__ATOMIC_RELEASE);
     g.service=service;g.published=true;
     service->setName("NativeAdrenoGpu");
     service->registerService();
@@ -902,34 +1022,42 @@ extern "C" IOService *native_adreno_published_service()
 }
 
 /* Same owner gate as each external method. No filesystem takes this lock. */
-extern "C" IOReturn native_adreno_provider_poll(void){if(!g.published || !g.lock || g.dying)return kIOReturnNotReady;IOLockLock(g.lock);IOReturn s=native_adreno_board_quiesce();IOLockUnlock(g.lock);return s;}
+extern "C" IOReturn native_adreno_provider_poll(void){if(!g.published || !g.lock || g.dying)return kIOReturnNotReady;nativeAdrenoIssuerLock(__LINE__);IOReturn s=native_adreno_board_quiesce();nativeAdrenoIssuerUnlock();return s;}
 extern "C" void houji_touch_driver_report(void);
 extern "C" void houji_framebuffer_history_report(void);
 extern "C" void houji_cpu_dvfs_history_report(void);
 extern "C" void houji_usb_report(void);
 extern "C" void houji_gpu_dvfs_history_report(void);
-extern "C" volatile uint32_t native_adreno_client_stats[5][6];
-extern "C" volatile uint32_t native_adreno_window_overflow[4][3];
+extern "C" volatile uint32_t native_adreno_client_stats[NativeAdrenoMaxClients+1][6];
+extern "C" volatile uint32_t native_adreno_window_overflow[NativeAdrenoMaxClients][3];
 // Bounded cached observations for the periodic log snapshot, before teardown.
 // Try the existing lock only for copying text; never hold it while printing.
 extern "C" unsigned houji_gpu_dvfs_snapshot(char *,unsigned);
+extern "C" unsigned houji_thermal_snapshot(char *,unsigned);
+extern "C" unsigned houji_backlight_snapshot(char *,unsigned);
+extern "C" unsigned houji_gpu_gate_snapshot(char *,unsigned);
+extern "C" unsigned native_adreno_present_sync_snapshot(char *,unsigned);
 extern "C" unsigned houji_gpu_cached_timing(char *out,unsigned capacity) {
  if(!out || !capacity)return 0;
- static char rows[48][96];static uint32_t scratch_busy;
+ static char rows[48][96];static NativeAdrenoClientRecord clients[8];static uint32_t scratch_busy;
  if(__atomic_exchange_n(&scratch_busy,1u,__ATOMIC_ACQUIRE)){
   int n=snprintf(out,capacity,"HOUJI CACHED TIMING: scratch busy; counters omitted\n");
   return n>0?((unsigned)n<capacity?(unsigned)n:capacity-1):0;
  }
- unsigned used=0;out[0]=0;bzero(rows,sizeof rows);bool copied=false;
- if(g.lock && IOLockTryLock(g.lock)) {
+ unsigned used=0;out[0]=0;bzero(rows,sizeof rows);bzero(clients,sizeof clients);bool copied=false;
+ used+=houji_tcc_extension_snapshot(out,capacity);
+ if(g.lock && nativeAdrenoIssuerTryLock(__LINE__)) {
   memcpy(rows,native_adreno_metal_rows,sizeof rows);
-  IOLockUnlock(g.lock);copied=true;
+  memcpy(clients,native_adreno_client_log,sizeof clients);
+  nativeAdrenoIssuerUnlock();copied=true;
  }
  auto append=[&](const char *format,auto... args){
   if(used>=capacity-1)return;int n=snprintf(out+used,capacity-used,format,args...);
   if(n>0)used+=(unsigned)n<capacity-used?(unsigned)n:capacity-used-1;
  };
  append("HOUJI CACHED TIMING: bridge-copied=%u; RAM only; snapshot header before kernel tail\n",copied);
+ {uint64_t v[4];for(unsigned i=0;i<4;++i)v[i]=__atomic_load_n(&native_adreno_submit_batches[i],__ATOMIC_RELAXED);
+  append("HOUJI CACHED BATCH: jobs=%llu IBs=%llu max=%llu over16=%llu\n",v[0],v[1],v[2],v[3]);}
  const char *phases[]={"all","wc-reassert","publish","audit"};
  for(unsigned phase=0;phase<4;++phase){
   uint64_t v[3];for(unsigned i=0;i<3;++i)v[i]=__atomic_load_n(&native_adreno_submit_cost[phase*3+i],__ATOMIC_RELAXED);
@@ -937,8 +1065,29 @@ extern "C" unsigned houji_gpu_cached_timing(char *out,unsigned capacity) {
  }
  append("HOUJI CACHED WC: coherent=%u audit=%u dirty=%u stale=%u failures=%u resets=%u\n",
   native_adreno_io_coherent,native_adreno_wc_audit[0],native_adreno_wc_audit[2],native_adreno_wc_audit[3],native_adreno_wc_audit[4],native_adreno_wc_audit[5]);
- for(unsigned row=0;row<48;++row)if(copied && rows[row][0])append("HOUJI CACHED METAL %u: %.95s\n",row,rows[row]);
+ append("HOUJI CACHED IMPORTS: NC-fallbacks=%u; failed WB alias preflight only\n",native_adreno_coherent_import_fallbacks);
+ append("HOUJI CACHED TLB: per-page=%u; unmap retains ASID scope and TLBSYNC\n",g.vm?g.vm->perPageTlbInvalidation():1);
+ append("HOUJI BO POOL: requested-MiB=%u reserve=%x WC=%x MiB=%u hits=%u fallback=%u used-MiB=%u peak-MiB=%u standalone=%u spans=%u import-spans=%u; retained CPU-page ownership\n",
+  native_adreno_pool_mib,native_adreno_pool_status,native_adreno_pool_wc,native_adreno_pool_stats[0],native_adreno_pool_stats[1],native_adreno_pool_stats[2],
+  native_adreno_pool_stats[3],native_adreno_pool_stats[4],native_adreno_pool_stats[5],native_adreno_pool_stats[6],native_adreno_pool_stats[7]);
+ nativeAdrenoLatency.snapshot(append);
+ nativeAdrenoIssuerTrace.snapshot(append);
+ append("HOUJI FENCE POLL: calls=%llu pauses=%llu unlocked-pending=%llu max-us=%llu; hints never authorize completion\n",__atomic_load_n(&native_adreno_wait_outer[0],__ATOMIC_RELAXED),__atomic_load_n(&native_adreno_wait_outer[2],__ATOMIC_RELAXED),__atomic_load_n(&native_adreno_wait_outer[4],__ATOMIC_RELAXED),__atomic_load_n(&native_adreno_wait_outer[3],__ATOMIC_RELAXED));
+ append("HOUJI DISPATCH WAIT: BO-retries=%llu submit-retries=%llu mutation-reservation=1; pending waits outside issuer lock, original drain/proof retained\n",
+  __atomic_load_n(&nativeAdrenoGateRetries[0],__ATOMIC_RELAXED),__atomic_load_n(&nativeAdrenoGateRetries[1],__ATOMIC_RELAXED));
+ nativeAdrenoAllocationTrace.snapshot(append);
+ used+=houji_gpu_gate_snapshot(out+used,capacity-used);
+ used+=native_adreno_present_sync_snapshot(out+used,capacity-used);
  used+=houji_gpu_dvfs_snapshot(out+used,capacity-used);
+ used+=houji_thermal_snapshot(out+used,capacity-used);
+ used+=houji_backlight_snapshot(out+used,capacity-used);
+ for(const auto &client:clients)if(copied && client.name[0]) {
+  unsigned window=client.slot<NativeAdrenoMaxClients?(unsigned)(kClientWindows[client.slot].bytes>>20):0;
+  unsigned base=client.slot<NativeAdrenoMaxClients?(unsigned)(kClientWindows[client.slot].start>>20):0;
+  append("HOUJI CLIENT WINDOW: name=%.20s slot=%u highest-address-MiB=%u base-MiB=%u window-MiB=%u refused=%u last=%x; address high-water mark, not allocated bytes\n",
+   client.name,client.slot,client.peak_mib,base,window,client.refused,client.last_refusal);
+ }
+ for(unsigned row=0;row<48;++row)if(copied && rows[row][0])append("HOUJI CACHED METAL %u: %.95s\n",row,rows[row]);
  __atomic_store_n(&scratch_busy,0u,__ATOMIC_RELEASE);
  return used;
 }
@@ -990,7 +1139,7 @@ extern "C" void native_adreno_perf_report(void){
 }
 static void nativeAdrenoStopDiagnostics(void){
  const char *phases[]={"all","wc-reassert","publish","audit"};
- IOLog("HOUJI CACHE POLICY: coherent=%u skipped=%u/%u/%u/%u wc-reset=%u distrusted=%u dirty=%u stale=%u; cached observations only\n",native_adreno_io_coherent,native_adreno_coherent_skips[0],native_adreno_coherent_skips[1],native_adreno_coherent_skips[2],native_adreno_coherent_skips[3],native_adreno_wc_audit[5],native_adreno_wc_distrusted,native_adreno_wc_audit[2],native_adreno_wc_audit[3]);
+ IOLog("HOUJI CACHE POLICY: coherent=%u skipped=%u/%u/%u/%u wc-reset=%u distrusted=%u dirty=%u stale=%u NC-import-fallbacks=%u; cached observations only\n",native_adreno_io_coherent,native_adreno_coherent_skips[0],native_adreno_coherent_skips[1],native_adreno_coherent_skips[2],native_adreno_coherent_skips[3],native_adreno_wc_audit[5],native_adreno_wc_distrusted,native_adreno_wc_audit[2],native_adreno_wc_audit[3],native_adreno_coherent_import_fallbacks);
  for(unsigned phase=0;phase<4;++phase){
   uint64_t v[3];for(unsigned i=0;i<3;++i)v[i]=__atomic_load_n(&native_adreno_submit_cost[phase*3+i],__ATOMIC_RELAXED);
   IOLog("HOUJI SUBMIT COST: phase=%s calls=%llu total-us=%llu max-us=%llu; CPU wall time, original validation and cache policy\n",phases[phase],v[0],v[1],v[2]);
@@ -1007,7 +1156,7 @@ static void nativeAdrenoStopDiagnostics(void){
 
  houji_touch_driver_report();
  houji_framebuffer_history_report();
- for(unsigned slot=0;slot<4;slot++){
+ for(unsigned slot=0;slot<NativeAdrenoMaxClients;slot++){
   const auto&s=native_adreno_client_stats[slot];const auto&w=native_adreno_window_overflow[slot];
   IOLog("HOUJI GPU ALLOC: slot=%u live=%u peak-objects=%u failed=%u status=%x last-bytes=%u window-denied=%u last-map-KiB=%u last-end-MiB=%u; cached counters, not RAM usage\n",slot,s[0],s[1],s[2],s[3],s[4],w[0],w[1],w[2]);
  }
@@ -1023,19 +1172,19 @@ static void nativeAdrenoStopDiagnostics(void){
  }
 }
 
-extern "C" int native_adreno_provider_stop(int(*stop)(void*),void*c){if(!g.lock || !stop)return 1;IOLockLock(g.lock);g.dying=true;g.published=false;(void)native_adreno_board_quiesce();nativeAdrenoStopDiagnostics();int s=stop(c);IOLockUnlock(g.lock);return s;}
+extern "C" int native_adreno_provider_stop(int(*stop)(void*),void*c){if(!g.lock || !stop)return 1;nativeAdrenoIssuerLock(__LINE__);__atomic_store_n(&nativeAdrenoHintEnabled,0u,__ATOMIC_RELEASE);g.dying=true;g.published=false;(void)native_adreno_board_quiesce();nativeAdrenoStopDiagnostics();int s=stop(c);nativeAdrenoIssuerUnlock();return s;}
 extern "C" IOMemoryDescriptor *native_gop_handoff_memory(void){return nullptr;}
 extern "C" IOReturn native_gop_handoff_call(uint32_t,task_t,const void*,size_t,void*,size_t){return kIOReturnUnsupported;}
 
 extern "C" IOReturn native_adreno_provider_try_poll(void){
  if(!g.published || !g.lock || g.dying)return kIOReturnNotReady;
- if(!IOLockTryLock(g.lock))return kIOReturnBusy;
- /* No work can be added while holding this gate. Every actual external
-  * operation still enters the unchanged strict board quiesce/VM path;
-  * stop also performs that path. Avoid full idle audits in a diagnostic
+ if(!nativeAdrenoIssuerTryLock(__LINE__))return kIOReturnBusy;
+ /* No work can be added while holding this gate. VM/BO mutations and
+  * submissions still enter the strict board quiesce/VM path. Avoid full
+  * idle audits in a diagnostic
   * timer when the real submit object has no outstanding jobs. */
- if(g.submit && !g.submit->outstanding()){IOLockUnlock(g.lock);return kIOReturnSuccess;}
- IOReturn result=native_adreno_board_quiesce();IOLockUnlock(g.lock);return result;
+ if(g.submit && !g.submit->outstanding()){nativeAdrenoIssuerUnlock();return kIOReturnSuccess;}
+ IOReturn result=native_adreno_board_quiesce();nativeAdrenoIssuerUnlock();return result;
 }
 extern "C" unsigned native_adreno_provider_probe_result(void){return __atomic_load_n(&gHoujiProbeResult,__ATOMIC_ACQUIRE);}
 extern "C" void native_adreno_provider_snapshot(void){
@@ -1048,70 +1197,88 @@ extern "C" uint64_t native_adreno_provider_progress_token(void){const auto&d=nat
 
 extern "C" IOReturn native_adreno_provider_desktop_stats(uint64_t out[7]){
  if(!out || !g.published || !g.lock || g.dying)return kIOReturnNotReady;
- if(!IOLockTryLock(g.lock))return kIOReturnBusy;
+ if(!nativeAdrenoIssuerTryLock(__LINE__))return kIOReturnBusy;
  IOReturn result=native_adreno_board_quiesce();
  if(!result){
   out[0]=__atomic_load_n(&gHoujiDesktopSubmits,__ATOMIC_ACQUIRE);out[1]=__atomic_load_n(&gHoujiDesktopWaits,__ATOMIC_ACQUIRE);out[2]=__atomic_load_n(&gHoujiDesktopSubmitErrors,__ATOMIC_ACQUIRE);out[3]=__atomic_load_n(&gHoujiDesktopLastFence,__ATOMIC_ACQUIRE);
   out[4]=g.ring->completedFence();out[5]=g.submit->outstanding();out[6]=g.ring->lastSubmitted();
  }
- IOLockUnlock(g.lock);return result;
+ nativeAdrenoIssuerUnlock();return result;
 }
 
-/* ishtar 2022's wait-before-copy rule, adapted to the qualified houji owner.
- * Queue for the CPU issuer mutex instead of dropping every busy timer sample.
- * GPU observation remains nonblocking: unfinished work stays pending for a later vsync.
- * Keep the issuer lock through the CPU read/copy, so no later GPU submit can
- * start rewriting a surface halfway through that copy. No reference retired.
+/* Retain the qualified producer AND current ring-tail fence before a CPU read.
+ * A pending copy sleeps outside the issuer mutex until an existing ABI
+ * observer sees progress, with a bounded timer fallback. Observed completion
+ * can resume the accepted frame without waiting for the next display tick.
+ * Success keeps the mutex through cache maintenance/copy, excluding later
+ * GPU writes. No reference is retired here; this is not a GPU IRQ or vblank.
  */
-static uint64_t gHoujiPresentSync[9];
+extern "C" unsigned native_adreno_present_sync_snapshot(char *out,unsigned capacity){
+ if(!out || !capacity)return 0;
+ unsigned long long v[14];for(unsigned i=0;i<14;i++)v[i]=__atomic_load_n(&gHoujiPresentSync[i],__ATOMIC_RELAXED);
+ int n=snprintf(out,capacity,"HOUJI PRESENT SYNC: attempts=%llu granted=%llu gate-busy=%llu GPU-pending=%llu observed-fence=%llu max-hold-us=%llu lock-wait-us=%llu max-lock-wait-us=%llu; cached CPU observations\nHOUJI PRESENT WAKE: sleeps=%llu event-wakes=%llu expired=%llu sleep-us=%llu signals=%llu; pending checks may repeat; no GPU IRQ or panel vblank\n",v[0],v[1],v[2],v[3],v[4],v[6],v[7],v[8],v[9],v[10],v[11],v[12],v[13]);
+ if(n<=0 || (unsigned)n>=capacity){out[0]=0;return 0;}return (unsigned)n;
+}
 extern "C" int native_adreno_present_begin_frame(uint32_t desired){
  __atomic_fetch_add(&gHoujiPresentSync[0],1ull,__ATOMIC_RELAXED);
  if(!g.published || !g.lock || !g.ring)return 0;
- /* Cheap first look without the lock: the copy retries every 500 us while
-  * the GPU renders, and taking g.lock each time competed with submits. */
- if(desired && (int32_t)(g.ring->peekCompleted()-desired)<0){
-  __atomic_fetch_add(&gHoujiPresentSync[3],1ull,__ATOMIC_RELAXED);return -1;
+ const uint64_t began=g.clock.now_us(g.clock.cookie);
+ for(;;){
+  if(!nativeAdrenoIssuerTryLock(__LINE__)){
+   __atomic_fetch_add(&gHoujiPresentSync[2],1ull,__ATOMIC_RELAXED);
+   uint64_t lockBegan=g.clock.now_us(g.clock.cookie);
+   nativeAdrenoIssuerLock(__LINE__); /* normal priority-inheriting CPU mutex, no GPU wait */
+   uint64_t elapsed=g.clock.now_us(g.clock.cookie)-lockBegan;
+   __atomic_fetch_add(&gHoujiPresentSync[7],elapsed,__ATOMIC_RELAXED);
+   uint64_t old=__atomic_load_n(&gHoujiPresentSync[8],__ATOMIC_RELAXED);
+   while(elapsed>old && !__atomic_compare_exchange_n(&gHoujiPresentSync[8],&old,elapsed,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
+  }
+  nativeAdrenoIssuerTrace.context(UINT32_MAX,UINT32_MAX,desired);
+  if(g.dying || !native_adreno_board_running()){nativeAdrenoIssuerUnlock();return -1;}
+  uint32_t fence=desired?desired:g.ring->lastSubmitted(),seen=0;
+  auto result=fence?g.ring->observeFence(fence,nullptr,0,&seen):NativeAdrenoRingFenceComplete;
+  // A completed producer does not cover newer writes to an alias. Re-read
+  // the current tail on EVERY wake with the issuer mutex held.
+  uint32_t tail=g.ring->lastSubmitted();
+  if(result==NativeAdrenoRingFenceComplete && tail!=fence && tail)
+   result=g.ring->observeFence(tail,nullptr,0,&seen);
+  if(result==NativeAdrenoRingFenceComplete){
+   __atomic_store_n(&gHoujiPresentSync[4],seen,__ATOMIC_RELAXED);
+   __atomic_store_n(&gHoujiPresentSync[5],g.clock.now_us(g.clock.cookie),__ATOMIC_RELAXED);
+   __atomic_fetch_add(&gHoujiPresentSync[1],1ull,__ATOMIC_RELAXED);return 1;
+  }
+  if(result!=NativeAdrenoRingFenceTimeout){nativeAdrenoIssuerUnlock();return -1;}
+  __atomic_fetch_add(&gHoujiPresentSync[3],1ull,__ATOMIC_RELAXED);
+  const uint64_t now=g.clock.now_us(g.clock.cookie),elapsed=now-began;
+  if(elapsed>=8333){nativeAdrenoIssuerUnlock();return -1;}
+  // Register under the notifier's mutex so a completion cannot be lost
+  // between checking and sleeping. Release it BEFORE blocking. Clients
+  // without a fence observer still get a bounded timeout, never a fake fence.
+  assert_wait_timeout((event_t)&gHoujiPresentProgress,THREAD_UNINT,(uint32_t)(8333-elapsed),NSEC_PER_USEC);
+  __atomic_fetch_add(&gHoujiPresentSync[9],1ull,__ATOMIC_RELAXED);
+  nativeAdrenoIssuerUnlock();
+  wait_result_t woke=thread_block(THREAD_CONTINUE_NULL);
+  __atomic_fetch_add(&gHoujiPresentSync[woke==THREAD_AWAKENED?10:11],1ull,__ATOMIC_RELAXED);
+  __atomic_fetch_add(&gHoujiPresentSync[12],g.clock.now_us(g.clock.cookie)-now,__ATOMIC_RELAXED);
  }
- if(!IOLockTryLock(g.lock)){
-  __atomic_fetch_add(&gHoujiPresentSync[2],1ull,__ATOMIC_RELAXED);
-  uint64_t began=g.clock.now_us(g.clock.cookie);
-  IOLockLock(g.lock); /* normal priority-inheriting CPU mutex, no GPU wait */
-  uint64_t elapsed=g.clock.now_us(g.clock.cookie)-began;
-  __atomic_fetch_add(&gHoujiPresentSync[7],elapsed,__ATOMIC_RELAXED);
-  uint64_t old=__atomic_load_n(&gHoujiPresentSync[8],__ATOMIC_RELAXED);
-  while(elapsed>old && !__atomic_compare_exchange_n(&gHoujiPresentSync[8],&old,elapsed,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
- }
- if(g.dying || !native_adreno_board_running()){IOLockUnlock(g.lock);return -1;}
- const uint32_t last=g.ring->lastSubmitted();
- uint32_t fence=desired?desired:last,seen=0;
- if((int32_t)(fence-last)>0)fence=last; /* never wait on a fence the ring has not issued */
- if(fence && g.ring->observeFence(fence,nullptr,0,&seen)!=NativeAdrenoRingFenceComplete){
-  __atomic_fetch_add(&gHoujiPresentSync[3],1ull,__ATOMIC_RELAXED);IOLockUnlock(g.lock);return -1;
- }
- __atomic_store_n(&gHoujiPresentSync[4],seen,__ATOMIC_RELAXED);
- __atomic_store_n(&gHoujiPresentSync[5],g.clock.now_us(g.clock.cookie),__ATOMIC_RELAXED);
- __atomic_fetch_add(&gHoujiPresentSync[1],1ull,__ATOMIC_RELAXED);return 1;
 }
 extern "C" void native_adreno_present_end(void){
  uint64_t elapsed=g.clock.now_us(g.clock.cookie)-__atomic_load_n(&gHoujiPresentSync[5],__ATOMIC_RELAXED);
  uint64_t old=__atomic_load_n(&gHoujiPresentSync[6],__ATOMIC_RELAXED);
  while(elapsed>old && !__atomic_compare_exchange_n(&gHoujiPresentSync[6],&old,elapsed,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
- IOLockUnlock(g.lock);
+ nativeAdrenoIssuerUnlock();
 }
 extern "C" void native_adreno_present_sync_report(void){
  uint64_t v[9];for(unsigned i=0;i<9;i++)v[i]=__atomic_load_n(&gHoujiPresentSync[i],__ATOMIC_RELAXED);
- IOLog("HOUJI PRESENT SYNC: attempts=%llu granted=%llu gate-busy=%llu GPU-pending=%llu observed-fence=%llu max-hold-us=%llu lock-wait-us=%llu max-lock-wait-us=%llu; queued CPU mutex, zero-timeout GPU observation\n",v[0],v[1],v[2],v[3],v[4],v[6],v[7],v[8]);
+ IOLog("HOUJI PRESENT SYNC: attempts=%llu granted=%llu gate-busy=%llu GPU-pending=%llu observed-fence=%llu max-hold-us=%llu lock-wait-us=%llu max-lock-wait-us=%llu; queued CPU mutex, fenced copy\n",v[0],v[1],v[2],v[3],v[4],v[6],v[7],v[8]);
 }
 
 extern "C" int native_adreno_present_begin(void){return native_adreno_present_begin_frame(0);}
 extern "C" uint32_t native_adreno_present_capture_fence(void){
  if(!g.published || !g.lock || !g.ring)return 0;
- /* Lock-free when known: taking g.lock here made SwapEnd wait behind a
-  * whole-GPU quiesce. The value only grows and covers the caller's submit. */
- if(uint32_t fence=__atomic_load_n(&gHoujiLastSubmittedFence,__ATOMIC_ACQUIRE))return fence;
- IOLockLock(g.lock);
+ nativeAdrenoIssuerLock(__LINE__);
  uint32_t fence=(!g.dying && native_adreno_board_running())?g.ring->lastSubmitted():0;
- IOLockUnlock(g.lock);return fence;
+ nativeAdrenoIssuerUnlock();return fence;
 }
 
 extern "C" void houji_gpu_dvfs_tick(void);
@@ -1119,10 +1286,9 @@ extern "C" void houji_gpu_dvfs_tick(void);
 extern "C" {volatile uint64_t native_adreno_dvfs_skips[2];}
 extern "C" IOReturn native_adreno_dvfs_poll(void){
  if(!g.published || !g.lock || g.dying)return kIOReturnNotReady;
- /* Under heavy rendering the issuer lock is almost always held; a single try skipped nearly every tick and the governor
-  * never ramped. Retry for up to 8 ms between submissions. */
- bool locked=false;
- for(unsigned i=0;i<8 && !(locked=IOLockTryLock(g.lock));i++){native_adreno_dvfs_skips[1]=native_adreno_dvfs_skips[1]+1;IOSleep(1);}
- if(!locked){native_adreno_dvfs_skips[0]=native_adreno_dvfs_skips[0]+1;return kIOReturnBusy;}
- houji_gpu_dvfs_tick();IOLockUnlock(g.lock);return kIOReturnSuccess;
+ // This dedicated worker may sleep. Queue behind the issuer rather than
+ // losing every sample to a busy compositor and retaining an idle OPP.
+ nativeAdrenoIssuerLock(__LINE__);
+ if(!g.published || g.dying || !native_adreno_board_running()){nativeAdrenoIssuerUnlock();return kIOReturnNotReady;}
+ houji_gpu_dvfs_tick();nativeAdrenoIssuerUnlock();return kIOReturnSuccess;
 }
