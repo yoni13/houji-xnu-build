@@ -128,7 +128,8 @@ void cameraThread(void *, wait_result_t) {
     cs[0] = 1;
     // camcc's rail MMCX is already up for the display (dispcc shares it); a vote from this DRV would replace the firmware's, so none here.
     uint32_t found = 0;
-    for (uint32_t off : {0x26004u, 0x26028u}) {gGcc.va[off / 4] |= 1u; dsb(); waitBits(&gGcc.va[off / 4], 1u << 31, false, 1000);}
+    static const uint32_t branches[] = {0x26004u, 0x26028u};
+    for (uint32_t off : branches) {gGcc.va[off / 4] |= 1u; dsb(); waitBits(&gGcc.va[off / 4], 1u << 31, false, 1000);}
     if (!mapWindow(gCamcc, kCamcc, 0x20000)) {cs[0] = -2; rpmh.close(); return;}
     cs[0] = 2;
     // supplies in the sensor's order: vio, vana, vdig
