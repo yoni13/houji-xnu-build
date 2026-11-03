@@ -15,7 +15,6 @@ extern "C" {
 }
 
 extern "C" void sweet_hid_key(int key, int down);
-extern "C" void houji_screen_command(const char *what);   // HoujiScreen.cpp
 // [0] stage (1 mapped, 2 polling; negative: the step that failed), [1] power APID, [2] GPIO APID, [3] pressed mask (bit 0 power, 1 up,
 // 2 down), [4] reports, [5] read errors, [6] polls, [7] arbiter version
 extern "C" {volatile int32_t native_buttons_stats[8];}
@@ -81,7 +80,6 @@ void buttonsThread(void *, wait_result_t) {
         if (mask != last) {
             for (int key = 0; key < 3; ++key)
                 if (((mask ^ last) >> key) & 1) sweet_hid_key(key, (mask >> key) & 1);
-            if ((mask & 1) && !(last & 1)) houji_screen_command("toggle");   // iOS cannot turn this panel off itself
             IOLog("HOUJI BUTTONS: %s%s%s\n", mask & 1 ? "power " : "", mask & 2 ? "volume-up " : "", mask & 4 ? "volume-down" : mask ? "" : "released");
             last = mask;
             native_buttons_stats[3] = (int32_t)mask;

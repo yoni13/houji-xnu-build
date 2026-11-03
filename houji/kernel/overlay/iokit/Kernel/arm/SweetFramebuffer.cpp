@@ -869,6 +869,7 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
 }
 
 static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
+extern "C" void houji_screen_power(int on);   /* houji-buttons/HoujiScreen.cpp */
 
 IOReturn
 IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
@@ -901,6 +902,11 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		ret=fFB->swap(rec);
 		break;
 	}
+	case 12:   /* display power from backboardd: scalar 0 off, 1 on (every power-key sleep/wake and auto-lock) */
+		if (args->scalarInputCount >= 1) {
+			houji_screen_power(args->scalarInput[0] != 0);
+		}
+		break;
 	case kSweetFBGetID:
 		out[0] = 0;
 		outCount = 1;
