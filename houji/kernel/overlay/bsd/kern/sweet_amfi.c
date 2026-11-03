@@ -29,12 +29,14 @@
 #include <mach/kern_return.h>
 #include <sys/codesign.h>
 #include <sys/mount.h>
+#include <sys/param.h>
 #include <sys/priv.h>
 #include <sys/proc.h>
 #include <sys/systm.h>
 #include <sys/ubc_internal.h>
 #include <sys/vnode.h>
 #include <security/mac_policy.h>
+#include "HoujiSystemAppPaths.h"
 
 /* iokit/Kernel/arm/SweetEntitlements.cpp */
 void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
@@ -273,6 +275,10 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
 	return 0;
 }
 
+/* XNU's own executable-path helper holds/revalidates the text vnode. */
+extern int proc_pidpathinfo_internal(proc_t, uint64_t, char *, uint32_t, int32_t *);
+#include "HoujiTccCompatibility.h"
+
 /*
  * Policy "Sandbox": libsystem_sandbox calls __mac_syscall("Sandbox", op,
  * arg). Without a policy of that name every call fails with ENOPOLICY and
@@ -280,13 +286,14 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
  * "profile not found"). SWEET runs without a sandbox: operations succeed
  * (checks allow, profile init is accepted); the few that must return
- * data (container paths, extension tokens) fail with ENOENT. The first
- * use of each operation number is logged.
+ * data (container paths, extension tokens) fail with ENOENT, except the
+ * narrow native unconfined result for tccd's MediaLibrary/Photos requests.
+ * The first use of each operation number is logged.
  */
 static uint64_t sweet_sandbox_seen;
 
 static int
-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
 {
 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
 		sweet_sandbox_seen |= 1ULL << call;
@@ -295,8 +302,9 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
 		printf("SWEET Sandbox: %s op %d\n", name, call);
 	}
 	switch (call) {
+	case 5:         /* exact tccd media-library requests after TCC authorization */
+		return houji_tcc_extension_issue(p, arg);
 	case 4:         /* container path (audit token / pid) */
-	case 5:         /* extension issue */
 	case 6:         /* extension consume */
 	case 0x43:      /* container expected */
 		return ENOENT;
@@ -305,8 +313,41 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
 	}
 }
 
+/* The owner's iOS 16 dyld calls AMFI op 0x5a with {u64 input, u64 *output}.
+ * Its SyscallDelegate returns zero permissions on ENOPOLICY. In particular,
+ * original app-private frameworks then fail before @rpath is expanded.
+ * Supply only ALLOW_AT_PATH (Apple dyld-1042.1), for restored system bundles.
+ * Do not enable DYLD environment overrides, interposing, trust-cache calls,
+ * or failed library insertion. Signature/page validation remains unchanged.
+ */
+static int
+sweet_amfi_syscall(struct proc *p, int call, user_addr_t arg)
+{
+	struct { uint64_t input; user_addr_t output; } request;
+	uint64_t permissions = 1; /* AMFI_DYLD_OUTPUT_ALLOW_AT_PATH */
+	char path[MAXPATHLEN] = {0};
+	int32_t ignored = 0;
+	int error;
+	if (call != 0x5a) return ENOPOLICY;
+	if ((error = copyin(arg, &request, sizeof(request))) != 0) return error;
+	/* Simulator, restricted/encrypted and unknown input flags keep the old policy. */
+	if (request.input != 0 || proc_issetugid(p) || !csproc_get_platform_binary(p))
+		return ENOPOLICY;
+	if (proc_pidpathinfo_internal(p, 0, path, sizeof(path), &ignored) != 0 ||
+	    memchr(path, '\0', sizeof(path)) == NULL ||
+	    !houji_system_app_path(path)) return ENOPOLICY;
+	error = copyout(&permissions, request.output, sizeof(permissions));
+	if (!error) {
+		char name[32];
+		proc_name(proc_pid(p), name, sizeof(name));
+		printf("HOUJI DYLD PATH: %s permissions=1\n", name);
+	}
+	return error;
+}
+
 static const struct mac_policy_ops sweet_amfi_mac_ops = {
 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
+	.mpo_policy_syscall = sweet_amfi_syscall,
 };
 
 /*
@@ -360,7 +401,7 @@ static struct mac_policy_conf sweet_sandbox_mac_conf = {
 static mac_policy_handle_t sweet_sandbox_mac_handle;
 
 static struct mac_policy_conf sweet_amfi_mac_conf = {
-	.mpc_name = "SWEET AMFI",
+	.mpc_name = "AMFI",
 	.mpc_fullname = "SWEET built-in Mobile File Integrity",
 	.mpc_ops = &sweet_amfi_mac_ops,
 };
