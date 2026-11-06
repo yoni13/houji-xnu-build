@@ -1,0 +1,102 @@
+name: houji weak-link patch and sign
+# Patches LC_LOAD_WEAK_DYLIB into the app executables transported from the private
+# repo (yoni13/houji-app-transport) using macOS tooling: lief for the load command,
+# then codesign ad-hoc re-sign so dyld's fixup chain stays consistent. The patched
+# executables return as an artifact; the host injects them into the offline image.
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch or commit of yoni13/UniXNU-houji (for the record only)
+        type: string
+        default: main
+permissions:
+  contents: read
+jobs:
+  weaklink:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: yoni13/UniXNU-houji
+          ref: ${{ inputs.source_ref }}
+      - name: Fetch transported executables
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh repo clone yoni13/houji-app-transport transport -- --depth 1
+          mkdir -p apps
+          tar xzf transport/apps-pristine.tar.gz -C apps
+          ls apps | head -5
+          find apps -type f | wc -l
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install lief
+        run: pip3 install --break-system-packages lief
+      - name: Patch load commands
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, os, struct
+          import lief
+          from lief.MachO import LoadCommand
+
+          DYLIB = '/usr/lib/HoujiKeyboardGeometry.dylib'
+          patched = skipped = 0
+          for path in sorted(glob.glob('apps/*.app/*')):
+              name = os.path.basename(os.path.dirname(path))
+              if not os.path.isfile(path) or name + '.app' != os.path.basename(os.path.dirname(path)):
+                  continue
+              b = lief.MachO.parse(path)
+              fat = b if isinstance(b, lief.MachO.FatBinary) else None
+              m = fat[0] if fat else b
+              have = any(c.command == LoadCommand.TYPE.LOAD_WEAK_DYLIB and
+                         str(getattr(c, 'name', '')) == DYLIB for c in m.commands)
+              if have:
+                  skipped += 1
+                  continue
+              m.add(lief.MachO.LoadCommand.dylib_command(DYLIB, LoadCommand.TYPE.LOAD_WEAK_DYLIB))
+              m.write(path + '.patched')
+              os.replace(path + '.patched', path)
+              patched += 1
+          print(f'patched={patched} skipped={skipped}')
+          PY
+      - name: Re-sign ad-hoc with original entitlements
+        run: |
+          set -euo pipefail
+          SIGNED=0
+          for f in apps/*.app/*; do
+            [ -f "$f" ] || continue
+            # extract current entitlements (if any) and re-apply after re-signing
+            ENT=$(mktemp).plist
+            if codesign -d --entitlements :- "$f" > /dev/null 2>&1; then
+              codesign -d --entitlements :- "$f" > "$ENT" 2>/dev/null || true
+              if codesign --force --sign - --timestamp=none --entitlements "$ENT" "$f" 2>/dev/null; then
+                SIGNED=$((SIGNED+1)); continue
+              fi
+            fi
+            codesign --force --sign - --timestamp=none "$f"
+            SIGNED=$((SIGNED+1))
+          done
+          echo "signed=$SIGNED"
+      - name: Verify
+        run: |
+          set -euo pipefail
+          OK=0
+          for f in apps/*.app/*; do
+            [ -f "$f" ] || continue
+            if otool -l "$f" | grep -A2 LC_LOAD_WEAK_DYLIB | grep -q HoujiKeyboardGeometry; then
+              codesign --verify --strict "$f" && OK=$((OK+1)) || echo "BAD SIGN: $f"
+            fi
+          done
+          echo "verified=$OK"
+          test "$OK" -gt 0
+      - name: Package
+        run: tar czf apps-weaklinked.tar.gz -C apps .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: houji-weaklinked-apps
+          path: apps-weaklinked.tar.gz
+          retention-days: 7
