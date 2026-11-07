@@ -1624,12 +1624,30 @@ static void initializeTextureLimits(id device) {
 // The device queries the runtime answers (nmb_device_answer_selector), as methods of the device class. One without an argument is read once
 // and installed only where the device has an answer of its own; one with an argument asks the runtime each call, and a refusal answers 0/NO
 // with the reason logged.
+// Argument answers are fixed properties of the process's single device; keep successful ones (AdrenoMetal 31867dc8, as in
+// UniXNU-houji graphics/metal). Each uncached supportsFamily: query built and freed a large table, returning its pages to the
+// kernel: about 30% of backboardd's render thread during app opens. Failures still log and retry; at most 1024 entries.
 static std::unordered_map<SEL,uint64_t> gAnswers;
 static NSUInteger countAnswer(id,SEL cmd) {return (NSUInteger)gAnswers.at(cmd);}
 static BOOL flagAnswer(id,SEL cmd) {return gAnswers.at(cmd)!=0;}
 static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
+ static std::mutex lock;
+ static std::unordered_map<SEL,std::unordered_map<NSUInteger,uint64_t>> kept;
+ static size_t entries;
+ {
+  std::lock_guard<std::mutex> hold(lock);
+  auto answers=kept.find(cmd);
+  if(answers!=kept.end()) {
+   auto answer=answers->second.find(arg);
+   if(answer!=answers->second.end())return answer->second;
+  }
+ }
  uint64_t value=0;
  if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());return 0;}
+ {
+  std::lock_guard<std::mutex> hold(lock);
+  if(entries<1024 && kept[cmd].emplace(arg,value).second)++entries;
+ }
  return value;
 }
 static NSUInteger countArgAnswer(id,SEL cmd,NSUInteger arg) {return (NSUInteger)askAnswer(cmd,arg);}
