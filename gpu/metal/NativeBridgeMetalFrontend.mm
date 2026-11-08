@@ -1844,6 +1844,15 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   (unsigned long long)gCompleted.load(),(unsigned long long)gPipelines.load(),(unsigned long long)gProblems.load(),(unsigned long long)gPasses.load(),
   (unsigned long long)gDraws.load(),(unsigned long long)gFullScreenPasses.load(),(unsigned long long)(gBiggestPass.load()>>10),
   (unsigned long long)gDispatches.load(),(unsigned long long)gBlits.load());
+ static const uint64_t *tuStats=nullptr;
+ if(!tuStats){
+  tuStats=(const uint64_t *)dlsym(RTLD_DEFAULT,"houji_tu_submit_stats");
+  for(const char *path:{"/System/Library/Extensions/NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib","/usr/lib/libvulkan_freedreno.dylib"})
+   if(!tuStats)if(void *h=dlopen(path,RTLD_NOLOAD|RTLD_LAZY))tuStats=(const uint64_t *)dlsym(h,"houji_tu_submit_stats");
+ }
+ if(const uint64_t *tu=tuStats)
+  row("TU submit n=%llu total=%lluus waits=%lluus/%llu kernel=%lluus/%llu max=%lluus",(unsigned long long)tu[0],(unsigned long long)(tu[1]/1000),
+   (unsigned long long)(tu[2]/1000),(unsigned long long)tu[4],(unsigned long long)(tu[3]/1000),(unsigned long long)tu[5],(unsigned long long)(tu[6]/1000));
  row("T pipeline n=%llu total=%llums max=%llums",(unsigned long long)gTimePipeline.count.load(),ms(gTimePipeline.total.load()),ms(gTimePipeline.slowest.load()));
  row("XR pf553 pipelines=%llu failed=%llu two-plane-surfaces=%llu",(unsigned long long)gXr553Pipelines.load(),(unsigned long long)gXr553Failures.load(),(unsigned long long)gXrPlanarSurfaces.load());
  row("T library n=%llu total=%llums max=%llums",(unsigned long long)gTimeLibrary.count.load(),ms(gTimeLibrary.total.load()),ms(gTimeLibrary.slowest.load()));

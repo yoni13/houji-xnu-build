@@ -853,6 +853,12 @@ darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *e
    return vk_device_set_lost(&dev->vk, "submit: no free job slot");
 }
 
+/* houji: submit-path timing, read by the Metal plugin (dlsym) for its telemetry rows. [0] calls, [1] total ns,
+ * [2] ns in the CPU waits before submitting, [3] ns in the kernel submit calls, [4] waits that blocked (> 50 us),
+ * [5] kernel submit calls, [6] max total ns. */
+extern "C" __attribute__((visibility("default"))) uint64_t houji_tu_submit_stats[8];
+uint64_t houji_tu_submit_stats[8];
+
 static VkResult
 darwin_queue_submit(struct tu_queue *queue, void *_submit,
                     struct vk_sync_wait *waits, uint32_t wait_count,
@@ -861,11 +867,16 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
 {
    struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
    struct tu_device *dev = queue->device;
+   const uint64_t houji_began = os_time_get_nano();
 
    /* The kernel client has one ring and no GPU-side waits: wait on the CPU before submitting. */
    for (uint32_t i = 0; i < wait_count; i++) {
       struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
+      const uint64_t w0 = os_time_get_nano();
       VkResult result = darwin_sync_wait(dev, s, UINT64_MAX);
+      const uint64_t waited = os_time_get_nano() - w0;
+      p_atomic_add(&houji_tu_submit_stats[2], waited);
+      if (waited > 50000) p_atomic_inc(&houji_tu_submit_stats[4]);
       if (result != VK_SUCCESS)
          return vk_device_set_lost(&dev->vk, "wait before submit failed");
    }
@@ -878,7 +889,10 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
       for (unsigned at = 0; at < total; at += NativeAdrenoAbiMaxBuffers) {
          unsigned count = MIN2(total - at, (unsigned)NativeAdrenoAbiMaxBuffers);
          uint32_t chunk_fence = 0;
+         const uint64_t k0 = os_time_get_nano();
          VkResult result = darwin_submit_chunk(queue, all + at, count, &chunk_fence);
+         p_atomic_add(&houji_tu_submit_stats[3], os_time_get_nano() - k0);
+         p_atomic_inc(&houji_tu_submit_stats[5]);
          if (result != VK_SUCCESS)
             return result;
          pthread_mutex_lock(&dw.lock);
@@ -900,6 +914,12 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
 
    if (u_trace_submission_data)
       u_trace_submission_data->gpu_ts_offset = 0;
+   {
+      const uint64_t spent = os_time_get_nano() - houji_began;
+      p_atomic_inc(&houji_tu_submit_stats[0]);
+      p_atomic_add(&houji_tu_submit_stats[1], spent);
+      if (spent > houji_tu_submit_stats[6]) houji_tu_submit_stats[6] = spent;
+   }
    return VK_SUCCESS;
 }
 
