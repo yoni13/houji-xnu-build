@@ -1,0 +1,79 @@
+name: houji iOS 27 kernel
+# Builds the source (native) XNU of the iOS 27 port with Xcode and uploads it with its symbol-bearing reference build.
+# The prelink against the original kernelcache runs on the owner's machine: no Apple kext is built into anything uploaded here.
+on:
+  workflow_dispatch:
+    inputs:
+      device_ref:
+        description: Commit or branch of yoni13/UniXNU-houji (the iOS 27 device repository)
+        type: string
+        default: ios27
+      unixnu_ref:
+        description: Commit of UniXNU/UniXNU
+        type: string
+        default: 0c1bac3
+      xcode:
+        description: Xcode version of the macos-26 image
+        type: string
+        default: '26.6'
+      defconfig:
+        type: string
+        default: houji_ios27_defconfig
+permissions:
+  contents: read
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+jobs:
+  kernel:
+    runs-on: macos-26
+    timeout-minutes: 300
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_${{ inputs.xcode }}.app/Contents/Developer
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: ${{ inputs.unixnu_ref }}
+          submodules: recursive
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: yoni13/UniXNU-houji
+          ref: ${{ inputs.device_ref }}
+          path: device
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Tools
+        run: |
+          ls -d /Applications/Xcode_*.app
+          brew install llvm lld mtools dtc
+          command -v unifdef || { brew install unifdef; echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"; }
+          xcodebuild -version
+      - name: Configure
+        run: |
+          bash device/scripts/install-os-profile.sh "$PWD"
+          ./unixnu defconfig "${{ inputs.defconfig }}" -D "$PWD/device"
+          ./unixnu fetch
+          ./unixnu status --json | head -40
+      - name: Build the native kernel
+        run: ./unixnu build kernel --skip-prelink
+      - name: Collect
+        if: always()
+        run: |
+          O=$(./unixnu status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["output"])')
+          mkdir -p "$RUNNER_TEMP/up"
+          cd "$O"
+          find . -maxdepth 2 -not -path './tree/*' | head -50
+          ls -la tree/build/xnu/ios-obj/*/ tree/build/xnu/fileset-reference 2>/dev/null | head -60 || true
+          tar -czf "$RUNNER_TEMP/up/logs.tgz" logs 2>/dev/null || true
+          tar -czf "$RUNNER_TEMP/up/native.tgz" kernel $(ls -d tree/build/xnu/ios-obj/*/mach.*.unstripped* tree/build/xnu/fileset-reference tree/build/*.json tree/build/xnu/*.json 2>/dev/null) || true
+          ls -la "$RUNNER_TEMP/up"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: houji-ios27-native
+          path: ${{ runner.temp }}/up/*
+          retention-days: 14
