@@ -11,7 +11,7 @@ on:
       unixnu_ref:
         description: Commit of UniXNU/UniXNU
         type: string
-        default: 0c1bac3
+        default: 0c1bac3d51a3009dca1708b15a5198f4b43d057a
       xcode:
         description: Xcode version of the macos-26 image
         type: string
