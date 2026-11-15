@@ -96,8 +96,18 @@ jobs:
                   if a == '-o' and i + 1 < len(args): output = args[i + 1]
                   if not a.startswith('-') and args[i - 1] not in takes_value and a.rsplit('.', 1)[-1] in ('c', 'cpp', 'cc', 'cp', 's', 'S', 'm', 'mm'):
                       source = a
+              # The shape clang writes: compiler, -x<lang>, input, -o, output, then the other arguments without the
+              # dependency-file options (a replayed command must not rewrite the original .d file or its target).
+              rest, i = [], 1
+              while i < len(args):
+                  a = args[i]
+                  if a in ('-o', '-MF', '-MT', '-MQ'): i += 2; continue
+                  if a in ('-MD', '-MMD', '-MP', '-MG', '-M', '-MM') or a == source: i += 1; continue
+                  rest.append(a); i += 1
+              lang = {'c': 'c', 'cpp': 'c++', 'cc': 'c++', 'cp': 'c++', 's': 'assembler', 'S': 'assembler-with-cpp', 'm': 'objective-c', 'mm': 'objective-c++'}[source.rsplit('.', 1)[-1]]
               with open(record, 'w') as f:
-                  f.write(json.dumps({'directory': os.getcwd(), 'file': source, 'output': output, 'arguments': args}) + ',\n')
+                  f.write(json.dumps({'directory': os.getcwd(), 'file': source, 'output': output,
+                                      'arguments': [args[0], '-x' + lang, source, '-o', output, *rest]}) + ',\n')
           sys.exit(status)
           PY
           chmod +x "$RUNNER_TEMP/ccwrap"
@@ -133,6 +143,8 @@ jobs:
           cd "$O"
           find . -maxdepth 2 -not -path './tree/*' | head -50
           ls -la tree/build/xnu/ios-obj/*/ tree/build/xnu/fileset-reference 2>/dev/null | head -60 || true
+          cp tree/build/libpthread-kernel/*.log tree/build/houji-kit/*.log logs/ 2>/dev/null || true
+          cp tree/build/xnu/ios-obj/*/osfmk/DEVELOPMENT/prng_random.o.json logs/record-prng_random.json 2>/dev/null || true
           tar -czf "$RUNNER_TEMP/up/logs.tgz" logs 2>/dev/null || true
           tar -czf "$RUNNER_TEMP/up/native.tgz" kernel $(ls -d tree/build/xnu/ios-obj/*/mach.*.unstripped* tree/build/xnu/fileset-reference tree/build/*.json tree/build/xnu/*.json 2>/dev/null) || true
           ls -la "$RUNNER_TEMP/up"
