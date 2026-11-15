@@ -23,6 +23,10 @@ on:
         description: Compile-only houji UFS and public storage interface gate (no kernel link)
         type: boolean
         default: false
+      link_storage:
+        description: Link read-only houji storage runtime (boot activation remains off)
+        type: boolean
+        default: false
 permissions:
   contents: read
 env:
@@ -86,6 +90,18 @@ jobs:
             out/houji/*/*/tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.json
           key: ios27-reference-v1-${{ github.run_id }}
           restore-keys: ios27-reference-v1-
+      - name: Prepare opt-in storage link inputs
+        if: inputs.link_storage
+        run: |
+          set -euo pipefail
+          git clone --quiet https://github.com/UniXNU/ShengUfs.git "$RUNNER_TEMP/link-ShengUfs"
+          git -C "$RUNNER_TEMP/link-ShengUfs" checkout --quiet 99d8bcd3e43dd24fc3c8437c67b5d4cc71ab94d0
+          git clone --quiet --depth 1 --branch IOStorageFamily-337.100.1 https://github.com/apple-oss-distributions/IOStorageFamily.git "$RUNNER_TEMP/link-IOStorageFamily"
+          python3 device/scripts/prepare-houji-ufs.py --source "$RUNNER_TEMP/link-ShengUfs" --legacy "$PWD/device/package" --output "$RUNNER_TEMP/link-houji-ufs"
+          echo "UNIXNU_HOUJI_STORAGE_LINK=1" >> "$GITHUB_ENV"
+          echo "UNIXNU_HOUJI_FRAMEWORK=$PWD" >> "$GITHUB_ENV"
+          echo "UNIXNU_HOUJI_UFS_SOURCE=$RUNNER_TEMP/link-houji-ufs" >> "$GITHUB_ENV"
+          echo "UNIXNU_HOUJI_STORAGE_SOURCE=$RUNNER_TEMP/link-IOStorageFamily" >> "$GITHUB_ENV"
       - name: Build the native kernel
         run: |
           # ccache refuses commands with -MJ (clang's compile-command record), and UniXNU's build passes it on every compile:
