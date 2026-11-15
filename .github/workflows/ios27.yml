@@ -83,7 +83,7 @@ jobs:
           ccache -z
           status=0
           ./unixnu build kernel --skip-prelink || status=$?
-          ccache -s | head -12
+          ccache -s -vv | head -70
           grep -h 'reference inputs and digest match\|RELEASE reference exit' out/houji/*/*/logs/*reference*.log || true
           misses=$(ccache --print-stats | awk '$1=="local_storage_miss"{print $2}')
           [ "${misses:-1}" -ge 20 ] && echo "CCACHE_SAVE=1" >> "$GITHUB_ENV"
