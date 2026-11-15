@@ -140,7 +140,7 @@ jobs:
           git clone --quiet --depth 1 --branch IOStorageFamily-337.100.1 https://github.com/apple-oss-distributions/IOStorageFamily.git "$RUNNER_TEMP/IOStorageFamily"
           python3 device/scripts/prepare-houji-ufs.py --source "$RUNNER_TEMP/ShengUfs" --legacy "$PWD/device/package" --output "$RUNNER_TEMP/houji-ufs"
           O=$(./unixnu status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["output"])')
-          UNIXNU_XNU_ARCH=arm64e UNIXNU_IOS_VERSION=27.2.1 python3 device/scripts/compile-houji-ufs.py --framework "$PWD" --tree "$O/tree" --ufs "$RUNNER_TEMP/houji-ufs" --storage-source "$RUNNER_TEMP/IOStorageFamily"
+          UNIXNU_XNU_ARCH=arm64e UNIXNU_IOS_VERSION=27.2.1 python3 device/scripts/compile-houji-ufs.py --archive --framework "$PWD" --tree "$O/tree" --ufs "$RUNNER_TEMP/houji-ufs" --storage-source "$RUNNER_TEMP/IOStorageFamily"
       - name: Save compiler cache
         if: always() && env.CCACHE_SAVE == '1'
         uses: actions/cache/save@v4
