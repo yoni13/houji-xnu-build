@@ -19,6 +19,10 @@ on:
       defconfig:
         type: string
         default: houji_ios27_defconfig
+      compile_ufs:
+        description: Compile-only houji UFS and public storage interface gate (no kernel link)
+        type: boolean
+        default: false
 permissions:
   contents: read
 env:
@@ -127,6 +131,16 @@ jobs:
           misses=$(ccache --print-stats | awk '$1=="local_storage_miss"{print $2}')
           [ "${misses:-1}" -ge 20 ] && echo "CCACHE_SAVE=1" >> "$GITHUB_ENV"
           exit $status
+      - name: Compile houji source storage (not linked)
+        if: success() && inputs.compile_ufs
+        run: |
+          set -euo pipefail
+          git clone --quiet https://github.com/UniXNU/ShengUfs.git "$RUNNER_TEMP/ShengUfs"
+          git -C "$RUNNER_TEMP/ShengUfs" checkout --quiet 99d8bcd3e43dd24fc3c8437c67b5d4cc71ab94d0
+          git clone --quiet --depth 1 --branch IOStorageFamily-337.100.1 https://github.com/apple-oss-distributions/IOStorageFamily.git "$RUNNER_TEMP/IOStorageFamily"
+          python3 device/scripts/prepare-houji-ufs.py --source "$RUNNER_TEMP/ShengUfs" --legacy "$PWD/device/package" --output "$RUNNER_TEMP/houji-ufs"
+          O=$(./unixnu status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["output"])')
+          UNIXNU_XNU_ARCH=arm64e UNIXNU_IOS_VERSION=27.2.1 python3 device/scripts/compile-houji-ufs.py --framework "$PWD" --tree "$O/tree" --ufs "$RUNNER_TEMP/houji-ufs" --storage-source "$RUNNER_TEMP/IOStorageFamily"
       - name: Save compiler cache
         if: always() && env.CCACHE_SAVE == '1'
         uses: actions/cache/save@v4
@@ -151,6 +165,7 @@ jobs:
           ls -la tree/build/xnu/ios-obj/*/ tree/build/xnu/fileset-reference 2>/dev/null | head -60 || true
           cp tree/build/libpthread-kernel/*.log tree/build/houji-kit/*.log logs/ 2>/dev/null || true
           cp tree/build/xnu/ios-obj/*/osfmk/DEVELOPMENT/prng_random.o.json logs/record-prng_random.json 2>/dev/null || true
+          cp tree/build/houji-ufs-compile/*.log tree/build/houji-ufs-compile/*.json logs/ 2>/dev/null || true
           tar -czf "$RUNNER_TEMP/up/logs.tgz" logs 2>/dev/null || true
           tar -czf "$RUNNER_TEMP/up/native.tgz" kernel $(ls -d tree/build/xnu/ios-obj/*/mach.*.unstripped* tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.noctf tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.json tree/build/*.json tree/build/xnu/*.json 2>/dev/null) || true
           ls -la "$RUNNER_TEMP/up"
