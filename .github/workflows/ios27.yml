@@ -78,7 +78,30 @@ jobs:
           restore-keys: ios27-reference-v1-
       - name: Build the native kernel
         run: |
-          export CCACHE=ccache CCACHE_DIR="$PWD/.ccache" CCACHE_MAXSIZE=3G CCACHE_BASEDIR="$PWD" CCACHE_NOHASHDIR=1
+          # ccache refuses commands with -MJ (clang's compile-command record), and UniXNU's build passes it on every compile:
+          # the board package builders replay those records. This wrapper writes the record itself and gives ccache the
+          # command without the flag.
+          cat > "$RUNNER_TEMP/ccwrap" <<'PY'
+          #!/usr/bin/env python3
+          import json, os, subprocess, sys
+          args = sys.argv[1:]
+          record = None
+          if '-MJ' in args:
+              at = args.index('-MJ'); record = args[at + 1]; del args[at:at + 2]
+          status = subprocess.call(['ccache', *args])
+          if record and status == 0:
+              takes_value = {'-o', '-MF', '-MT', '-MQ', '-include', '-isysroot', '-arch', '-target', '-x', '-Xclang', '-I', '-D', '-iquote', '-isystem'}
+              source = output = None
+              for i, a in enumerate(args[1:], 1):
+                  if a == '-o' and i + 1 < len(args): output = args[i + 1]
+                  if not a.startswith('-') and args[i - 1] not in takes_value and a.rsplit('.', 1)[-1] in ('c', 'cpp', 'cc', 'cp', 's', 'S', 'm', 'mm'):
+                      source = a
+              with open(record, 'w') as f:
+                  f.write(json.dumps({'directory': os.getcwd(), 'file': source, 'output': output, 'arguments': args}) + ',\n')
+          sys.exit(status)
+          PY
+          chmod +x "$RUNNER_TEMP/ccwrap"
+          export CCACHE="$RUNNER_TEMP/ccwrap" CCACHE_DIR="$PWD/.ccache" CCACHE_MAXSIZE=3G CCACHE_BASEDIR="$PWD" CCACHE_NOHASHDIR=1
           export CCACHE_SLOPPINESS=include_file_mtime,include_file_ctime
           ccache -z
           status=0
