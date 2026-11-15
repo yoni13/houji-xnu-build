@@ -46,6 +46,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      # Homebrew's downloaded bottles (llvm is the large one); the install then only unpacks them.
+      - name: Restore tool downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew/downloads
+          key: ios27-brew-v1-${{ runner.os }}-${{ runner.arch }}
       - name: Tools
         run: |
           ls -d /Applications/Xcode_*.app
