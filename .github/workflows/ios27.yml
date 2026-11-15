@@ -49,7 +49,7 @@ jobs:
       - name: Tools
         run: |
           ls -d /Applications/Xcode_*.app
-          brew install llvm lld mtools dtc
+          brew install llvm lld mtools dtc ccache
           command -v unifdef || { brew install unifdef; echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"; }
           xcodebuild -version
       - name: Configure
@@ -58,8 +58,50 @@ jobs:
           ./unixnu defconfig "${{ inputs.defconfig }}" -D "$PWD/device"
           ./unixnu fetch
           ./unixnu status --json | head -40
+      # Two caches. The compiler cache goes through XNU's own hook (make CCACHE=ccache; KCC = $(CCACHE) $(CC)) and serves both
+      # the DEVELOPMENT build and the RELEASE reference build, whose private source copy has a different path each time its
+      # inputs change (hence the base directory and no working directory in the hash). The reference kernel itself is kept
+      # too: its builder reuses it when its recorded inputs and digest still match, which skips the LTO link.
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ios27-ccache-v1-${{ github.run_id }}
+          restore-keys: ios27-ccache-v1-
+      - name: Restore reference kernel
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            out/houji/*/*/tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.noctf
+            out/houji/*/*/tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.json
+          key: ios27-reference-v1-${{ github.run_id }}
+          restore-keys: ios27-reference-v1-
       - name: Build the native kernel
-        run: ./unixnu build kernel --skip-prelink
+        run: |
+          export CCACHE=ccache CCACHE_DIR="$PWD/.ccache" CCACHE_MAXSIZE=3G CCACHE_BASEDIR="$PWD" CCACHE_NOHASHDIR=1
+          export CCACHE_SLOPPINESS=include_file_mtime,include_file_ctime
+          ccache -z
+          status=0
+          ./unixnu build kernel --skip-prelink || status=$?
+          ccache -s | head -12
+          grep -h 'reference inputs and digest match\|RELEASE reference exit' out/houji/*/*/logs/*reference*.log || true
+          misses=$(ccache --print-stats | awk '$1=="local_storage_miss"{print $2}')
+          [ "${misses:-1}" -ge 20 ] && echo "CCACHE_SAVE=1" >> "$GITHUB_ENV"
+          exit $status
+      - name: Save compiler cache
+        if: always() && env.CCACHE_SAVE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ios27-ccache-v1-${{ github.run_id }}
+      - name: Save reference kernel
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            out/houji/*/*/tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.noctf
+            out/houji/*/*/tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.json
+          key: ios27-reference-v1-${{ github.run_id }}
       - name: Collect
         if: always()
         run: |
