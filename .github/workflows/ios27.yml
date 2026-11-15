@@ -152,7 +152,7 @@ jobs:
           cp tree/build/libpthread-kernel/*.log tree/build/houji-kit/*.log logs/ 2>/dev/null || true
           cp tree/build/xnu/ios-obj/*/osfmk/DEVELOPMENT/prng_random.o.json logs/record-prng_random.json 2>/dev/null || true
           tar -czf "$RUNNER_TEMP/up/logs.tgz" logs 2>/dev/null || true
-          tar -czf "$RUNNER_TEMP/up/native.tgz" kernel $(ls -d tree/build/xnu/ios-obj/*/mach.*.unstripped* tree/build/xnu/fileset-reference tree/build/*.json tree/build/xnu/*.json 2>/dev/null) || true
+          tar -czf "$RUNNER_TEMP/up/native.tgz" kernel $(ls -d tree/build/xnu/ios-obj/*/mach.*.unstripped* tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.noctf tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.json tree/build/*.json tree/build/xnu/*.json 2>/dev/null) || true
           ls -la "$RUNNER_TEMP/up"
       - uses: actions/upload-artifact@v4
         if: always()
